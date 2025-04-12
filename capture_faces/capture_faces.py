@@ -1,21 +1,25 @@
 import cv2
 import os
-import face_recognition
+import numpy as np
 from datetime import datetime
+from keras_facenet import FaceNet
+
+# Setup FaceNet embedder
+embedder = FaceNet()
 
 # Ask user for name
 name = input("Enter name: ").strip().replace(" ", "_")
-user_dir = os.path.join("datasets", "faces", name)
-os.makedirs(user_dir, exist_ok=True)
+img_dir = os.path.join("datasets", "faces", name)
+os.makedirs(img_dir, exist_ok=True)
 
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)  # Ensure RGB color
+cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)  # Ensure RGB
 
 if not cap.isOpened():
     print("[ERROR] Webcam not found.")
     exit()
 
-print(f"[INFO] Capturing faces for: {name}")
+print(f"[INFO] Capturing faces and embeddings for: {name}")
 print("[INFO] Press 'q' to quit early.")
 
 count = 0
@@ -27,35 +31,38 @@ while count < MAX_IMAGES:
         print("[ERROR] Failed to grab frame.")
         break
 
-    # Convert BGR to RGB for face_recognition
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    detections = embedder.extract(rgb, threshold=0.95)
 
-    # Detect faces
-    try:
-        face_locations = face_recognition.face_locations(rgb_frame)
-    except Exception as e:
-        print(f"[ERROR] Face detection failed: {e}")
-        continue
+    for det in detections:
+        box = det['box']
+        embedding = det['embedding']
+        x, y, w, h = box
+        face_crop = frame[y:y+h, x:x+w]
 
-    for face_location in face_locations:
-        top, right, bottom, left = face_location
-        face_image = frame[top:bottom, left:right]
-
-        if face_image.size == 0:
+        if face_crop.size == 0:
             continue
 
-        filename = f"{name}_{count:03d}.jpg"
-        path = os.path.join(user_dir, filename)
-        cv2.imwrite(path, face_image)
-        print(f"[INFO] Saved {filename}")
+        # Save image
+        img_filename = f"{name}_{count:03d}.jpg"
+        img_path = os.path.join(img_dir, img_filename)
+        cv2.imwrite(img_path, face_crop)
+
+        # Save embedding
+        emb_filename = f"{name}_{count:03d}.npy"
+        emb_path = os.path.join(img_dir, emb_filename)
+        np.save(emb_path, embedding)
+
+        print(f"[INFO] Saved {img_filename} and its embedding")
         count += 1
 
         if count >= MAX_IMAGES:
             break
 
-    # Show frame with rectangle
-    for (top, right, bottom, left) in face_locations:
-        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+    # Draw boxes
+    for det in detections:
+        x, y, w, h = det['box']
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     cv2.imshow("Face Capture", frame)
 
@@ -64,4 +71,4 @@ while count < MAX_IMAGES:
 
 cap.release()
 cv2.destroyAllWindows()
-print(f"[DONE] Collected {count} face images in: {user_dir}")
+print(f"[DONE] Collected {count} face images and embeddings in: {img_dir}")

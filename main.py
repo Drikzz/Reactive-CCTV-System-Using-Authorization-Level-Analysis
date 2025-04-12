@@ -5,7 +5,7 @@ from ultralytics import YOLO
 
 # Import face recognition utilities
 try:
-    from utils.face_utils import load_known_faces, recognize_faces
+    from utils.face_classifier import load_classifier_and_encoder, recognize_faces
     FACE_RECOGNITION_ENABLED = True
 except Exception as e:
     print(f"[ERROR] Couldn't import face_utils: {e}")
@@ -21,13 +21,13 @@ SAVE_DIR = "outputs/annotated_frames"
 # Load YOLOv8
 model = YOLO(MODEL_PATH)
 
-# Load known faces if available
-known_encodings, known_names = [], []
+# Load trained face recognition model
+classifier, label_encoder = None, None
 if FACE_RECOGNITION_ENABLED:
     try:
-        known_encodings, known_names = load_known_faces()
+        classifier, label_encoder = load_classifier_and_encoder(model_path='models')
     except Exception as e:
-        print(f"[ERROR] Failed to load faces: {e}")
+        print(f"[ERROR] Failed to load classifier or encoder: {e}")
         FACE_RECOGNITION_ENABLED = False
 
 # Set up video
@@ -44,11 +44,13 @@ while cap.isOpened():
         break
 
     results = model(frame)
+    print(results)
     annotated_frame = results[0].plot()
 
     if FACE_RECOGNITION_ENABLED:
         try:
-            faces = recognize_faces(frame, known_encodings, known_names)
+            faces = recognize_faces(frame, classifier, label_encoder)
+            print(faces)
             for face in faces:
                 name = face['name']
                 top, right, bottom, left = face['location']

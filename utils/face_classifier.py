@@ -69,3 +69,8 @@ def recognize_faces(frame, classifier, label_encoder, threshold=0.5):
         recognized.append({"name": name, "location": box})
 
     return recognized
+
+def load_classifier_and_encoder(model_path='models'):
+    classifier = joblib.load(os.path.join(model_path, 'svm_classifier.pkl'))
+    label_encoder = joblib.load(os.path.join(model_path, 'label_encoder.pkl'))
+    return classifier, label_encoder
