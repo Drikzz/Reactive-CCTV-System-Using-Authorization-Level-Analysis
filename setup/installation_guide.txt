@@ -20,14 +20,30 @@ pip3 install torch torchvision torchaudio
 
 (Official instructions: https://pytorch.org/)
 
-3. 🧠 Face Recognition Requirements
+3. 🧠 Install FaceNet and Other Core Dependencies
 
-Face recognition requires dlib and face_recognition. Since dlib can be tricky to install directly, use the provided .whl file:
+For FaceNet and other core libraries, run the following:
+```
+pip install keras-facenet numpy opencv-python tensorflow keras scikit-learn matplotlib
+```bash
 
-👉 Install from https://github.com/z-mahmud22/Dlib_Windows_Python3.x/blob/main/dlib-19.24.99-cp312-cp312-win_amd64.whl (Windows Only):
+4. 📦 Optional for Saving/Loading Models
 
-NOIE: Check official installation from PyTorh Website
-https://pytorch.org/
+If you need to save/load models (e.g., for FaceNet), you can install joblib:
+```
+pip install joblib
+```bash
+
+5. ✅ Test Your Setup
+
+Run this to test your YOLOv8 setup:
+```
+python yolov8_setup.py
+```bash
+
+ignore ignore ignore
+
+If everything works, it will load yolov8n.pt and perform inference on sample_image.jpg.
 
 Make sure you're in the root folder of the project (thesis_system/), then run:
 ```
@@ -40,12 +56,3 @@ Then install:
 ```
 pip install face_recognition
 ```bash
-
-✅ Test Your Setup
-
-Run this to test your YOLOv8 setup:
-```
-python yolov8_setup.py
-```bash
-
-If everything works, it will load yolov8n.pt and perform inference on sample_image.jpg.
