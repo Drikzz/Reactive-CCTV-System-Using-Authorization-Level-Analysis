@@ -1,0 +1,51 @@
+✅ Installation Guide for Thesis System
+
+This guide helps you set up your environment to run the YOLOv8 and Face Recognition modules.
+
+1. 📦 Basic Dependencies
+
+Run this command to install the base libraries:
+```bash
+pip install ultralytics opencv-python
+```
+
+2. 🔥 Install PyTorch (Required for YOLOv8)
+
+YOLOv8 depends on PyTorch. For CPU-only systems, install it using:
+
+For GPU-enabled systems (change cu118 based on your CUDA version):
+```
+pip3 install torch torchvision torchaudio
+```bash
+
+(Official instructions: https://pytorch.org/)
+
+3. 🧠 Face Recognition Requirements
+
+Face recognition requires dlib and face_recognition. Since dlib can be tricky to install directly, use the provided .whl file:
+
+👉 Install from https://github.com/z-mahmud22/Dlib_Windows_Python3.x/blob/main/dlib-19.24.99-cp312-cp312-win_amd64.whl (Windows Only):
+
+NOIE: Check official installation from PyTorh Website
+https://pytorch.org/
+
+Make sure you're in the root folder of the project (thesis_system/), then run:
+```
+pip install setup/dlib‑19.24.0‑cp38‑cp38‑win_amd64.whl
+```bash
+
+Replace the filename if you're using another version of Python or OS.
+
+Then install:
+```
+pip install face_recognition
+```bash
+
+✅ Test Your Setup
+
+Run this to test your YOLOv8 setup:
+```
+python yolov8_setup.py
+```bash
+
+If everything works, it will load yolov8n.pt and perform inference on sample_image.jpg.

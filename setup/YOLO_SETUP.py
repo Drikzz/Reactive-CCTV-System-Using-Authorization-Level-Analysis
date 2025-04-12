@@ -5,7 +5,7 @@ import cv2
 from ultralytics import YOLO
 
 def install_requirements():
-    os.system('pip install ultralytics opencv-python-headless')
+    os.system('pip install ultralytics opencv-python')
 
 def load_model(model_path="yolov8n.pt"):
     # Load YOLOv8 model
