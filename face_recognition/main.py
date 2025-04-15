@@ -1,4 +1,9 @@
+import sys
 import os
+
+# Add root directory to path so we can import utils
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import cv2
 from datetime import datetime
 from ultralytics import YOLO
