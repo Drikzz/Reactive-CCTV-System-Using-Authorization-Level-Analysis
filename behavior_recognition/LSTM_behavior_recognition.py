@@ -25,6 +25,7 @@ import os
 import random
 import math
 import json
+import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable, Set, Dict
 from threading import Lock
@@ -59,9 +60,20 @@ class LSTMConfig:
     show_video_conversion_progress: bool = True  # print % of videos converted to tensors
     cache_root: str = os.path.join('datasets', 'cache')  # root for cached tensors
     enable_cache: bool = True                            # toggle to disable caching
+    pre_cache_before_training: bool = True               # run a full dataset pass to build cache and time it
 
 
 # -------------------------- Dataset -------------------------- #
+
+def format_secs(secs: float) -> str:
+    secs = float(secs)
+    if secs < 60:
+        return f"{secs:.1f}s"
+    minutes, s = divmod(int(round(secs)), 60)
+    if minutes < 60:
+        return f"{minutes}m{s:02d}s"
+    hours, m = divmod(minutes, 60)
+    return f"{hours}h{m:02d}m{s:02d}s"
 class BehaviorVideoDataset(Dataset):
     def __init__(
         self,
@@ -352,7 +364,26 @@ def train_example():
     best_model_path = os.path.join(save_dir, 'best_model.pth')
     last_model_path = os.path.join(save_dir, 'last_model.pth')
 
+    # -------------------------- Preprocessing Timing -------------------------- #
+    # Warm-up/cache build timing: iterate through train and test datasets once to force
+    # decoding and caching, then report total preprocessing time.
+    if cfg.pre_cache_before_training:
+        print("Preprocessing: decoding videos and building cache (one pass)...")
+        t0 = time.time()
+        # Iterate dataset objects rather than loaders to avoid batching overhead
+        # Use a no-grad context for safety (though dataset __getitem__ doesn't use autograd)
+        try:
+            _ = [train_loader.dataset[i] for i in range(len(train_loader.dataset))]
+            _ = [test_loader.dataset[i] for i in range(len(test_loader.dataset))]
+        except Exception as e:
+            print(f"Warning during preprocessing pass: {e}")
+        t1 = time.time()
+        prep_secs = t1 - t0
+        print(f"Preprocessing completed in {format_secs(prep_secs)} ({prep_secs:.1f}s)")
+
+    epoch_times: List[float] = []
     for epoch in range(cfg.num_epochs):
+        epoch_start = time.time()
         model.train()
         running_loss = 0.0
         correct = 0
@@ -377,7 +408,12 @@ def train_example():
         print()
         train_loss = running_loss / max(1,total)
         train_acc = 100.0 * correct / max(1,total)
-        print(f"Epoch [{epoch+1}/{cfg.num_epochs}] loss={train_loss:.4f} acc={train_acc:.2f}%")
+        epoch_dur = time.time() - epoch_start
+        epoch_times.append(epoch_dur)
+        avg_epoch = sum(epoch_times) / len(epoch_times)
+        remaining = cfg.num_epochs - (epoch + 1)
+        eta_total = remaining * avg_epoch
+        print(f"Epoch [{epoch+1}/{cfg.num_epochs}] loss={train_loss:.4f} acc={train_acc:.2f}% | time={format_secs(epoch_dur)} | ETA total={format_secs(eta_total)}")
         # one quick evaluation pass (optional)
         if (epoch+1) % 5 == 0 or epoch == cfg.num_epochs - 1:
             model.eval()
