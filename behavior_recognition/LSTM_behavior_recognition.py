@@ -267,19 +267,26 @@ def discover_videos(root_dir: str, max_videos_per_class: Optional[int] = None) -
     video_label_pairs: List[Tuple[str, int]] = []
     if not os.path.isdir(root_dir):
         raise FileNotFoundError(f"Root directory not found: {root_dir}")
-    for entry in sorted(os.listdir(root_dir)):
-        class_path = os.path.join(root_dir, entry)
-        if os.path.isdir(class_path):
-            classes.append(entry)
-            vids = [os.path.join(class_path, f) for f in os.listdir(class_path) if f.lower().endswith('.mp4')]
-            vids = sorted(vids)
-            if max_videos_per_class is not None:
-                vids = vids[:max_videos_per_class]
-            label = len(classes) - 1
-            for v in vids:
-                video_label_pairs.append((v, label))
+    # Discover categories (e.g., neutral-actions, suspicious-actions)
+    for category in sorted(os.listdir(root_dir)):
+        category_path = os.path.join(root_dir, category)
+        if os.path.isdir(category_path):
+            # Discover classes within each category
+            for class_name in sorted(os.listdir(category_path)):
+                class_path = os.path.join(category_path, class_name)
+                if os.path.isdir(class_path):
+                    # Use 'category/class' as class label
+                    full_class_name = f"{category}/{class_name}"
+                    classes.append(full_class_name)
+                    vids = [os.path.join(class_path, f) for f in os.listdir(class_path) if f.lower().endswith('.mp4')]
+                    vids = sorted(vids)
+                    if max_videos_per_class is not None:
+                        vids = vids[:max_videos_per_class]
+                    label = len(classes) - 1
+                    for v in vids:
+                        video_label_pairs.append((v, label))
     if not classes:
-        raise RuntimeError(f"No class subdirectories with videos found under {root_dir}. Create structure root_dir/ClassName/*.mp4")
+        raise RuntimeError(f"No class subdirectories with videos found under {root_dir}. Create structure root_dir/category/class/*.mp4")
     return video_label_pairs, classes
 
 
