@@ -110,6 +110,10 @@ class BehaviorVideoDataset(Dataset):
         self.dataset_root = dataset_root
         if self.enable_cache:
             os.makedirs(self.cache_root, exist_ok=True)
+        # Track unreadable/corrupted videos
+        self.unreadable_videos: List[str] = []
+        self._unreadable_set: Set[str] = set()
+        self._unreadable_lock = Lock()
 
     def __len__(self):
         return len(self.video_label_pairs)
@@ -170,43 +174,59 @@ class BehaviorVideoDataset(Dataset):
                         cache_hit = True
                 except Exception:
                     cache_hit = False
+        unreadable = False
         if not cache_hit:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                raise RuntimeError(f"Failed to open video: {video_path}")
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            indices = self._sample_indices(frame_count)
-            wanted = set(indices)
-            cur = 0
-            grabbed_frames = {}
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if cur in wanted:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_like = T.functional.to_pil_image(frame_rgb)
-                    tensor = self.transform(pil_like)
-                    grabbed_frames[cur] = tensor
-                    if len(grabbed_frames) == len(wanted):
+                # Mark unreadable and use a fallback clip
+                unreadable = True
+                grabbed_frames = {}
+                indices = list(range(self.sequence_length))  # placeholder
+            else:
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                indices = self._sample_indices(frame_count)
+                wanted = set(indices)
+                cur = 0
+                grabbed_frames = {}
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
                         break
-                cur += 1
-            cap.release()
-            ordered = [grabbed_frames.get(i) for i in indices]
-            if ordered[0] is None:
-                # fallback black frame
-                fallback = torch.zeros(3, self.img_size, self.img_size)
-                ordered[0] = fallback
-            for i in range(1, len(ordered)):
-                if ordered[i] is None:
-                    ordered[i] = ordered[i - 1]
-            clip = torch.stack(ordered, dim=0)
-            if self.enable_cache and cache_path is not None:
-                try:
-                    torch.save(clip.cpu(), cache_path)
-                except Exception as e:
-                    if self.show_progress:
-                        print(f"Warning: failed to cache {cache_path}: {e}")
+                    if cur in wanted:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        pil_like = T.functional.to_pil_image(frame_rgb)
+                        tensor = self.transform(pil_like)
+                        grabbed_frames[cur] = tensor
+                        if len(grabbed_frames) == len(wanted):
+                            break
+                    cur += 1
+                cap.release()
+                if len(grabbed_frames) == 0:
+                    unreadable = True
+            if unreadable:
+                # Full fallback black clip for unreadable videos
+                clip = torch.zeros(self.sequence_length, 3, self.img_size, self.img_size)
+                # Track unreadable video (thread-safe, unique)
+                with self._unreadable_lock:
+                    if video_path not in self._unreadable_set:
+                        self._unreadable_set.add(video_path)
+                        self.unreadable_videos.append(video_path)
+            else:
+                ordered = [grabbed_frames.get(i) for i in indices]
+                if ordered[0] is None:
+                    # fallback black frame
+                    fallback = torch.zeros(3, self.img_size, self.img_size)
+                    ordered[0] = fallback
+                for i in range(1, len(ordered)):
+                    if ordered[i] is None:
+                        ordered[i] = ordered[i - 1]
+                clip = torch.stack(ordered, dim=0)
+                if self.enable_cache and cache_path is not None:
+                    try:
+                        torch.save(clip.cpu(), cache_path)
+                    except Exception as e:
+                        if self.show_progress:
+                            print(f"Warning: failed to cache {cache_path}: {e}")
         # At this point clip must be a tensor
         assert clip is not None, "Internal error: clip tensor not created"
         # Progress reporting (only first time per video)
@@ -216,7 +236,7 @@ class BehaviorVideoDataset(Dataset):
                     self._processed_videos.add(video_path)
                     self._processed_count += 1
                     pct = 100.0 * self._processed_count / max(1, self._total_videos)
-                    origin = 'CACHE' if cache_hit else 'DECODE'
+                    origin = 'CACHE' if cache_hit else ('UNREADABLE' if unreadable else 'DECODE')
                     print(f"Video tensor ready {self._processed_count}/{self._total_videos} ({pct:5.1f}%) [{origin}] - {os.path.basename(video_path)}")
         return clip, label
 
@@ -387,7 +407,18 @@ def train_example():
         t1 = time.time()
         prep_secs = t1 - t0
         print(f"Preprocessing completed in {format_secs(prep_secs)} ({prep_secs:.1f}s)")
-
+        # Report unreadable videos detected during preprocessing
+        unreadable_all = list(dict.fromkeys(
+            train_loader.dataset.unreadable_videos + test_loader.dataset.unreadable_videos
+        ))
+        if len(unreadable_all) > 0:
+            print("Unreadable videos detected (replaced with black frames):")
+            for p in unreadable_all:
+                try:
+                    rel = os.path.relpath(p, cfg.root_dir)
+                except Exception:
+                    rel = p
+                print(f"  - {rel}")
     epoch_times: List[float] = []
     for epoch in range(cfg.num_epochs):
         epoch_start = time.time()
