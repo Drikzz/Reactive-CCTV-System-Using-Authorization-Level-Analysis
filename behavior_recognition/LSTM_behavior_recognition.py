@@ -37,6 +37,11 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 import torchvision.models as models
+# Optuna for HPO
+try:
+    import optuna  # type: ignore
+except Exception:
+    optuna = None
 
 # -------------------------- Configuration -------------------------- #
 @dataclass
@@ -58,9 +63,14 @@ class LSTMConfig:
     max_videos_per_class: Optional[int] = None  # for quick debugging
     frame_sampling: str = 'stride'        # 'uniform' | 'stride' | 'random'
     show_video_conversion_progress: bool = True  # print % of videos converted to tensors
-    cache_root: str = os.path.join('datasets', 'cache')  # root for cached tensors
+    cache_root: str = os.path.join('datasets', 'cache', 'LSTM')  # root for cached tensors
     enable_cache: bool = True                            # toggle to disable caching
     pre_cache_before_training: bool = True               # run a full dataset pass to build cache and time it
+    # ---- Optuna tuning toggles (keep defaults; only override LR, dropout, batch size) ----
+    use_optuna: bool = False
+    optuna_trials: int = 10
+    val_split: float = 0.2
+    early_stop_patience: int = 5
 
 
 # -------------------------- Dataset -------------------------- #
@@ -74,6 +84,7 @@ def format_secs(secs: float) -> str:
         return f"{minutes}m{s:02d}s"
     hours, m = divmod(minutes, 60)
     return f"{hours}h{m:02d}m{s:02d}s"
+
 class BehaviorVideoDataset(Dataset):
     def __init__(
         self,
@@ -326,6 +337,28 @@ def make_splits(video_label_pairs: List[Tuple[str, int]], classes: List[str], tr
         test_pairs.extend([(p, label) for p in test_paths])
     return train_pairs, test_pairs
 
+def split_train_val_pairs(
+    train_pairs: List[Tuple[str,int]],
+    classes: List[str],
+    val_ratio: float,
+    seed: int
+) -> Tuple[List[Tuple[str,int]], List[Tuple[str,int]]]:
+    """Per-class split of given train_pairs into (train_sub, val_sub)."""
+    rng = random.Random(seed)
+    by_class: Dict[int, List[str]] = {i: [] for i in range(len(classes))}
+    for path, label in train_pairs:
+        by_class[label].append(path)
+    train_sub: List[Tuple[str,int]] = []
+    val_sub: List[Tuple[str,int]] = []
+    for label, paths in by_class.items():
+        paths = paths[:]  # copy
+        rng.shuffle(paths)
+        k_val = max(1, int(math.floor(len(paths) * val_ratio))) if len(paths) > 1 else 0
+        val_paths = paths[:k_val]
+        tr_paths = paths[k_val:]
+        train_sub.extend([(p, label) for p in tr_paths])
+        val_sub.extend([(p, label) for p in val_paths])
+    return train_sub, val_sub
 
 # -------------------------- Build Datasets & Loaders -------------------------- #
 
@@ -351,6 +384,178 @@ def build_dataloaders(cfg: LSTMConfig):
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
     return train_loader, test_loader, classes
 
+def build_train_val_test_loaders(cfg: LSTMConfig, batch_size_override: Optional[int] = None):
+    """Like build_dataloaders, but also returns a validation loader split from training."""
+    video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
+    train_sub, val_sub = split_train_val_pairs(train_pairs, classes, cfg.val_split, cfg.random_seed)
+
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Resize((cfg.img_size, cfg.img_size)),
+        T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+    ])
+    train_ds = BehaviorVideoDataset(
+        train_sub, classes, cfg.sequence_length, transform, cfg.img_size,
+        cfg.frame_sampling, show_progress=cfg.show_video_conversion_progress,
+        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+    )
+    val_ds = BehaviorVideoDataset(
+        val_sub, classes, cfg.sequence_length, transform, cfg.img_size,
+        cfg.frame_sampling, show_progress=False,
+        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+    )
+    test_ds = BehaviorVideoDataset(
+        test_pairs, classes, cfg.sequence_length, transform, cfg.img_size,
+        cfg.frame_sampling, show_progress=False,
+        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+    )
+    bs = batch_size_override if batch_size_override is not None else cfg.batch_size
+    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+    return train_loader, val_loader, test_loader, classes
+
+# -------------------------- Training / Evaluation Helpers -------------------------- #
+
+def run_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, optimizer: Optional[torch.optim.Optimizer], device: torch.device):
+    """Train if optimizer is provided; otherwise evaluate. Returns (avg_loss, accuracy)."""
+    if optimizer is None:
+        model.eval()
+        torch.set_grad_enabled(False)
+    else:
+        model.train()
+        torch.set_grad_enabled(True)
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for clips, labels in loader:
+        clips, labels = clips.to(device), labels.to(device)
+        outputs = model(clips)
+        loss = criterion(outputs, labels)
+        if optimizer is not None:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        running_loss += loss.item() * labels.size(0)
+        _, pred = outputs.max(1)
+        total += labels.size(0)
+        correct += pred.eq(labels).sum().item()
+
+    avg_loss = running_loss / max(1, total)
+    acc = 100.0 * correct / max(1, total)
+    return avg_loss, acc
+
+# -------------------------- Optuna Tuning -------------------------- #
+
+def tune_with_optuna(cfg: LSTMConfig):
+    if optuna is None:
+        print("Optuna not installed. Run: pip install optuna")
+        return
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Optuna tuning on device: {device}")
+
+    # Prepare static datasets (recreated per batch size change to adjust loaders)
+    def build_loaders_for_bs(bs: int):
+        return build_train_val_test_loaders(cfg, batch_size_override=bs)
+
+    def objective(trial: "optuna.trial.Trial") -> float:
+        # Search space (override only LR, dropout, batch size)
+        lr = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+        dropout = trial.suggest_float("dropout", 0.1, 0.7)
+        bs_choices = sorted({cfg.batch_size, max(1, cfg.batch_size // 2), cfg.batch_size * 2})
+        bs = trial.suggest_categorical("batch_size", bs_choices)
+
+        train_loader, val_loader, _test_loader, classes = build_loaders_for_bs(bs)
+
+        model = CNNLSTM(
+            num_classes=len(classes),
+            hidden_size=cfg.hidden_size,
+            num_layers=cfg.num_layers,
+            bidirectional=cfg.bidirectional,
+            dropout=dropout,
+            freeze_cnn=cfg.freeze_cnn
+        ).to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+
+        best_val_loss = float('inf')
+        best_state = None
+        patience = cfg.early_stop_patience
+        epochs_no_improve = 0
+
+        for epoch in range(cfg.num_epochs):
+            _train_loss, _train_acc = run_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, _val_acc = run_epoch(model, val_loader, criterion, None, device)
+
+            # Early stopping on validation loss
+            if val_loss + 1e-8 < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    break
+
+            # Report progress to Optuna
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        # Restore best weights before returning objective
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return best_val_loss
+
+    study = optuna.create_study(direction="minimize")
+    n_trials = min(cfg.optuna_trials, 10)  # hard cap at 10
+    study.optimize(objective, n_trials=n_trials)
+
+    print(f"Best trial: {study.best_trial.number}")
+    best_params = study.best_trial.params
+    print(f"Best params: {best_params}")
+
+    # Evaluate validation accuracy with best params (retrain once with early stopping)
+    bs = best_params.get("batch_size", cfg.batch_size)
+    lr = best_params.get("learning_rate", cfg.learning_rate)
+    dropout = best_params.get("dropout", cfg.dropout)
+
+    train_loader, val_loader, _test_loader, classes = build_train_val_test_loaders(cfg, batch_size_override=bs)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = CNNLSTM(
+        num_classes=len(classes),
+        hidden_size=cfg.hidden_size,
+        num_layers=cfg.num_layers,
+        bidirectional=cfg.bidirectional,
+        dropout=dropout,
+        freeze_cnn=cfg.freeze_cnn
+    ).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+
+    best_state = None
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    for epoch in range(cfg.num_epochs):
+        _train_loss, _ = run_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, _ = run_epoch(model, val_loader, criterion, None, device)
+        if val_loss + 1e-8 < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= cfg.early_stop_patience:
+                break
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    _, val_acc = run_epoch(model, val_loader, criterion, None, device)
+    print(f"Best validation accuracy: {val_acc:.2f}%")
 
 # -------------------------- Example Training Loop -------------------------- #
 
@@ -358,6 +563,10 @@ def train_example():
     cfg = LSTMConfig()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+    # If tuning requested, run Optuna and exit
+    if cfg.use_optuna:
+        tune_with_optuna(cfg)
+        return
     try:
         train_loader, test_loader, classes = build_dataloaders(cfg)
     except Exception as e:
