@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import cv2
 from datetime import datetime
+import numpy as np
 from ultralytics import YOLO
 
 # FaceNet utils
@@ -21,19 +22,36 @@ except Exception as e:
 USE_WEBCAM = True
 VIDEO_PATH = "sample_video.mp4"
 MODEL_PATH = "models/YOLOv8/yolov8n.pt"
-ANNOTATED_FRAME_DIR = "outputs/annotated_frames/known"  # Full frame saves here
-LOGS_DIR = "logs/unknown"
+# Updated output directory structure
+OUTPUT_DIR = "outputs"
+ANNOTATED_FRAMES_DIR = os.path.join(OUTPUT_DIR, "annotated_frames")
+CROPPED_FACES_DIR = os.path.join(OUTPUT_DIR, "cropped_faces")
 SAVE_FACES = True
 RESIZE_WIDTH = 640
-RECOG_THRESHOLD = 0.6  # probability threshold to accept identity
+RECOG_THRESHOLD = 0.65  # probability threshold to accept identity
 # -------------- 
 
 model = YOLO(MODEL_PATH)
 
-classifier, label_encoder = None, None
+classifier, label_encoder, centroids = None, None, None
+# dist_threshold = 1.0  # Default if not loaded from file
+dist_threshold = 0.8  # hardcoded
+
 if FACE_RECOGNITION_ENABLED:
     try:
-        classifier, label_encoder = load_classifier_and_encoder(model_path='models/Facenet/')
+        classifier, label_encoder, centroids = load_classifier_and_encoder(model_path='models/Facenet/')
+        
+        # Load distance threshold if available
+        threshold_path = os.path.join('models/Facenet/', 'distance_threshold.npy')
+        if os.path.exists(threshold_path):
+            dist_threshold = float(np.load(threshold_path))
+            print(f"[INFO] Loaded distance threshold: {dist_threshold:.3f}")
+        else:
+            print(f"[INFO] Using default distance threshold: {dist_threshold:.3f}")
+            
+        print(f"[INFO] Loaded classifier with {len(label_encoder.classes_)} known identities")
+        if centroids:
+            print(f"[INFO] Loaded {len(centroids)} class centroids")
     except Exception as e:
         print(f"[ERROR] Failed to load classifier or encoder: {e}")
         FACE_RECOGNITION_ENABLED = False
@@ -42,8 +60,11 @@ cap = cv2.VideoCapture(0 if USE_WEBCAM else VIDEO_PATH)
 
 # Create output folders if saving faces
 if SAVE_FACES:
-    os.makedirs(ANNOTATED_FRAME_DIR, exist_ok=True)
-    os.makedirs(LOGS_DIR, exist_ok=True)
+    # Create all necessary directories
+    os.makedirs(os.path.join(ANNOTATED_FRAMES_DIR, "known"), exist_ok=True)
+    os.makedirs(os.path.join(ANNOTATED_FRAMES_DIR, "unknown"), exist_ok=True)
+    os.makedirs(os.path.join(CROPPED_FACES_DIR, "known"), exist_ok=True)
+    os.makedirs(os.path.join(CROPPED_FACES_DIR, "unknown"), exist_ok=True)
 
 frame_num = 0
 print("[INFO] Starting detection" + (" + face recognition" if FACE_RECOGNITION_ENABLED else ""))
@@ -75,10 +96,14 @@ while cap.isOpened():
     # --- Face Recognition or fallback ---
     if FACE_RECOGNITION_ENABLED:
         try:
-            faces = recognize_faces(original_frame, classifier, label_encoder, threshold=RECOG_THRESHOLD)
+            faces = recognize_faces(original_frame, classifier, label_encoder, 
+                                   threshold=RECOG_THRESHOLD, 
+                                   centroids=centroids,
+                                   dist_threshold=dist_threshold)
             for face in faces:
                 name = face['name']
                 prob = face.get('prob', 0.0)
+                distance = face.get('distance', None)
                 x1o, y1o, x2o, y2o = face['bbox']
 
                 # Scale face coords to resized frame
@@ -88,65 +113,78 @@ while cap.isOpened():
                 y2_r = int(y2o * ratio)
                 face_center = ((x1_r + x2_r) // 2, (y1_r + y2_r) // 2)
 
+                # Save cropped face (both known and unknown)
+                if SAVE_FACES:
+                    face_crop = original_frame[y1o:y2o, x1o:x2o]
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S%f')
+                    
+                    # Save to appropriate directory based on recognition result
+                    if name != "Unknown":
+                        filename = f"{name}_{timestamp}.jpg"
+                        save_path = os.path.join(CROPPED_FACES_DIR, "known", filename)
+                    else:
+                        filename = f"unknown_{timestamp}.jpg"
+                        save_path = os.path.join(CROPPED_FACES_DIR, "unknown", filename)
+                    
+                    cv2.imwrite(save_path, face_crop)
+
                 matched = False
                 for (x1, y1, x2, y2) in people_boxes:
                     if x1 <= face_center[0] <= x2 and y1 <= face_center[1] <= y2:
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        label = f"{name}" if name == "Unknown" else f"{name} {prob:.2f}"
-                        cv2.putText(annotated_frame, label, (x1, y1 - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        # Simplified display - only show name, no probabilities
+                        color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated_frame, name, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                         matched = True
                         break
 
                 if not matched:
-                    cv2.rectangle(annotated_frame, (x1_r, y1_r), (x2_r, y2_r), (0, 255, 0), 2)
-                    label = f"{name}" if name == "Unknown" else f"{name} {prob:.2f}"
-                    cv2.putText(annotated_frame, label, (x1_r, y1_r - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                # Save unknown faces even when recognition is enabled
-                if SAVE_FACES and name == "Unknown":
-                    x1c = max(0, int(x1o))
-                    y1c = max(0, int(y1o))
-                    x2c = min(orig_w - 1, int(x2o))
-                    y2c = min(orig_h - 1, int(y2o))
-                    if x2c > x1c and y2c > y1c:
-                        unknown_face = original_frame[y1c:y2c, x1c:x2c]
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S%f')
-                        filename = f"unknown_{timestamp}.jpg"
-                        save_path = os.path.join(LOGS_DIR, filename)
-                        cv2.imwrite(save_path, unknown_face)
+                    # Simplified display - only show name, no probabilities
+                    color = (0, 255, 0)
+                    cv2.rectangle(annotated_frame, (x1_r, y1_r), (x2_r, y2_r), color, 2)
+                    cv2.putText(annotated_frame, name, (x1_r, y1_r - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         except Exception as e:
             print(f"[ERROR] Face recognition failed: {e}")
-            FACE_RECOGNITION_ENABLED = False
-
-    else:
-        # --- Fallback for unknown faces if recognition is disabled ---
-        # Use YOLO detections for the bounding boxes (red border for unknown people)
-        for (x1, y1, x2, y2) in people_boxes:
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red border
-            cv2.putText(annotated_frame, "Unknown", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            
-            # Save cropped image of the unknown face (inverse-scale to original frame)
-            if SAVE_FACES:
-                x1o = max(0, int(x1 / ratio))
-                y1o = max(0, int(y1 / ratio))
-                x2o = min(orig_w - 1, int(x2 / ratio))
-                y2o = min(orig_h - 1, int(y2 / ratio))
-                if x2o > x1o and y2o > y1o:
-                    unknown_face = original_frame[y1o:y2o, x1o:x2o]
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S%f')
-                    filename = f"unknown_{timestamp}.jpg"
-                    save_path = os.path.join(LOGS_DIR, filename)
-                    cv2.imwrite(save_path, unknown_face)
+            # Fall back to YOLO detections
+            for (x1, y1, x2, y2) in people_boxes:
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)  # Red border
+                cv2.putText(annotated_frame, "Unknown", (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                
+                # Save cropped image of the unknown face
+                if SAVE_FACES:
+                    x1o = max(0, int(x1 / ratio))
+                    y1o = max(0, int(y1 / ratio))
+                    x2o = min(orig_w - 1, int(x2 / ratio))
+                    y2o = min(orig_h - 1, int(y2 / ratio))
+                    if x2o > x1o and y2o > y1o:
+                        unknown_face = original_frame[y1o:y2o, x1o:x2o]
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S%f')
+                        filename = f"unknown_{timestamp}.jpg"
+                        save_path = os.path.join(CROPPED_FACES_DIR, "unknown", filename)
+                        cv2.imwrite(save_path, unknown_face)
 
     # --- Save Full Annotated Frame (with bounding boxes) ---
     if SAVE_FACES:
-        # Save the full annotated frame (with bounding boxes) in 'annotated_frames/known'
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S%f')
         frame_filename = f"frame_{frame_num}_{timestamp}.jpg"
-        frame_path = os.path.join(ANNOTATED_FRAME_DIR, frame_filename)
+        
+        # Determine if this frame contains known or unknown faces
+        has_known_face = False
+        if FACE_RECOGNITION_ENABLED:
+            try:
+                has_known_face = any(face['name'] != "Unknown" for face in faces)
+            except:
+                pass
+        
+        # Save to appropriate directory
+        if has_known_face:
+            frame_path = os.path.join(ANNOTATED_FRAMES_DIR, "known", frame_filename)
+        else:
+            frame_path = os.path.join(ANNOTATED_FRAMES_DIR, "unknown", frame_filename)
+        
         cv2.imwrite(frame_path, annotated_frame)
 
     # --- Display ---

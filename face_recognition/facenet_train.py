@@ -11,10 +11,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # from utils.common import load_known_faces
 from utils.face_classifier import train_classifier, save_classifier_and_encoder
-from utils.facenet_utils import get_embedder
+from utils.facenet_utils import get_embedder, compute_embedding_distance
 
 DATASET_DIR = "datasets/faces"
 FACE_SIZE = (160, 160)
+DISTANCE_THRESHOLD = 1.0  # Default distance threshold for open-set recognition
 
 def load_images_and_embeddings(dataset_dir, embedder, image_size=(160, 160)):
     X, y = [], []
@@ -60,8 +61,34 @@ counts = Counter(names)
 if any(c < 2 for c in counts.values()) or len(counts) < 2:
     print("[WARN] Not enough samples per class for stratified split. Training on all data; skipping evaluation.")
     X_all = np.asarray(faces, dtype=np.float32)
-    model, le = train_classifier(X_all, list(names))
-    save_classifier_and_encoder(model, le, save_path='models/Facenet/')
+    model, le, centroids = train_classifier(X_all, list(names))
+    
+    # Calculate optimal distance threshold based on intra-class distances
+    print("[INFO] Computing optimal distance threshold...")
+    
+    # A simple approach: use the average of maximum intra-class distances
+    max_intra_distances = []
+    for name, centroid in centroids.items():
+        class_indices = [i for i, n in enumerate(names) if n == name]
+        if len(class_indices) > 1:  # Need at least 2 samples for distances
+            class_embeddings = [faces[i] for i in class_indices]
+            distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
+            max_intra_distances.append(max(distances))
+    
+    if max_intra_distances:
+        optimal_threshold = 1.2 * np.mean(max_intra_distances)  # Scale factor for margin
+        print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
+    else:
+        optimal_threshold = DISTANCE_THRESHOLD
+        print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
+    
+    # Save the threshold along with the model
+    model_path = 'models/Facenet/'
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+    np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
+    
+    save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
     sys.exit(0)
 
 X = np.asarray(faces, dtype=np.float32)
@@ -77,13 +104,59 @@ try:
     )
 except ValueError as e:
     print(f"[WARN] Stratified split failed: {e}. Training on all data; skipping evaluation.")
-    model, le = train_classifier(X, list(y_names))
-    save_classifier_and_encoder(model, le, save_path='models/Facenet/')
+    model, le, centroids = train_classifier(X, list(y_names))
+    
+    # Calculate optimal distance threshold (same as above)
+    print("[INFO] Computing optimal distance threshold...")
+    max_intra_distances = []
+    for name, centroid in centroids.items():
+        class_indices = [i for i, n in enumerate(y_names) if n == name]
+        if len(class_indices) > 1:
+            class_embeddings = [X[i] for i in class_indices]
+            distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
+            max_intra_distances.append(max(distances))
+    
+    if max_intra_distances:
+        optimal_threshold = 1.2 * np.mean(max_intra_distances)
+        print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
+    else:
+        optimal_threshold = DISTANCE_THRESHOLD
+        print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
+    
+    model_path = 'models/Facenet/'
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+    np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
+    
+    save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
     sys.exit(0)
 
 # Train on train set
-model, le = train_classifier(X_train, list(y_train))
-save_classifier_and_encoder(model, le, save_path='models/Facenet/')
+model, le, centroids = train_classifier(X_train, list(y_train))
+
+# Calculate optimal distance threshold
+print("[INFO] Computing optimal distance threshold...")
+max_intra_distances = []
+for name, centroid in centroids.items():
+    class_indices = [i for i, n in enumerate(y_train) if n == name]
+    if len(class_indices) > 1:
+        class_embeddings = [X_train[i] for i in class_indices]
+        distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
+        max_intra_distances.append(max(distances))
+
+if max_intra_distances:
+    optimal_threshold = 1.2 * np.mean(max_intra_distances)
+    print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
+else:
+    optimal_threshold = DISTANCE_THRESHOLD
+    print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
+
+model_path = 'models/Facenet/'
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
+
+save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
 
 # Evaluate on val and test
 def eval_split(split_name, Xs, ys):
@@ -95,16 +168,6 @@ def eval_split(split_name, Xs, ys):
     print(f"[EVAL] {split_name} confusion matrix:\n{cm}")
     return report, cm
 
+# Call eval_split for validation and test sets
 val_report, val_cm = eval_split("Validation", X_val, y_val)
 test_report, test_cm = eval_split("Test", X_test, y_test)
-
-# Save metrics
-os.makedirs('models', exist_ok=True)
-with open(os.path.join('models', 'metrics.txt'), 'w') as f:
-    f.write("=== Validation ===\n")
-    f.write(val_report + "\n")
-    f.write(str(val_cm) + "\n\n")
-    f.write("=== Test ===\n")
-    f.write(test_report + "\n")
-    f.write(str(test_cm) + "\n")
-print("[INFO] Metrics saved to models/metrics.txt")
