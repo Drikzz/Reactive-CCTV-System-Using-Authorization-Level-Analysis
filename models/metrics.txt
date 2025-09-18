@@ -1,8 +1,8 @@
 === Validation ===
               precision    recall  f1-score   support
 
-     Aldrikz     1.0000    1.0000    1.0000        16
-        hope     1.0000    1.0000    1.0000        16
+   Aldrikzm8     1.0000    1.0000    1.0000        16
+         Art     1.0000    1.0000    1.0000        16
 
     accuracy                         1.0000        32
    macro avg     1.0000    1.0000    1.0000        32
@@ -14,8 +14,8 @@ weighted avg     1.0000    1.0000    1.0000        32
 === Test ===
               precision    recall  f1-score   support
 
-     Aldrikz     1.0000    1.0000    1.0000        20
-        hope     1.0000    1.0000    1.0000        20
+   Aldrikzm8     1.0000    1.0000    1.0000        20
+         Art     1.0000    1.0000    1.0000        20
 
     accuracy                         1.0000        40
    macro avg     1.0000    1.0000    1.0000        40

@@ -4,36 +4,82 @@ from collections import Counter
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
+import cv2
 
 # Add the root project dir to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from utils.common import load_known_faces
+# from utils.common import load_known_faces
 from utils.face_classifier import train_classifier, save_classifier_and_encoder
+from utils.facenet_utils import get_embedder
 
-faces, names = load_known_faces("datasets/faces")
-if not faces:
-    print("[ERROR] No face embeddings found. Capture faces first.")
+DATASET_DIR = "datasets/faces"
+FACE_SIZE = (160, 160)
+
+def load_images_and_embeddings(dataset_dir, embedder, image_size=(160, 160)):
+    X, y = [], []
+    if not os.path.isdir(dataset_dir):
+        return X, y
+
+    # Each subfolder is a person/class
+    for person in sorted(os.listdir(dataset_dir)):
+        person_dir = os.path.join(dataset_dir, person)
+        if not os.path.isdir(person_dir):
+            continue
+
+        for fname in sorted(os.listdir(person_dir)):
+            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            fpath = os.path.join(person_dir, fname)
+            img = cv2.imread(fpath)
+            if img is None or img.size == 0:
+                continue
+
+            # Images are already aligned crops; ensure size and compute embedding
+            if (img.shape[1], img.shape[0]) != image_size:
+                img = cv2.resize(img, image_size)
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            try:
+                emb = embedder.embeddings([rgb])[0]
+            except Exception as e:
+                print(f"[WARN] Embedding failed for {fpath}: {e}")
+                continue
+            X.append(emb)
+            y.append(person)
+    return X, y
+
+embedder = get_embedder()
+faces, names = load_images_and_embeddings(DATASET_DIR, embedder, FACE_SIZE)
+
+if not faces or not names:
+    print("[ERROR] No face images found. Capture faces first.")
     sys.exit(1)
 
-# Ensure stratified split is feasible
 counts = Counter(names)
 if any(c < 2 for c in counts.values()) or len(counts) < 2:
     print("[WARN] Not enough samples per class for stratified split. Training on all data; skipping evaluation.")
-    model, le = train_classifier(faces, names)
+    X_all = np.asarray(faces, dtype=np.float32)
+    model, le = train_classifier(X_all, list(names))
     save_classifier_and_encoder(model, le, save_path='models/Facenet/')
     sys.exit(0)
 
 X = np.asarray(faces, dtype=np.float32)
 y_names = np.array(names)
 
-# Split: 20% test, then 20% of remaining for val
-X_trainval, X_test, y_trainval, y_test = train_test_split(
-    X, y_names, test_size=0.2, random_state=42, stratify=y_names
-)
-X_train, X_val, y_train, y_val = train_test_split(
-    X_trainval, y_trainval, test_size=0.2, random_state=42, stratify=y_trainval
-)
+# Try stratified splits; fallback to train-all if it fails
+try:
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X, y_names, test_size=0.2, random_state=42, stratify=y_names
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.2, random_state=42, stratify=y_trainval
+    )
+except ValueError as e:
+    print(f"[WARN] Stratified split failed: {e}. Training on all data; skipping evaluation.")
+    model, le = train_classifier(X, list(y_names))
+    save_classifier_and_encoder(model, le, save_path='models/Facenet/')
+    sys.exit(0)
 
 # Train on train set
 model, le = train_classifier(X_train, list(y_train))
