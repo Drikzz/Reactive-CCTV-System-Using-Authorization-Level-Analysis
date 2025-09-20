@@ -76,19 +76,20 @@ if any(c < 2 for c in counts.values()) or len(counts) < 2:
             max_intra_distances.append(max(distances))
     
     if max_intra_distances:
-        optimal_threshold = 1.2 * np.mean(max_intra_distances)  # Scale factor for margin
+        optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
+        print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
         print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
     else:
         optimal_threshold = DISTANCE_THRESHOLD
         print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
     
     # Save the threshold along with the model
-    model_path = 'models/Facenet/'
+    model_path = 'models/FaceNet/'
     if not os.path.exists(model_path):
         os.makedirs(model_path)
     np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
     
-    save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
+    save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
     sys.exit(0)
 
 X = np.asarray(faces, dtype=np.float32)
@@ -117,18 +118,19 @@ except ValueError as e:
             max_intra_distances.append(max(distances))
     
     if max_intra_distances:
-        optimal_threshold = 1.2 * np.mean(max_intra_distances)
+        optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
+        print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
         print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
     else:
         optimal_threshold = DISTANCE_THRESHOLD
         print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
     
-    model_path = 'models/Facenet/'
+    model_path = 'models/FaceNet/'
     if not os.path.exists(model_path):
         os.makedirs(model_path)
     np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
     
-    save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
+    save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
     sys.exit(0)
 
 # Train on train set
@@ -145,18 +147,19 @@ for name, centroid in centroids.items():
         max_intra_distances.append(max(distances))
 
 if max_intra_distances:
-    optimal_threshold = 1.2 * np.mean(max_intra_distances)
+    optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
+    print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
     print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
 else:
     optimal_threshold = DISTANCE_THRESHOLD
     print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
 
-model_path = 'models/Facenet/'
+model_path = 'models/FaceNet/'
 if not os.path.exists(model_path):
     os.makedirs(model_path)
 np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
 
-save_classifier_and_encoder(model, le, save_path='models/Facenet/', centroids=centroids)
+save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
 
 # Evaluate on val and test
 def eval_split(split_name, Xs, ys):
