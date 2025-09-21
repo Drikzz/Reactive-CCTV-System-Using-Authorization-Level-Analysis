@@ -34,7 +34,7 @@ import cv2  # type: ignore
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import torchvision.transforms as T
 import torchvision.models as models
 # Optuna for HPO
@@ -71,7 +71,14 @@ class LSTMConfig:
     optuna_trials: int = 10
     val_split: float = 0.2
     early_stop_patience: int = 5
-
+    # Balancing cap
+    cap_per_class: int = 200
+    # Augmentation probs/magnitude (training only, for augmented entries)
+    aug_flip_p: float = 0.5
+    aug_crop_scale: Tuple[float,float] = (0.8, 1.0)
+    aug_crop_ratio: Tuple[float,float] = (0.9, 1.1)
+    aug_brightness: Tuple[float,float] = (0.8, 1.2)
+    aug_contrast: Tuple[float,float] = (0.8, 1.2)
 
 # -------------------------- Dataset -------------------------- #
 
@@ -88,46 +95,87 @@ def format_secs(secs: float) -> str:
 class BehaviorVideoDataset(Dataset):
     def __init__(
         self,
-        video_label_pairs: List[Tuple[str, int]],
+        video_label_pairs: List[Tuple[str, int]],  # or (path, label, aug_flag)
         classes: List[str],
         sequence_length: int,
-        transform: Optional[Callable] = None,
+        transform: Optional[Callable] = None,  # now expected to be normalization only
         img_size: int = 224,
         frame_sampling: str = 'uniform',
         show_progress: bool = True,
         cache_root: Optional[str] = None,
         enable_cache: bool = True,
         dataset_root: Optional[str] = None,
+        # new optional augmentation knobs (used only when per-sample aug flag is True)
+        aug_flip_p: float = 0.5,
+        aug_crop_scale: Tuple[float,float] = (0.8, 1.0),
+        aug_crop_ratio: Tuple[float,float] = (0.9, 1.1),
+        aug_brightness: Tuple[float,float] = (0.8, 1.2),
+        aug_contrast: Tuple[float,float] = (0.8, 1.2),
     ):
-        self.video_label_pairs = video_label_pairs
+        # core meta
         self.classes = classes
         self.sequence_length = sequence_length
-        self.img_size = img_size  # store for caching / fallback frame
-        self.transform = transform or T.Compose([
+        self.img_size = img_size
+        # base preprocess: ToTensor+Resize only (cached), normalization applied later
+        self._preprocess = T.Compose([
             T.ToTensor(),
             T.Resize((img_size, img_size)),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
+        # normalization params (use provided Normalize if passed)
+        if isinstance(transform, T.Normalize):
+            mean = transform.mean
+            std = transform.std
+        else:
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+        self._mean = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
+        self._std = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
+
         self.frame_sampling = frame_sampling
         self.show_progress = show_progress
-        # Tracking conversion progress (only counts first-time tensorization of a video)
+        # progress tracking
         self._processed_videos = set()
         self._processed_count = 0
         self._progress_lock = Lock()
         self._total_videos = len(video_label_pairs)
-        # Caching setup
+        # caching
         self.enable_cache = enable_cache and (cache_root is not None)
         self.cache_root = cache_root
         self.dataset_root = dataset_root
         if self.enable_cache:
             os.makedirs(self.cache_root, exist_ok=True)
-        # Track unreadable/corrupted videos
+        # unreadable
         self.unreadable_videos: List[str] = []
         self._unreadable_set: Set[str] = set()
         self._unreadable_lock = Lock()
+        # per-sample fields
+        self.paths: List[str] = []
+        self.labels_only: List[int] = []
+        self.aug_flags: List[bool] = []
+        for item in video_label_pairs:
+            if len(item) == 2:
+                pth, lab = item  # type: ignore
+                augf = False
+            else:
+                pth, lab, augf = item  # type: ignore
+            self.paths.append(pth)
+            self.labels_only.append(int(lab))
+            self.aug_flags.append(bool(augf))
+        # class counts after capping/duplication
+        n_classes = len(classes)
+        self.class_counts: List[int] = [0] * n_classes
+        for lab in self.labels_only:
+            if 0 <= lab < n_classes:
+                self.class_counts[lab] += 1
+        # aug params
+        self.aug_flip_p = aug_flip_p
+        self.aug_crop_scale = aug_crop_scale
+        self.aug_crop_ratio = aug_crop_ratio
+        self.aug_brightness = aug_brightness
+        self.aug_contrast = aug_contrast
 
     def __len__(self):
-        return len(self.video_label_pairs)
+        return len(self.paths)
 
     def _sample_indices(self, total_frames: int) -> List[int]:
         Tseq = self.sequence_length
@@ -156,101 +204,153 @@ class BehaviorVideoDataset(Dataset):
                     idxs.extend(idxs[: max(0, Tseq - len(idxs))])
                 return idxs[:Tseq]
 
+    def _cache_path_for(self, video_path: str) -> Tuple[str, bool]:
+        """Return (cache_path, path_is_already_cache)."""
+        if self.cache_root is None:
+            return "", False
+        # if a .npy is already provided as path, load it directly
+        if video_path.lower().endswith(".npy"):
+            return video_path, True
+        # else, derive relative path from dataset_root (if possible) and build .npy path
+        if self.dataset_root and os.path.commonpath([os.path.abspath(video_path), os.path.abspath(self.dataset_root)]) == os.path.abspath(self.dataset_root):
+            rel = os.path.relpath(video_path, self.dataset_root)
+        else:
+            rel = os.path.basename(video_path)
+        rel_no_ext, _ = os.path.splitext(rel)
+        rel_no_ext = rel_no_ext.replace('\\', '/').replace('..', '')
+        rel_no_ext_base = os.path.basename(rel_no_ext)
+        cache_filename = f"{rel_no_ext_base}_T{self.sequence_length}_S{self.frame_sampling}_IMG{self.img_size}.npy"
+        subdir = os.path.dirname(rel_no_ext)  # keep class/category structure
+        cache_dir = os.path.join(self.cache_root, subdir)
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, cache_filename), False
+
+    def _normalize_clip(self, clip: torch.Tensor) -> torch.Tensor:
+        # clip in [0,1], shape (T,3,H,W)
+        return (clip - self._mean) / self._std
+
+    def _augment_clip_inplace(self, clip: torch.Tensor) -> torch.Tensor:
+        # clip in [0,1], shape (T,3,H,W). Apply same params across all frames.
+        Tlen, C, H, W = clip.shape
+        # flip
+        do_flip = random.random() < self.aug_flip_p
+        # crop params from the first frame using torchvision helper
+        # convert one frame to PIL only to sample crop params
+        pil0 = T.functional.to_pil_image(clip[0].clamp(0,1))
+        i, j, h, w = T.RandomResizedCrop.get_params(
+            pil0, scale=self.aug_crop_scale, ratio=self.aug_crop_ratio
+        )
+        b_factor = random.uniform(*self.aug_brightness)
+        c_factor = random.uniform(*self.aug_contrast)
+        out_frames = []
+        for t in range(Tlen):
+            fr = clip[t]
+            if do_flip:
+                fr = torch.flip(fr, dims=[2])  # horizontal
+            fr = T.functional.resized_crop(
+                fr, i, j, h, w, (self.img_size, self.img_size),
+                interpolation=T.InterpolationMode.BILINEAR
+            )
+            fr = T.functional.adjust_brightness(fr, b_factor)
+            fr = T.functional.adjust_contrast(fr, c_factor)
+            out_frames.append(fr)
+        return torch.stack(out_frames, dim=0)
+
     def __getitem__(self, idx):
-        video_path, label = self.video_label_pairs[idx]
-        # ---- Determine cache path first ----
+        video_path = self.paths[idx]
+        label = self.labels_only[idx]
+        do_aug = self.aug_flags[idx]
+
         cache_hit = False
-        cache_path: Optional[str] = None
-        clip: Optional[torch.Tensor] = None
-        if self.enable_cache:
-            # derive relative path preserving class subfolder
-            if self.dataset_root and os.path.commonpath([os.path.abspath(video_path), os.path.abspath(self.dataset_root)]) == os.path.abspath(self.dataset_root):
-                rel = os.path.relpath(video_path, self.dataset_root)
-            else:
-                rel = os.path.basename(video_path)
-            rel_no_ext, _ = os.path.splitext(rel)
-            # normalize and sanitize
-            rel_no_ext = rel_no_ext.replace('\\', '/').replace('..', '')
-            rel_no_ext_base = os.path.basename(rel_no_ext)
-            size_tag = self.img_size
-            cache_filename = f"{rel_no_ext_base}_T{self.sequence_length}_S{self.frame_sampling}_IMG{size_tag}.pt"
-            subdir = os.path.dirname(rel)
-            cache_dir = os.path.join(self.cache_root, subdir)
-            os.makedirs(cache_dir, exist_ok=True)
-            cache_path = os.path.join(cache_dir, cache_filename)
+        clip_pre: Optional[torch.Tensor] = None  # pre-normalization clip in [0,1]
+        unreadable = False
+
+        # ---- Prefer .npy cache first ----
+        cache_path = ""
+        if self.enable_cache and self.cache_root:
+            cache_path, path_is_cache = self._cache_path_for(video_path)
             if os.path.isfile(cache_path):
                 try:
-                    clip = torch.load(cache_path, map_location='cpu')
-                    if isinstance(clip, torch.Tensor) and clip.ndim == 4 and clip.shape[0] == self.sequence_length:
-                        cache_hit = True
+                    arr = np.load(cache_path, allow_pickle=False)
+                    clip_pre = torch.from_numpy(arr).float()
+                    cache_hit = True
                 except Exception:
                     cache_hit = False
-        unreadable = False
-        if not cache_hit:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                # Mark unreadable and use a fallback clip
+
+        # ---- Fallback: decode from video and save cache if enabled ----
+        if clip_pre is None:
+            # If original path is already a cache path but missing, mark unreadable immediately
+            if video_path.lower().endswith(".npy"):
                 unreadable = True
-                grabbed_frames = {}
-                indices = list(range(self.sequence_length))  # placeholder
             else:
-                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                indices = self._sample_indices(frame_count)
-                wanted = set(indices)
-                cur = 0
-                grabbed_frames = {}
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    if cur in wanted:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        pil_like = T.functional.to_pil_image(frame_rgb)
-                        tensor = self.transform(pil_like)
-                        grabbed_frames[cur] = tensor
-                        if len(grabbed_frames) == len(wanted):
-                            break
-                    cur += 1
-                cap.release()
-                if len(grabbed_frames) == 0:
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
                     unreadable = True
-            if unreadable:
-                # Full fallback black clip for unreadable videos
-                clip = torch.zeros(self.sequence_length, 3, self.img_size, self.img_size)
-                # Track unreadable video (thread-safe, unique)
-                with self._unreadable_lock:
-                    if video_path not in self._unreadable_set:
-                        self._unreadable_set.add(video_path)
-                        self.unreadable_videos.append(video_path)
-            else:
-                ordered = [grabbed_frames.get(i) for i in indices]
-                if ordered[0] is None:
-                    # fallback black frame
-                    fallback = torch.zeros(3, self.img_size, self.img_size)
-                    ordered[0] = fallback
-                for i in range(1, len(ordered)):
-                    if ordered[i] is None:
-                        ordered[i] = ordered[i - 1]
-                clip = torch.stack(ordered, dim=0)
-                if self.enable_cache and cache_path is not None:
-                    try:
-                        torch.save(clip.cpu(), cache_path)
-                    except Exception as e:
-                        if self.show_progress:
-                            print(f"Warning: failed to cache {cache_path}: {e}")
-        # At this point clip must be a tensor
-        assert clip is not None, "Internal error: clip tensor not created"
-        # Progress reporting (only first time per video)
+                else:
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    indices = self._sample_indices(frame_count)
+                    wanted = set(indices)
+                    cur = 0
+                    grabbed_frames: Dict[int, torch.Tensor] = {}
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        if cur in wanted:
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            pil_img = T.functional.to_pil_image(frame_rgb)
+                            tensor = self._preprocess(pil_img)  # [0,1], no normalize
+                            grabbed_frames[cur] = tensor
+                            if len(grabbed_frames) == len(wanted):
+                                break
+                        cur += 1
+                    cap.release()
+                    if len(grabbed_frames) == 0:
+                        unreadable = True
+                    else:
+                        ordered = [grabbed_frames.get(i) for i in indices]
+                        if ordered[0] is None:
+                            ordered[0] = torch.zeros(3, self.img_size, self.img_size)
+                        for i in range(1, len(ordered)):
+                            if ordered[i] is None:
+                                ordered[i] = ordered[i - 1]
+                        clip_pre = torch.stack(ordered, dim=0)  # (T,3,H,W)
+                        # save npy cache for future runs
+                        if self.enable_cache and self.cache_root and cache_path:
+                            try:
+                                np.save(cache_path, clip_pre.cpu().numpy())
+                            except Exception as e:
+                                if self.show_progress:
+                                    print(f"Warning: failed to cache {cache_path}: {e}")
+
+        # ---- If still missing, fallback to zeros ----
+        if clip_pre is None:
+            clip_pre = torch.zeros(self.sequence_length, 3, self.img_size, self.img_size)
+            unreadable = True
+            with self._unreadable_lock:
+                if video_path not in self._unreadable_set:
+                    self._unreadable_set.add(video_path)
+                    self.unreadable_videos.append(video_path)
+
+        # ---- Apply training-only augmentations on cached tensors, then normalize ----
+        if do_aug:
+            clip_aug = self._augment_clip_inplace(clip_pre)
+            clip = self._normalize_clip(clip_aug)
+            origin = 'CACHE_NPY+AUG' if cache_hit else ('DECODE+AUG' if not unreadable else 'UNREADABLE')
+        else:
+            clip = self._normalize_clip(clip_pre)
+            origin = 'CACHE_NPY' if cache_hit else ('DECODE' if not unreadable else 'UNREADABLE')
+
+        # progress (first-time)
         if self.show_progress:
             with self._progress_lock:
                 if video_path not in self._processed_videos:
                     self._processed_videos.add(video_path)
                     self._processed_count += 1
                     pct = 100.0 * self._processed_count / max(1, self._total_videos)
-                    origin = 'CACHE' if cache_hit else ('UNREADABLE' if unreadable else 'DECODE')
                     print(f"Video tensor ready {self._processed_count}/{self._total_videos} ({pct:5.1f}%) [{origin}] - {os.path.basename(video_path)}")
-        return clip, label
 
+        return clip, label
 
 # -------------------------- Model -------------------------- #
 class CNNLSTM(nn.Module):
@@ -360,60 +460,163 @@ def split_train_val_pairs(
         val_sub.extend([(p, label) for p in val_paths])
     return train_sub, val_sub
 
+# ---- New: cap to target and add augmented duplicates for minority classes ----
+def cap_and_augment_to_target(
+    train_pairs: List[Tuple[str,int]],
+    classes: List[str],
+    target_per_class: int,
+    seed: int
+) -> List[Tuple[str,int,bool]]:
+    """Cap each class to target_per_class; for minority classes, duplicate entries flagged as augmented until reaching target."""
+    rng = random.Random(seed)
+    by_class: Dict[int, List[str]] = {i: [] for i in range(len(classes))}
+    for path, label in train_pairs:
+        by_class[label].append(path)
+    out: List[Tuple[str,int,bool]] = []
+    for label, paths in by_class.items():
+        paths = paths[:]
+        rng.shuffle(paths)
+        if len(paths) == 0:
+            continue
+        if len(paths) > target_per_class:
+            kept = paths[:target_per_class]
+            out.extend([(p, label, False) for p in kept])
+        else:
+            kept = paths[:]
+            out.extend([(p, label, False) for p in kept])
+            need = target_per_class - len(kept)
+            if need > 0:
+                # round-robin duplicate with augmentation flag
+                i = 0
+                while i < need:
+                    out.append((kept[i % len(kept)], label, True))
+                    i += 1
+    return out
+
+def compute_class_counts_from_pairs(pairs: List[Tuple[str,int]], num_classes: int) -> List[int]:
+    counts = [0] * num_classes
+    for _, lab in pairs:
+        if 0 <= lab < num_classes:
+            counts[lab] += 1
+    return counts
+
+def compute_class_counts_from_aug_pairs(pairs: List[Tuple[str,int,bool]], num_classes: int) -> List[int]:
+    counts = [0] * num_classes
+    for _, lab, _aug in pairs:
+        if 0 <= lab < num_classes:
+            counts[lab] += 1
+    return counts
+
+def set_global_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def seed_worker(worker_id: int):
+    # Ensure each worker has a different but deterministic seed
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
 # -------------------------- Build Datasets & Loaders -------------------------- #
 
 def build_dataloaders(cfg: LSTMConfig):
-    video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    # try regular discovery first, else fallback to cache-only discovery
+    try:
+        video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    except Exception:
+        video_label_pairs, classes = discover_cached_clips(cfg.cache_root, cfg.max_videos_per_class)
+
     train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Resize((cfg.img_size, cfg.img_size)),
-        T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-    ])
+    # cap and oversample (training only)
+    train_pairs_aug = cap_and_augment_to_target(train_pairs, classes, cfg.cap_per_class, cfg.random_seed)
+
+    # normalization-only transform is inferred inside the dataset; pass Normalize explicitly
+    normalize_only = T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+
+    set_global_seed(cfg.random_seed)
+    g = torch.Generator().manual_seed(cfg.random_seed)
+
     train_ds = BehaviorVideoDataset(
-        train_pairs, classes, cfg.sequence_length, transform, cfg.img_size,
+        train_pairs_aug, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=cfg.show_video_conversion_progress,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir,
+        aug_flip_p=cfg.aug_flip_p, aug_crop_scale=cfg.aug_crop_scale, aug_crop_ratio=cfg.aug_crop_ratio,
+        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast
     )
     test_ds = BehaviorVideoDataset(
-        test_pairs, classes, cfg.sequence_length, transform, cfg.img_size,
+        test_pairs, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
         cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+
+    # sampler for equal class probability
+    class_counts = train_ds.class_counts
+    sample_weights = [1.0 / max(1, class_counts[lab]) for lab in train_ds.labels_only]
+    sampler = WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), num_samples=len(train_ds), replacement=True)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg.batch_size, sampler=sampler, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g
+    )
     return train_loader, test_loader, classes
 
 def build_train_val_test_loaders(cfg: LSTMConfig, batch_size_override: Optional[int] = None):
-    """Like build_dataloaders, but also returns a validation loader split from training."""
-    video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    # try regular discovery first, else fallback to cache-only discovery
+    try:
+        video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    except Exception:
+        video_label_pairs, classes = discover_cached_clips(cfg.cache_root, cfg.max_videos_per_class)
+
     train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
     train_sub, val_sub = split_train_val_pairs(train_pairs, classes, cfg.val_split, cfg.random_seed)
+    train_pairs_aug = cap_and_augment_to_target(train_sub, classes, cfg.cap_per_class, cfg.random_seed)
 
-    transform = T.Compose([
-        T.ToTensor(),
-        T.Resize((cfg.img_size, cfg.img_size)),
-        T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-    ])
+    normalize_only = T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+
+    set_global_seed(cfg.random_seed)
+    g = torch.Generator().manual_seed(cfg.random_seed)
+
     train_ds = BehaviorVideoDataset(
-        train_sub, classes, cfg.sequence_length, transform, cfg.img_size,
+        train_pairs_aug, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=cfg.show_video_conversion_progress,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir,
+        aug_flip_p=cfg.aug_flip_p, aug_crop_scale=cfg.aug_crop_scale, aug_crop_ratio=cfg.aug_crop_ratio,
+        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast
     )
     val_ds = BehaviorVideoDataset(
-        val_sub, classes, cfg.sequence_length, transform, cfg.img_size,
+        val_sub, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
         cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
     )
     test_ds = BehaviorVideoDataset(
-        test_pairs, classes, cfg.sequence_length, transform, cfg.img_size,
+        test_pairs, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
         cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
     )
+
+    class_counts = train_ds.class_counts
+    sample_weights = [1.0 / max(1, class_counts[lab]) for lab in train_ds.labels_only]
+    sampler = WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), num_samples=len(train_ds), replacement=True)
+
     bs = batch_size_override if batch_size_override is not None else cfg.batch_size
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, num_workers=cfg.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=bs, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, sampler=sampler, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=bs, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=bs, shuffle=False,
+        num_workers=cfg.num_workers, pin_memory=True, worker_init_fn=seed_worker, generator=g
+    )
     return train_loader, val_loader, test_loader, classes
 
 # -------------------------- Training / Evaluation Helpers -------------------------- #
@@ -562,6 +765,7 @@ def tune_with_optuna(cfg: LSTMConfig):
 def train_example():
     cfg = LSTMConfig()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    set_global_seed(cfg.random_seed)
     print(f"Using device: {device}")
     # If tuning requested, run Optuna and exit
     if cfg.use_optuna:
@@ -570,14 +774,28 @@ def train_example():
     try:
         train_loader, test_loader, classes = build_dataloaders(cfg)
     except Exception as e:
-        print(f"Dataset build failed: {e}\nPopulate datasets/behavior_clips/ with class subfolders and mp4 files.")
+        print(f"Dataset build failed: {e}\nPopulate datasets/behavior_clips/ (or ensure cached .npy exists in {cfg.cache_root}).")
         return
     num_classes = len(classes)
     print(f"Discovered classes: {classes} (n={num_classes})")
 
-    model = CNNLSTM(num_classes=num_classes, hidden_size=cfg.hidden_size, num_layers=cfg.num_layers, bidirectional=cfg.bidirectional, dropout=cfg.dropout, freeze_cnn=cfg.freeze_cnn).to(device)
+    model = CNNLSTM(
+        num_classes=num_classes,
+        hidden_size=cfg.hidden_size,
+        num_layers=cfg.num_layers,
+        bidirectional=cfg.bidirectional,
+        dropout=cfg.dropout,
+        freeze_cnn=cfg.freeze_cnn
+    ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    # Class-balanced weighted loss: weights = 1.0 / class_counts (from training dataset)
+    class_counts = getattr(train_loader.dataset, "class_counts", [0]*num_classes)
+    class_weights = torch.tensor(
+        [1.0 / max(1, c) for c in class_counts],
+        dtype=torch.float, device=device
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg.learning_rate)
 
     # Prepare model save directory
@@ -601,13 +819,10 @@ def train_example():
     last_model_path = os.path.join(save_dir, 'last_model.pth')
 
     # -------------------------- Preprocessing Timing -------------------------- #
-    # Warm-up/cache build timing: iterate through train and test datasets once to force
-    # decoding and caching, then report total preprocessing time.
+    # Note: augmented training samples are applied on cached tensors each epoch.
     if cfg.pre_cache_before_training:
-        print("Preprocessing: decoding videos and building cache (one pass)...")
+        print("Preprocessing: ensuring cache exists (one pass over datasets)...")
         t0 = time.time()
-        # Iterate dataset objects rather than loaders to avoid batching overhead
-        # Use a no-grad context for safety (though dataset __getitem__ doesn't use autograd)
         try:
             _ = [train_loader.dataset[i] for i in range(len(train_loader.dataset))]
             _ = [test_loader.dataset[i] for i in range(len(test_loader.dataset))]
@@ -641,7 +856,7 @@ def train_example():
             labels = labels.to(device)
             optimizer.zero_grad()
             outputs = model(clips)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, labels)  # weighted loss
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * labels.size(0)
@@ -650,7 +865,7 @@ def train_example():
             correct += pred.eq(labels).sum().item()
             # Progress percentage for current epoch
             pct = 100.0 * (batch_idx + 1) / total_batches
-            print(f"Epoch {epoch+1}/{cfg.num_epochs} | Batch {batch_idx+1}/{total_batches} ({pct:5.1f}%) - batch_loss={loss.item():.4f}", end='\r')
+            print(f"Epoch {epoch+1}/{cfg.num_epochs} | Batch {batch_idx+1}/{total_batches} ({pct:5.1f}%) - batch_weighted_loss={loss.item():.4f}", end='\r')
         # After epoch, ensure newline
         print()
         train_loss = running_loss / max(1,total)
@@ -660,7 +875,7 @@ def train_example():
         avg_epoch = sum(epoch_times) / len(epoch_times)
         remaining = cfg.num_epochs - (epoch + 1)
         eta_total = remaining * avg_epoch
-        print(f"Epoch [{epoch+1}/{cfg.num_epochs}] loss={train_loss:.4f} acc={train_acc:.2f}% | time={format_secs(epoch_dur)} | ETA total={format_secs(eta_total)}")
+        print(f"Epoch [{epoch+1}/{cfg.num_epochs}] weighted_loss={train_loss:.4f} acc={train_acc:.2f}% | time={format_secs(epoch_dur)} | ETA total={format_secs(eta_total)}")
         # one quick evaluation pass (optional)
         if (epoch+1) % 5 == 0 or epoch == cfg.num_epochs - 1:
             model.eval()
