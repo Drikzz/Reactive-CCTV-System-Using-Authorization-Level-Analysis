@@ -2,7 +2,9 @@ import os
 import cv2
 import numpy as np
 import math
-from .facenet_utils import get_embedder
+import torch
+from facenet_pytorch import fixed_image_standardization
+from .facenet_utils import get_detector, get_embedder
 
 def compute_blur_score(img_bgr):
 	# Variance of Laplacian: higher is sharper
@@ -58,17 +60,26 @@ def align_face(frame_bgr, box, keypoints, output_size=(160, 160)):
 	return cv2.resize(rotated, output_size)
 
 def load_known_faces(folder="datasets/faces"):
+	"""
+	PyTorch version:
+	- If .npy embeddings are present, load them (note: may be incompatible with TF-era .npy).
+	- Otherwise, detect faces with MTCNN, align (160x160), embed with InceptionResnetV1.
+	"""
 	encodings, names = [], []
 	if not os.path.isdir(folder):
 		print(f"[WARN] Faces folder not found: {folder}")
 		return encodings, names
+
+	detector = get_detector()
+	embedder = get_embedder()
+	device = next(embedder.parameters()).device
 
 	for person_name in os.listdir(folder):
 		person_dir = os.path.join(folder, person_name)
 		if not os.path.isdir(person_dir):
 			continue
 
-		# Prefer precomputed embeddings
+		# Prefer precomputed embeddings (if they were created with the same pipeline)
 		npy_files = [f for f in os.listdir(person_dir) if f.lower().endswith(".npy")]
 		for f in npy_files:
 			try:
@@ -79,29 +90,38 @@ def load_known_faces(folder="datasets/faces"):
 			except Exception as e:
 				print(f"[WARN] Failed to load embedding {f}: {e}")
 
-		# Fallback to compute from images if no .npy files
+		# Fallback: compute from images
 		if not npy_files:
-			img_files = [f for f in os.listdir(person_dir)
-						 if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+			img_files = [f for f in os.listdir(person_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
 			for file in img_files:
 				path = os.path.join(person_dir, file)
 				image = cv2.imread(path)
 				if image is None:
 					continue
 				image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
 				try:
-					detections = get_embedder().extract(image_rgb, threshold=0.95)
+					boxes, _ = detector.detect(image_rgb)
 				except Exception as e:
-					print(f"[WARN] Face embedding failed for {path}: {e}")
+					print(f"[WARN] Detection failed for {path}: {e}")
+					continue
+				if boxes is None or len(boxes) == 0:
 					continue
 
-				if not detections:
+				try:
+					aligned = detector.extract(image_rgb, boxes, save_path=None)  # (N,3,160,160) float [0,1]
+				except Exception as e:
+					print(f"[WARN] Alignment failed for {path}: {e}")
 					continue
-				for det in detections:
-					embedding = det.get('embedding')
-					if embedding is None:
-						continue
-					encodings.append(np.asarray(embedding, dtype=np.float32))
+				if aligned is None or aligned.shape[0] == 0:
+					continue
+
+				with torch.no_grad():
+					aligned = fixed_image_standardization(aligned.to(device))
+					embs = embedder(aligned).detach().cpu().numpy()
+
+				for e in embs:
+					encodings.append(np.asarray(e, dtype=np.float32))
 					names.append(person_name)
 
 	print(f"[INFO] Loaded {len(encodings)} face encodings from {folder}.")

@@ -1,176 +1,172 @@
-import sys
+#!/usr/bin/env python3
+"""
+facenet_train.py
+----------------
+Train an SVM classifier on face embeddings extracted with facenet-pytorch.
+
+Pipeline:
+    - Load aligned faces from datasets/faces/<person>/
+    - Apply augmentation to training images
+    - Compute embeddings with InceptionResnetV1 (facenet-pytorch)
+    - Encode labels
+    - Train linear SVM
+    - Compute distance threshold (mean intra-class + 20)
+    - Save models, encoder, and threshold
+
+Output:
+    models/
+        facenet_svm.joblib
+        label_encoder.joblib
+        distance_threshold.npy
+        inception_resnet_v1.pt
+"""
+
 import os
-from collections import Counter
-import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
 import cv2
+import joblib
+import numpy as np
+from tqdm import tqdm
+from sklearn.svm import SVC
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score
+import torch
+from torchvision import transforms
+from facenet_pytorch import InceptionResnetV1
 
-# Add the root project dir to sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-# from utils.common import load_known_faces
-from utils.face_classifier import train_classifier, save_classifier_and_encoder
-from utils.facenet_utils import get_embedder, compute_embedding_distance
-
+# --- Config ---
 DATASET_DIR = "datasets/faces"
-FACE_SIZE = (160, 160)
-DISTANCE_THRESHOLD = 1.0  # Default distance threshold for open-set recognition
+MODELS_DIR = MODELS_DIR = os.path.join("models", "FaceNet")
 
-def load_images_and_embeddings(dataset_dir, embedder, image_size=(160, 160)):
+CLASSIFIER_PATH = os.path.join(MODELS_DIR, "facenet_svm.joblib")
+ENCODER_PATH = os.path.join(MODELS_DIR, "label_encoder.joblib")
+THRESHOLD_PATH = os.path.join(MODELS_DIR, "distance_threshold.npy")
+EMBEDDER_PATH = os.path.join(MODELS_DIR, "inception_resnet_v1.pt")
+
+IMAGE_SIZE = 160
+TEST_SPLIT = 0.2
+RANDOM_STATE = 42
+
+# --- Device ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+embedder = InceptionResnetV1(pretrained="vggface2").eval().to(device)
+
+# --- Augmentation pipeline ---
+train_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=5),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.ToTensor()
+])
+
+
+def get_embedding(img_bgr: np.ndarray, augment: bool = False) -> np.ndarray:
+    """Resize, normalize, augment (if train), and embed image."""
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (IMAGE_SIZE, IMAGE_SIZE))
+
+    if augment:
+        # Apply augmentation with torchvision
+        img = train_transform(img)
+        img = img.permute(1, 2, 0).numpy() * 255
+        img = img.astype(np.uint8)
+
+    tensor = torch.tensor(img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)
+    tensor = (tensor - 127.5) / 128.0  # normalize [-1, 1]
+    tensor = tensor.to(device)
+
+    with torch.no_grad():
+        emb = embedder(tensor).cpu().numpy().flatten()
+    return emb
+
+
+def load_dataset(dataset_dir: str):
+    """Load dataset images and labels from folders."""
     X, y = [], []
-    if not os.path.isdir(dataset_dir):
-        return X, y
-
-    # Each subfolder is a person/class
     for person in sorted(os.listdir(dataset_dir)):
         person_dir = os.path.join(dataset_dir, person)
         if not os.path.isdir(person_dir):
             continue
-
-        for fname in sorted(os.listdir(person_dir)):
-            if not fname.lower().endswith((".jpg", ".jpeg", ".png")):
+        for file in os.listdir(person_dir):
+            path = os.path.join(person_dir, file)
+            img = cv2.imread(path)
+            if img is None:
                 continue
-            fpath = os.path.join(person_dir, fname)
-            img = cv2.imread(fpath)
-            if img is None or img.size == 0:
-                continue
-
-            # Images are already aligned crops; ensure size and compute embedding
-            if (img.shape[1], img.shape[0]) != image_size:
-                img = cv2.resize(img, image_size)
-
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            try:
-                emb = embedder.embeddings([rgb])[0]
-            except Exception as e:
-                print(f"[WARN] Embedding failed for {fpath}: {e}")
-                continue
-            X.append(emb)
+            X.append(img)
             y.append(person)
-    return X, y
+    return X, y  # return lists, not numpy arrays
 
-embedder = get_embedder()
-faces, names = load_images_and_embeddings(DATASET_DIR, embedder, FACE_SIZE)
 
-if not faces or not names:
-    print("[ERROR] No face images found. Capture faces first.")
-    sys.exit(1)
+def compute_threshold(embeddings: np.ndarray, labels: np.ndarray) -> float:
+    """Compute intra-class distance threshold (mean + 2σ)."""
+    distances = []
+    for label in np.unique(labels):
+        idxs = np.where(labels == label)[0]
+        if len(idxs) < 2:
+            continue
+        embs = embeddings[idxs]
+        center = np.mean(embs, axis=0)
+        dists = np.linalg.norm(embs - center, axis=1)
+        distances.extend(dists)
+    return float(np.mean(distances) + 2 * np.std(distances))
 
-counts = Counter(names)
-if any(c < 2 for c in counts.values()) or len(counts) < 2:
-    print("[WARN] Not enough samples per class for stratified split. Training on all data; skipping evaluation.")
-    X_all = np.asarray(faces, dtype=np.float32)
-    model, le, centroids = train_classifier(X_all, list(names))
-    
-    # Calculate optimal distance threshold based on intra-class distances
-    print("[INFO] Computing optimal distance threshold...")
-    
-    # A simple approach: use the average of maximum intra-class distances
-    max_intra_distances = []
-    for name, centroid in centroids.items():
-        class_indices = [i for i, n in enumerate(names) if n == name]
-        if len(class_indices) > 1:  # Need at least 2 samples for distances
-            class_embeddings = [faces[i] for i in class_indices]
-            distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
-            max_intra_distances.append(max(distances))
-    
-    if max_intra_distances:
-        optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
-        print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
-        print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
+
+def main():
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    # --- Load dataset ---
+    print("[INFO] Loading dataset...")
+    X, y = load_dataset(DATASET_DIR)
+    print(f"[INFO] Loaded {len(X)} images from {len(set(y))} classes.")
+
+    # --- Split ---
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SPLIT, stratify=y, random_state=RANDOM_STATE
+        )
+    except ValueError:
+        X_train, X_test, y_train, y_test = X, [], y, []
+        print("[WARN] Stratified split failed (small dataset). Using all data for training.")
+
+    # --- Encode labels ---
+    encoder = LabelEncoder()
+    y_train_enc = encoder.fit_transform(y_train)
+    y_test_enc = encoder.transform(y_test) if len(y_test) > 0 else []
+
+    # --- Embeddings ---
+    print("[INFO] Computing embeddings...")
+    X_train_emb = np.array([get_embedding(img, augment=True) for img in tqdm(X_train, desc="Train")])
+
+    X_test_emb = None
+    if len(X_test) > 0:
+        X_test_emb = np.array([get_embedding(img, augment=False) for img in tqdm(X_test, desc="Test")])
+
+    # --- Train classifier ---
+    print("[INFO] Training SVM classifier...")
+    clf = SVC(kernel="linear", probability=True)
+    clf.fit(X_train_emb, y_train_enc)
+
+    # --- Evaluate ---
+    if X_test_emb is not None and len(X_test_emb) > 0:
+        y_pred = clf.predict(X_test_emb)
+        acc = accuracy_score(y_test_enc, y_pred)
+        print(f"[RESULT] Test Accuracy: {acc:.4f}")
     else:
-        optimal_threshold = DISTANCE_THRESHOLD
-        print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
-    
-    # Save the threshold along with the model
-    model_path = 'models/FaceNet/'
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-    np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
-    
-    save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
-    sys.exit(0)
+        print("[WARN] No test set; accuracy not computed.")
 
-X = np.asarray(faces, dtype=np.float32)
-y_names = np.array(names)
+    # --- Threshold ---
+    print("[INFO] Calculating distance threshold...")
+    threshold = compute_threshold(X_train_emb, y_train_enc)
+    print(f"[INFO] Distance threshold set to {threshold:.4f}")
 
-# Try stratified splits; fallback to train-all if it fails
-try:
-    X_trainval, X_test, y_trainval, y_test = train_test_split(
-        X, y_names, test_size=0.2, random_state=42, stratify=y_names
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_trainval, y_trainval, test_size=0.2, random_state=42, stratify=y_trainval
-    )
-except ValueError as e:
-    print(f"[WARN] Stratified split failed: {e}. Training on all data; skipping evaluation.")
-    model, le, centroids = train_classifier(X, list(y_names))
-    
-    # Calculate optimal distance threshold (same as above)
-    print("[INFO] Computing optimal distance threshold...")
-    max_intra_distances = []
-    for name, centroid in centroids.items():
-        class_indices = [i for i, n in enumerate(y_names) if n == name]
-        if len(class_indices) > 1:
-            class_embeddings = [X[i] for i in class_indices]
-            distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
-            max_intra_distances.append(max(distances))
-    
-    if max_intra_distances:
-        optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
-        print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
-        print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
-    else:
-        optimal_threshold = DISTANCE_THRESHOLD
-        print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
-    
-    model_path = 'models/FaceNet/'
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-    np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
-    
-    save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
-    sys.exit(0)
+    # --- Save ---
+    joblib.dump(clf, CLASSIFIER_PATH)
+    joblib.dump(encoder, ENCODER_PATH)
+    np.save(THRESHOLD_PATH, threshold)
+    torch.save(embedder.state_dict(), EMBEDDER_PATH)
 
-# Train on train set
-model, le, centroids = train_classifier(X_train, list(y_train))
+    print(f"[DONE] Models saved to {MODELS_DIR}/")
 
-# Calculate optimal distance threshold
-print("[INFO] Computing optimal distance threshold...")
-max_intra_distances = []
-for name, centroid in centroids.items():
-    class_indices = [i for i, n in enumerate(y_train) if n == name]
-    if len(class_indices) > 1:
-        class_embeddings = [X_train[i] for i in class_indices]
-        distances = [compute_embedding_distance(emb, centroid) for emb in class_embeddings]
-        max_intra_distances.append(max(distances))
-
-if max_intra_distances:
-    optimal_threshold = max(0.8, 1.5 * np.mean(max_intra_distances))  # Scale factor for margin
-    print(f'raw distance threshold: {1.5 * np.mean(max_intra_distances)}')
-    print(f"[INFO] Optimal distance threshold: {optimal_threshold:.3f}")
-else:
-    optimal_threshold = DISTANCE_THRESHOLD
-    print(f"[INFO] Using default distance threshold: {optimal_threshold:.3f}")
-
-model_path = 'models/FaceNet/'
-if not os.path.exists(model_path):
-    os.makedirs(model_path)
-np.save(os.path.join(model_path, 'distance_threshold.npy'), optimal_threshold)
-
-save_classifier_and_encoder(model, le, save_path='models/FaceNet/', centroids=centroids)
-
-# Evaluate on val and test
-def eval_split(split_name, Xs, ys):
-    y_true_enc = le.transform(ys)  # assumes all classes seen in training
-    y_pred_enc = model.predict(Xs)
-    report = classification_report(y_true_enc, y_pred_enc, target_names=list(le.classes_), digits=4, zero_division=0)
-    cm = confusion_matrix(y_true_enc, y_pred_enc)
-    print(f"[EVAL] {split_name} classification report:\n{report}")
-    print(f"[EVAL] {split_name} confusion matrix:\n{cm}")
-    return report, cm
-
-# Call eval_split for validation and test sets
-val_report, val_cm = eval_split("Validation", X_val, y_val)
-test_report, test_cm = eval_split("Test", X_test, y_test)
+if __name__ == "__main__":
+    main()

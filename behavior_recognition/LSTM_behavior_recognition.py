@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Callable, Set, Dict
 from threading import Lock
+import gc
 
 import cv2  # type: ignore
 import numpy as np
@@ -79,6 +80,8 @@ class LSTMConfig:
     aug_crop_ratio: Tuple[float,float] = (0.9, 1.1)
     aug_brightness: Tuple[float,float] = (0.8, 1.2)
     aug_contrast: Tuple[float,float] = (0.8, 1.2)
+    # New: cache format ('pt' or 'npy'), default to PyTorch
+    cache_format: str = 'pt'
 
 # -------------------------- Dataset -------------------------- #
 
@@ -111,6 +114,8 @@ class BehaviorVideoDataset(Dataset):
         aug_crop_ratio: Tuple[float,float] = (0.9, 1.1),
         aug_brightness: Tuple[float,float] = (0.8, 1.2),
         aug_contrast: Tuple[float,float] = (0.8, 1.2),
+        # New:
+        cache_format: str = 'pt',
     ):
         # core meta
         self.classes = classes
@@ -142,6 +147,7 @@ class BehaviorVideoDataset(Dataset):
         self.enable_cache = enable_cache and (cache_root is not None)
         self.cache_root = cache_root
         self.dataset_root = dataset_root
+        self.cache_ext = '.pt' if str(cache_format).lower() == 'pt' else '.npy'
         if self.enable_cache:
             os.makedirs(self.cache_root, exist_ok=True)
         # unreadable
@@ -208,8 +214,8 @@ class BehaviorVideoDataset(Dataset):
         """Return (cache_path, path_is_already_cache)."""
         if self.cache_root is None:
             return "", False
-        # if a .npy is already provided as path, load it directly
-        if video_path.lower().endswith(".npy"):
+        lp = video_path.lower()
+        if lp.endswith(".npy") or lp.endswith(".pt"):
             return video_path, True
         # else, derive relative path from dataset_root (if possible) and build .npy path
         if self.dataset_root and os.path.commonpath([os.path.abspath(video_path), os.path.abspath(self.dataset_root)]) == os.path.abspath(self.dataset_root):
@@ -219,7 +225,7 @@ class BehaviorVideoDataset(Dataset):
         rel_no_ext, _ = os.path.splitext(rel)
         rel_no_ext = rel_no_ext.replace('\\', '/').replace('..', '')
         rel_no_ext_base = os.path.basename(rel_no_ext)
-        cache_filename = f"{rel_no_ext_base}_T{self.sequence_length}_S{self.frame_sampling}_IMG{self.img_size}.npy"
+        cache_filename = f"{rel_no_ext_base}_T{self.sequence_length}_S{self.frame_sampling}_IMG{self.img_size}{self.cache_ext}"
         subdir = os.path.dirname(rel_no_ext)  # keep class/category structure
         cache_dir = os.path.join(self.cache_root, subdir)
         os.makedirs(cache_dir, exist_ok=True)
@@ -269,13 +275,40 @@ class BehaviorVideoDataset(Dataset):
         cache_path = ""
         if self.enable_cache and self.cache_root:
             cache_path, path_is_cache = self._cache_path_for(video_path)
-            if os.path.isfile(cache_path):
+
+            def _load_cache(path: str) -> Optional[torch.Tensor]:
                 try:
-                    arr = np.load(cache_path, allow_pickle=False)
-                    clip_pre = torch.from_numpy(arr).float()
-                    cache_hit = True
+                    if path.lower().endswith(".npy") and os.path.isfile(path):
+                        # mmap to reduce peak RAM during cache loads
+                        arr = np.load(path, allow_pickle=False, mmap_mode='r')
+                        return torch.from_numpy(np.array(arr, copy=False)).float()
+                    if path.lower().endswith(".pt") and os.path.isfile(path):
+                        obj = torch.load(path, map_location='cpu')
+                        if isinstance(obj, torch.Tensor):
+                            return obj.float()
+                        if isinstance(obj, dict):
+                            for k in ("clip", "tensor", "data"):
+                                if k in obj:
+                                    v = obj[k]
+                                    if isinstance(v, np.ndarray):
+                                        return torch.from_numpy(v).float()
+                                    if isinstance(v, torch.Tensor):
+                                        return v.float()
+                        if isinstance(obj, np.ndarray):
+                            return torch.from_numpy(obj).float()
+                    return None
                 except Exception:
-                    cache_hit = False
+                    return None
+
+            # Try primary cache path
+            clip_pre = _load_cache(cache_path)
+            # If not found and path is not already cache (mp4 source), try alternate extension
+            if clip_pre is None and not video_path.lower().endswith((".pt", ".npy")):
+                alt = cache_path[:-4] + (".npy" if self.cache_ext == ".pt" else ".pt")
+                clip_pre = _load_cache(alt)
+                if clip_pre is not None:
+                    cache_path = alt  # loaded from alt
+            cache_hit = clip_pre is not None
 
         # ---- Fallback: decode from video and save cache if enabled ----
         if clip_pre is None:
@@ -318,7 +351,10 @@ class BehaviorVideoDataset(Dataset):
                         # save npy cache for future runs
                         if self.enable_cache and self.cache_root and cache_path:
                             try:
-                                np.save(cache_path, clip_pre.cpu().numpy())
+                                if self.cache_ext == ".pt":
+                                    torch.save(clip_pre.cpu(), cache_path)
+                                else:
+                                    np.save(cache_path, clip_pre.cpu().numpy())
                             except Exception as e:
                                 if self.show_progress:
                                     print(f"Warning: failed to cache {cache_path}: {e}")
@@ -336,10 +372,10 @@ class BehaviorVideoDataset(Dataset):
         if do_aug:
             clip_aug = self._augment_clip_inplace(clip_pre)
             clip = self._normalize_clip(clip_aug)
-            origin = 'CACHE_NPY+AUG' if cache_hit else ('DECODE+AUG' if not unreadable else 'UNREADABLE')
+            origin = 'CACHE+AUG' if cache_hit else ('DECODE+AUG' if not unreadable else 'UNREADABLE')
         else:
             clip = self._normalize_clip(clip_pre)
-            origin = 'CACHE_NPY' if cache_hit else ('DECODE' if not unreadable else 'UNREADABLE')
+            origin = 'CACHE' if cache_hit else ('DECODE' if not unreadable else 'UNREADABLE')
 
         # progress (first-time)
         if self.show_progress:
@@ -420,6 +456,50 @@ def discover_videos(root_dir: str, max_videos_per_class: Optional[int] = None) -
         raise RuntimeError(f"No class subdirectories with videos found under {root_dir}. Create structure root_dir/category/class/*.mp4")
     return video_label_pairs, classes
 
+
+# Fallback: discover from cache if MP4s are absent (supports cache-only runs)
+def discover_cached_clips(cache_root: str, max_videos_per_class: Optional[int] = None) -> Tuple[List[Tuple[str,int]], List[str]]:
+    """
+    Discover cached clips supporting:
+      - cache_root/category/*.{pt,npy}
+      - cache_root/category/class/*.{pt,npy}
+    """
+    if not os.path.isdir(cache_root):
+        raise FileNotFoundError(f"Cache directory not found: {cache_root}")
+    records: List[Tuple[str, List[str]]] = []
+    for dirpath, _dirnames, filenames in os.walk(cache_root):
+        files = [f for f in filenames if f.lower().endswith((".pt", ".npy"))]
+        if not files:
+            continue
+        rel_dir = os.path.relpath(dirpath, cache_root)
+        rel_dir = "." if rel_dir in ("", os.curdir) else rel_dir
+        parts = rel_dir.replace("\\", "/").split("/")
+        for f in sorted(files):
+            records.append((os.path.join(dirpath, f), parts))
+    if not records:
+        raise RuntimeError(f"No cached clips (.pt/.npy) found under {cache_root}")
+    has_two_levels = any(len(parts) >= 2 for _p, parts in records)
+    def class_key(parts: List[str]) -> str:
+        if has_two_levels and len(parts) >= 2:
+            return f"{parts[0]}/{parts[1]}"
+        elif len(parts) >= 1 and parts[0] not in (".", ""):
+            return parts[0]
+        else:
+            return "default"
+    by_class: Dict[str, List[str]] = {}
+    for path, parts in records:
+        by_class.setdefault(class_key(parts), []).append(path)
+    classes = sorted(by_class.keys())
+    cls_to_idx = {c: i for i, c in enumerate(classes)}
+    video_label_pairs: List[Tuple[str, int]] = []
+    for cls in classes:
+        files = sorted(by_class[cls])
+        if max_videos_per_class is not None:
+            files = files[:max_videos_per_class]
+        label = cls_to_idx[cls]
+        for p in files:
+            video_label_pairs.append((p, label))
+    return video_label_pairs, classes
 
 def make_splits(video_label_pairs: List[Tuple[str, int]], classes: List[str], train_split: float, seed: int) -> Tuple[List[Tuple[str,int]], List[Tuple[str,int]]]:
     random.seed(seed)
@@ -519,20 +599,30 @@ def seed_worker(worker_id: int):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+# New: resolve paths relative to project root (parent of this file)
+def _project_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+def _abs_under_root(p: str) -> str:
+    return p if os.path.isabs(p) else os.path.abspath(os.path.join(_project_root(), p))
+
 # -------------------------- Build Datasets & Loaders -------------------------- #
 
 def build_dataloaders(cfg: LSTMConfig):
+    # resolve absolute paths for discovery and dataset construction
+    abs_root = _abs_under_root(cfg.root_dir)
+    abs_cache = _abs_under_root(cfg.cache_root)
+
     # try regular discovery first, else fallback to cache-only discovery
     try:
-        video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+        video_label_pairs, classes = discover_videos(abs_root, cfg.max_videos_per_class)
     except Exception:
-        video_label_pairs, classes = discover_cached_clips(cfg.cache_root, cfg.max_videos_per_class)
+        video_label_pairs, classes = discover_cached_clips(abs_cache, cfg.max_videos_per_class)
 
     train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
     # cap and oversample (training only)
     train_pairs_aug = cap_and_augment_to_target(train_pairs, classes, cfg.cap_per_class, cfg.random_seed)
 
-    # normalization-only transform is inferred inside the dataset; pass Normalize explicitly
     normalize_only = T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
 
     set_global_seed(cfg.random_seed)
@@ -541,17 +631,18 @@ def build_dataloaders(cfg: LSTMConfig):
     train_ds = BehaviorVideoDataset(
         train_pairs_aug, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=cfg.show_video_conversion_progress,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir,
+        cache_root=abs_cache, enable_cache=cfg.enable_cache, dataset_root=abs_root,
         aug_flip_p=cfg.aug_flip_p, aug_crop_scale=cfg.aug_crop_scale, aug_crop_ratio=cfg.aug_crop_ratio,
-        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast
+        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast,
+        cache_format=cfg.cache_format
     )
     test_ds = BehaviorVideoDataset(
         test_pairs, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+        cache_root=abs_cache, enable_cache=cfg.enable_cache, dataset_root=abs_root,
+        cache_format=cfg.cache_format
     )
 
-    # sampler for equal class probability
     class_counts = train_ds.class_counts
     sample_weights = [1.0 / max(1, class_counts[lab]) for lab in train_ds.labels_only]
     sampler = WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), num_samples=len(train_ds), replacement=True)
@@ -567,11 +658,15 @@ def build_dataloaders(cfg: LSTMConfig):
     return train_loader, test_loader, classes
 
 def build_train_val_test_loaders(cfg: LSTMConfig, batch_size_override: Optional[int] = None):
+    # resolve absolute paths
+    abs_root = _abs_under_root(cfg.root_dir)
+    abs_cache = _abs_under_root(cfg.cache_root)
+
     # try regular discovery first, else fallback to cache-only discovery
     try:
-        video_label_pairs, classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+        video_label_pairs, classes = discover_videos(abs_root, cfg.max_videos_per_class)
     except Exception:
-        video_label_pairs, classes = discover_cached_clips(cfg.cache_root, cfg.max_videos_per_class)
+        video_label_pairs, classes = discover_cached_clips(abs_cache, cfg.max_videos_per_class)
 
     train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
     train_sub, val_sub = split_train_val_pairs(train_pairs, classes, cfg.val_split, cfg.random_seed)
@@ -585,19 +680,22 @@ def build_train_val_test_loaders(cfg: LSTMConfig, batch_size_override: Optional[
     train_ds = BehaviorVideoDataset(
         train_pairs_aug, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=cfg.show_video_conversion_progress,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir,
+        cache_root=abs_cache, enable_cache=cfg.enable_cache, dataset_root=abs_root,
         aug_flip_p=cfg.aug_flip_p, aug_crop_scale=cfg.aug_crop_scale, aug_crop_ratio=cfg.aug_crop_ratio,
-        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast
+        aug_brightness=cfg.aug_brightness, aug_contrast=cfg.aug_contrast,
+        cache_format=cfg.cache_format
     )
     val_ds = BehaviorVideoDataset(
         val_sub, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+        cache_root=abs_cache, enable_cache=cfg.enable_cache, dataset_root=abs_root,
+        cache_format=cfg.cache_format
     )
     test_ds = BehaviorVideoDataset(
         test_pairs, classes, cfg.sequence_length, normalize_only, cfg.img_size,
         cfg.frame_sampling, show_progress=False,
-        cache_root=cfg.cache_root, enable_cache=cfg.enable_cache, dataset_root=cfg.root_dir
+        cache_root=abs_cache, enable_cache=cfg.enable_cache, dataset_root=abs_root,
+        cache_format=cfg.cache_format
     )
 
     class_counts = train_ds.class_counts
@@ -774,7 +872,7 @@ def train_example():
     try:
         train_loader, test_loader, classes = build_dataloaders(cfg)
     except Exception as e:
-        print(f"Dataset build failed: {e}\nPopulate datasets/behavior_clips/ (or ensure cached .npy exists in {cfg.cache_root}).")
+        print(f"Dataset build failed: {e}\nPopulate datasets/behavior_clips/ or ensure cached .pt/.npy exists in {cfg.cache_root}.")
         return
     num_classes = len(classes)
     print(f"Discovered classes: {classes} (n={num_classes})")
@@ -824,8 +922,13 @@ def train_example():
         print("Preprocessing: ensuring cache exists (one pass over datasets)...")
         t0 = time.time()
         try:
-            _ = [train_loader.dataset[i] for i in range(len(train_loader.dataset))]
-            _ = [test_loader.dataset[i] for i in range(len(test_loader.dataset))]
+            # Stream through datasets without materializing lists
+            for i in range(len(train_loader.dataset)):
+                _ = train_loader.dataset[i]
+            gc.collect()
+            for i in range(len(test_loader.dataset)):
+                _ = test_loader.dataset[i]
+            gc.collect()
         except Exception as e:
             print(f"Warning during preprocessing pass: {e}")
         t1 = time.time()
