@@ -54,6 +54,14 @@ MOTION_DETECTION = True
 MOTION_THRESHOLD = 4000           # number of changed pixels considered 'motion'
 MOTION_HISTORY = 5                # smoothing history for motion decisions
 
+# Optical-flow based motion detection inside body crops (for micro-motions)
+FLOW_USE_LK = True                # enable Lucas-Kanade per-body optical flow
+FLOW_MAX_CORNERS = 50
+FLOW_QUALITY = 0.01
+FLOW_MIN_DISTANCE = 7
+FLOW_REINIT_EVERY = 30            # re-init feature points every N frames
+FLOW_MOTION_THRESHOLD = 1.5       # average motion vector length above which we consider motion
+
 # Performance optimization settings
 MIN_FACE_SIZE = 40                 # minimum face size to process (pixels)
 MAX_FACES_PER_FRAME = 8            # limit faces processed per frame
@@ -63,11 +71,15 @@ FACE_QUALITY_THRESHOLD = 0.8       # minimum MTCNN detection confidence
 PERSON_CONF_THRESHOLD = 0.6        # min YOLO confidence to accept a person detection
 MIN_PERSON_AREA_FRAC = 0.02        # drop very small person boxes (<2% of frame area)
 DRAW_UNKNOWN_GRACE_FRAMES = 12     # draw unknown only if a face was seen in this track within last N frames
+# Label-stability tuning: require repeated detections before treating a predicted name as stable
+LABEL_HISTORY_LEN = 5
+LABEL_CONFIRM_COUNT = 3
 # Display persistence settings (frames)
-DISPLAY_TTL = 90   # frames to keep full box after last seen activity (~3s at 30fps)
-GHOST_TTL = 60     # extra frames to show a faded/ghost box before removal (~2s)
+# Increased TTLs to reduce flicker for stationary people (tune as needed)
+DISPLAY_TTL = 240   # frames to keep full box after last seen activity (~8s at 30fps)
+GHOST_TTL = 120     # extra frames to show a faded/ghost box before removal (~4s)
 IOU_KEEP_THRESHOLD = 0.25  # IoU threshold to consider a person detection matching a track
-BODY_DISAPPEAR_FRAMES = 60  # frames of consecutive no-person/no-motion before we remove a body box (~2s)
+BODY_DISAPPEAR_FRAMES = 120  # frames of consecutive no-person/no-motion before we remove a body box (~4s)
 APPEARANCE_MATCH_THRESHOLD = 0.55  # histogram correlation threshold to accept appearance match (0-1)
 
 MODELS_DIR = os.path.join("models", "FaceNet")
@@ -298,7 +310,8 @@ def process_frames(frame_q, display_q, stop_event):
     # Increase timeouts for private-office use so a person remains tracked when their face
     # is briefly occluded (e.g., covered). Be cautious: larger values keep identities longer
     # but may produce stale tracks if the person leaves the scene.
-    TRACKING_TIMEOUT = 240  # frames to keep tracking without face detection (~8s at 30fps)
+    # Increase tracking timeout so tracks persist longer when faces/dropouts occur
+    TRACKING_TIMEOUT = 360  # frames to keep tracking without face detection (~12s at 30fps)
     IOU_THRESHOLD = 0.2     # lower IoU to allow association under partial occlusion/misaligned boxes
     # how long to keep a recognized label for a display_key when face evidence disappears
     LABEL_PERSIST_FRAMES = TRACKING_TIMEOUT * 2
@@ -306,6 +319,9 @@ def process_frames(frame_q, display_q, stop_event):
     # Set unknown_ttl larger than person tracker max_age so identity survives brief detector dropouts.
     rt = RecognitionTracker(cosine_threshold=RECOG_COSINE_THRESHOLD, unknown_ttl=TRACKING_TIMEOUT * 2, max_embeddings_per_person=40, iou_threshold=IOU_THRESHOLD)
     person_tracker = SortLikeTracker(iou_threshold=IOU_THRESHOLD, max_age=TRACKING_TIMEOUT)
+    # Kalman propagation settings (optional simple per-track Kalman for bbox prediction)
+    USE_KALMAN_PROPAGATION = True
+    KALMAN_MAX_MISSES = 60  # frames after which we drop the kalman for a track
     
     # Performance monitoring
     frame_start_time = datetime.now()
@@ -324,18 +340,34 @@ def process_frames(frame_q, display_q, stop_event):
     display_last_activity = {}
     # persistent mapping of display_key -> (label, last_seen_frame) so known names survive brief occlusion
     display_last_known = {}
+    # per-display-key recent predicted labels for stability voting
+    display_label_history = {}
     # persistent appearance descriptors per display_key (HSV histograms)
     display_appearance = {}
     # per-track previous small grayscale crop for motion detection
     display_prev_crop = {}
+    # per-display optical-flow state: prev_gray, prev_pts, last_init_frame
+    display_flow_state = {}  # key -> {'prev_gray': np.array, 'pts': np.array, 'last_init': int}
     # per-track consecutive miss counter (no face, no person overlap, no motion)
     display_miss_count = {}
+    # per-display consecutive no-motion counter (body region shows no pixel changes)
+    display_no_motion_count = {}
+    # once we saw an unknown person for a display_key, force-show their body box even if face isn't visible
+    display_force_show_unknown = {}  # display_key -> first_seen_frame
 
     # display smoothing cache for person boxes
     display_box_cache = {}  # track_id -> (x1,y1,x2,y2)
+    # per-frame drawn boxes list (cleared each frame) to avoid duplicate outlines
+    # store as list of tuples: (x1,y1,x2,y2,color)
+    drawn_boxes = []
+    # IoU threshold used to consider two boxes duplicates
+    DEDUPE_IOU = 0.80
+
+    # per-track Kalman filters: tid -> {'kf': cv2.KalmanFilter, 'misses': int, 'last_measured': frame_num}
+    track_kalman = {}
 
     # ---------- drawing helpers ----------
-    def smooth_box(prev_box, new_box, alpha=0.6):
+    def smooth_box(prev_box, new_box, alpha=0.85):
         if prev_box is None or new_box is None:
             return new_box
         x1 = int(prev_box[0] * alpha + new_box[0] * (1 - alpha))
@@ -353,7 +385,7 @@ def process_frames(frame_q, display_q, stop_event):
         cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0,0,0), thickness+2, cv2.LINE_AA)
         cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
 
-    def draw_stylized_box(img, box, color=(0,200,0), thickness=2, fill_alpha=0.12, corner=10):
+    def draw_stylized_box(img, box, color=(0,200,0), thickness=2, fill_alpha=0.12, corner=10, replace_overlaps=False):
         x1, y1, x2, y2 = box
         x1, y1 = max(0, x1), max(0, y1)
         h, w = img.shape[:2]
@@ -363,20 +395,109 @@ def process_frames(frame_q, display_q, stop_event):
             overlay = img.copy()
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
             cv2.addWeighted(overlay, fill_alpha, img, 1 - fill_alpha, 0, img)
-        # corner accents
-        cl = max(6, corner)
-        # top-left
-        cv2.line(img, (x1, y1), (x1+cl, y1), color, thickness)
-        cv2.line(img, (x1, y1), (x1, y1+cl), color, thickness)
-        # top-right
-        cv2.line(img, (x2, y1), (x2-cl, y1), color, thickness)
-        cv2.line(img, (x2, y1), (x2, y1+cl), color, thickness)
-        # bottom-left
-        cv2.line(img, (x1, y2), (x1+cl, y2), color, thickness)
-        cv2.line(img, (x1, y2), (x1, y2-cl), color, thickness)
-        # bottom-right
-        cv2.line(img, (x2, y2), (x2-cl, y2), color, thickness)
-        cv2.line(img, (x2, y2), (x2, y2-cl), color, thickness)
+
+        # draw full hollow rectangle (thicker outline for better visibility)
+        try:
+            # If an existing drawn box overlaps strongly with this one, skip drawing the smaller box.
+            # This avoids nested boxes (we prefer the larger existing box to remain).
+            box_area = float(max(1, (x2 - x1) * (y2 - y1)))
+            for (dx1, dy1, dx2, dy2, dcolor) in list(drawn_boxes):
+                iou_v = compute_iou((x1, y1, x2, y2), (dx1, dy1, dx2, dy2))
+                if iou_v >= DEDUPE_IOU:
+                    # If caller requested to replace overlaps (e.g., unknown boxes), remove existing boxes
+                    if replace_overlaps:
+                        try:
+                            drawn_boxes.remove((dx1, dy1, dx2, dy2, dcolor))
+                        except ValueError:
+                            pass
+                        # continue checking other drawn boxes
+                        continue
+                    # otherwise preserve the larger existing box and skip drawing current if larger
+                    existing_area = float(max(1, (dx2 - dx1) * (dy2 - dy1)))
+                    if existing_area >= box_area:
+                        return
+                    else:
+                        # remove smaller existing box so current can be drawn
+                        try:
+                            drawn_boxes.remove((dx1, dy1, dx2, dy2, dcolor))
+                        except ValueError:
+                            pass
+
+            tb = compute_box_thickness((x1, y1, x2, y2))
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, tb)
+            drawn_boxes.append((int(x1), int(y1), int(x2), int(y2), (int(color[0]), int(color[1]), int(color[2]))))
+        except Exception:
+            pass
+
+    # (Corner accents removed - we draw a single hollow rectangle outline for clarity)
+
+    def compute_box_thickness(box, min_th=2, max_th=8):
+        """Compute a good rectangle outline thickness proportional to box size."""
+        try:
+            bx1, by1, bx2, by2 = box
+            bw = max(1, bx2 - bx1)
+            bh = max(1, by2 - by1)
+            # use the smaller dimension to avoid extreme thickness for very wide boxes
+            base = min(bw, bh)
+            # scale: 1px per 100 pixels of smaller dimension, clamped
+            t = int(max(min_th, min(max_th, max(1, base // 100))))
+            return t
+        except Exception:
+            return min_th
+
+    # --- Kalman helpers (state: [cx,cy,w,h,vx,vy,vw,vh], meas: [cx,cy,w,h]) ---
+    def create_kalman_for_box(box):
+        try:
+            kf = cv2.KalmanFilter(8, 4)
+            # Transition matrix (x' = x + vx)
+            kf.transitionMatrix = np.eye(8, dtype=np.float32)
+            kf.transitionMatrix[0, 4] = 1.0
+            kf.transitionMatrix[1, 5] = 1.0
+            kf.transitionMatrix[2, 6] = 1.0
+            kf.transitionMatrix[3, 7] = 1.0
+            # Measurement matrix maps state -> measurement (first 4 states)
+            kf.measurementMatrix = np.zeros((4, 8), dtype=np.float32)
+            kf.measurementMatrix[0, 0] = 1.0
+            kf.measurementMatrix[1, 1] = 1.0
+            kf.measurementMatrix[2, 2] = 1.0
+            kf.measurementMatrix[3, 3] = 1.0
+            # Reasonable noise covariances (tunable)
+            kf.processNoiseCov = np.eye(8, dtype=np.float32) * 1e-2
+            kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1e-1
+            kf.errorCovPost = np.eye(8, dtype=np.float32) * 1.0
+            # initialize state from box
+            x1, y1, x2, y2 = box
+            w = float(max(1.0, x2 - x1))
+            h = float(max(1.0, y2 - y1))
+            cx = float(x1 + x2) / 2.0
+            cy = float(y1 + y2) / 2.0
+            state = np.array([[cx], [cy], [w], [h], [0.0], [0.0], [0.0], [0.0]], dtype=np.float32)
+            kf.statePost = state
+            kf.statePre = state
+            return kf
+        except Exception:
+            return None
+
+    def kalman_predict_box(kf):
+        try:
+            pred = kf.predict()
+            cx = float(pred[0, 0]); cy = float(pred[1, 0]); w = float(pred[2, 0]); h = float(pred[3, 0])
+            x1 = int(max(0, cx - w / 2.0)); y1 = int(max(0, cy - h / 2.0))
+            x2 = int(min(orig_w - 1, cx + w / 2.0)); y2 = int(min(orig_h - 1, cy + h / 2.0))
+            return (x1, y1, x2, y2)
+        except Exception:
+            return None
+
+    def kalman_correct_with_box(kf, box):
+        try:
+            x1, y1, x2, y2 = box
+            w = float(max(1.0, x2 - x1)); h = float(max(1.0, y2 - y1))
+            cx = float(x1 + x2) / 2.0; cy = float(y1 + y2) / 2.0
+            meas = np.array([[cx], [cy], [w], [h]], dtype=np.float32)
+            kf.correct(meas)
+            return True
+        except Exception:
+            return False
     
     # appearance helpers (HSV histogram)
     def compute_hsv_hist(image_bgr, mask=None, bins=(32, 32)):
@@ -409,6 +530,11 @@ def process_frames(frame_q, display_q, stop_event):
         original_frame = frame.copy()
         orig_h, orig_w = original_frame.shape[:2]
         annotated_frame = original_frame.copy()
+        # clear per-frame drawn boxes (list)
+        try:
+            drawn_boxes.clear()
+        except Exception:
+            drawn_boxes = []
 
         # Resize for YOLO speed (we map boxes back to original coords)
         ratio = 1.0
@@ -478,6 +604,74 @@ def process_frames(frame_q, display_q, stop_event):
         track_list = person_tracker.update(people_boxes)
         # convert back to list of bboxes preserving order of tracks
         people_boxes = [t["bbox"] for t in track_list]
+        # --- Kalman propagation: create/maintain per-track kalman filters and predict when missing ---
+        if USE_KALMAN_PROPAGATION:
+            # Ensure track_kalman has entries for active tracks
+            current_tids = set([t.get('track_id') for t in track_list if t.get('track_id') is not None])
+            # create kalman for new tracks
+            for tr in track_list:
+                tid = tr.get('track_id')
+                tb = tr.get('bbox')
+                if tid is None:
+                    continue
+                if tid not in track_kalman and tb is not None:
+                    kf = create_kalman_for_box(tb)
+                    if kf is not None:
+                        track_kalman[tid] = {'kf': kf, 'misses': 0, 'last_measured': frame_num}
+                else:
+                    # correct existing kalman with measured bbox
+                    ent = track_kalman.get(tid)
+                    if ent is not None and tb is not None:
+                        corrected = kalman_correct_with_box(ent['kf'], tb)
+                        if corrected:
+                            ent['misses'] = 0
+                            ent['last_measured'] = frame_num
+            # Predict for tracks that have missing detections (i.e., not present in current track_list or bbox None)
+            for tid, ent in list(track_kalman.items()):
+                # find corresponding track in track_list
+                found = False
+                for tr in track_list:
+                    if tr.get('track_id') == tid:
+                        found = True
+                        break
+                if not found:
+                    # increment miss counter and predict
+                    ent['misses'] += 1
+                    if ent['misses'] > KALMAN_MAX_MISSES:
+                        # cleanup caches for this tid to avoid stale known labels
+                        try:
+                            del track_kalman[tid]
+                        except Exception:
+                            pass
+                        try:
+                            dk = f"tid_{tid}"
+                            for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history):
+                                try:
+                                    if dk in d:
+                                        del d[dk]
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        continue
+                    pred_box = kalman_predict_box(ent['kf'])
+                    if pred_box is not None:
+                        # If a real detection is already present overlapping this predicted box,
+                        # skip adding the predicted box to avoid duplicates.
+                        skip_pred = False
+                        for existing in people_boxes:
+                            try:
+                                if compute_iou(existing, pred_box) >= IOU_KEEP_THRESHOLD:
+                                    skip_pred = True
+                                    break
+                            except Exception:
+                                continue
+                        if skip_pred:
+                            continue
+                        # add predicted box into people_boxes and also update track_list insertion
+                        # mark as predicted so downstream code treats it conservatively
+                        people_boxes.append(pred_box)
+                        track_list.append({'track_id': tid, 'bbox': pred_box, 'predicted': True})
         # ---------- Motion detection: decide if frame should be processed ----------
         do_motion_check = MOTION_DETECTION
         motion_flag = True
@@ -517,6 +711,7 @@ def process_frames(frame_q, display_q, stop_event):
             for idx, tr in enumerate(active_tracks):
                 tb = tr.get('bbox')
                 tid = tr.get('track_id', None)
+                predicted_flag = tr.get('predicted', False)
 
                 # find matched pid by IoU (small helper here instead of full function)
                 matched_pid = None
@@ -564,8 +759,13 @@ def process_frames(frame_q, display_q, stop_event):
                 # treat active track as activity to keep visible
                 has_active_track = (tid is not None) or (matched_pid is not None) or (best_iou >= 0.4 if 'best_iou' in locals() else False)
                 if person_detected_now or has_active_track:
-                    display_last_activity[display_key] = frame_num
-                    display_miss_count[display_key] = 0
+                    # Do not refresh caches based on purely predicted tracks
+                    if not predicted_flag:
+                        display_last_activity[display_key] = frame_num
+                        display_miss_count[display_key] = 0
+                    else:
+                        # predicted entries still count as a miss-refresh but don't reset last activity
+                        display_miss_count[display_key] = display_miss_count.get(display_key, 0)
                 else:
                     display_miss_count[display_key] = display_miss_count.get(display_key, 0) + 1
 
@@ -585,6 +785,14 @@ def process_frames(frame_q, display_q, stop_event):
                         if frame_num - last_seen <= LABEL_PERSIST_FRAMES:
                             label = last_label
 
+                # If the recognition tracker or face observations mark this display_key as unknown,
+                # set a persistent flag so body boxes remain visible even when the face is not seen.
+                if label == 'Unknown':
+                    # mark the display_key with the first frame we saw it unknown (if not already)
+                    # only set force_show for real observations, not predictions
+                    if not predicted_flag:
+                        display_force_show_unknown.setdefault(display_key, frame_num)
+
                 # color selection: known -> green shades, unknown -> neutral cyan fallback
                 fill_alpha = 0.0
                 if label != 'Unknown':
@@ -592,12 +800,13 @@ def process_frames(frame_q, display_q, stop_event):
                     person_color = (0, 200, 0)
                     thickness = 2
                 else:
-                    person_color = (60, 180, 200)  # light cyan-ish for stationary fallback
+                    # Unknown stationary person -> use red to match unknown face/body coloring
+                    person_color = (0, 0, 200)
                     thickness = 2
 
                 # Smooth + cache
                 prev = display_box_cache.get(display_key)
-                smoothed_tb = smooth_box(prev, tb, alpha=0.8)
+                smoothed_tb = smooth_box(prev, tb, alpha=0.92)
                 display_box_cache[display_key] = smoothed_tb
                 x1, y1, x2, y2 = smoothed_tb
 
@@ -635,12 +844,21 @@ def process_frames(frame_q, display_q, stop_event):
                     body_y1 = max(0, int(y1 + ph * 0.05))
                     body_y2 = min(orig_h - 1, y2 + extend_down)
                     body_box = (body_x1, body_y1, body_x2, body_y2)
-                    body_color = (int(person_color[0]*0.45), int(person_color[1]*0.45), int(person_color[2]*0.45))
-                    draw_stylized_box(annotated_frame, body_box, scale_color(body_color, visual_alpha), thickness=1, fill_alpha=0.0, corner=8)
+                    # merge person box and body_box into a single union box and draw only that
+                    union_x1 = min(x1, body_box[0])
+                    union_y1 = min(y1, body_box[1])
+                    union_x2 = max(x2, body_box[2])
+                    union_y2 = max(y2, body_box[3])
+                    merged_box = (union_x1, union_y1, union_x2, union_y2)
+                    # choose color using person_color but dimmed slightly for the merged box
+                    merged_color = (int(person_color[0]*0.9), int(person_color[1]*0.9), int(person_color[2]*0.9))
+                    draw_stylized_box(annotated_frame, merged_box, scale_color(merged_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
                 except Exception:
-                    pass
-
-                draw_stylized_box(annotated_frame, (x1, y1, x2, y2), scale_color(person_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                    # fallback to drawing the original person box
+                    try:
+                        draw_stylized_box(annotated_frame, (x1, y1, x2, y2), scale_color(person_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                    except Exception:
+                        pass
                 label_text = f"{label}"
                 if tid is not None:
                     label_text = f"#{tid} {label_text}"
@@ -928,19 +1146,83 @@ def process_frames(frame_q, display_q, stop_event):
                     fallback_label = None
 
                 if fallback_label:
-                    display_name = fallback_label
+                    # verify appearance match (avoid mis-assignment if a different person now occupies same area)
+                    try:
+                        stored = None
+                        # try to find appearance for pid/tid or candidate key used
+                        # prefer matched_pid path (we set fallback from tracked_persons)
+                        if best_pid is not None:
+                            key_try = f"pid_{best_pid}"
+                        elif best_tid is not None:
+                            key_try = f"tid_{best_tid}"
+                        else:
+                            key_try = best_key if best_key is not None else None
+                        if key_try is not None:
+                            stored = display_appearance.get(key_try)
+                        # If we have a stored appearance, compute current appearance and compare
+                        accept = True
+                        if stored is not None:
+                            # compute hist of current person box (pb_box)
+                            try:
+                                bx1, by1, bx2, by2 = pb_box
+                                crop = original_frame[by1:by2, bx1:bx2]
+                                cur_hist = compute_hsv_hist(crop)
+                                sim = compare_hist(stored, cur_hist)
+                                accept = (sim >= APPEARANCE_MATCH_THRESHOLD)
+                            except Exception:
+                                accept = False
+                        if accept:
+                            display_name = fallback_label
+                        else:
+                            display_name = None
+                    except Exception:
+                        display_name = fallback_label
                     face_color = (0, 200, 0)
                     faces_by_name.setdefault(display_name, []).append(f)
                 else:
+                    # Unknown face -> use red (BGR) to match unknown body/person boxes
                     face_color = (0, 0, 200)
                     unknown_in_frame = True
             else:
                 face_color = (0, 200, 0)
                 faces_by_name.setdefault(display_name, []).append(f)
 
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), face_color, 1)
+            try:
+                fth = compute_box_thickness((x1, y1, x2, y2), min_th=1, max_th=4)
+            except Exception:
+                fth = 1
+            try:
+                # IoU-based dedupe: if overlapping drawn boxes exist, either skip or replace
+                skip_face = False
+                face_area = float(max(1, (x2 - x1) * (y2 - y1)))
+                for (dx1, dy1, dx2, dy2, dcolor) in list(drawn_boxes):
+                    iou_v = compute_iou((x1, y1, x2, y2), (dx1, dy1, dx2, dy2))
+                    if iou_v >= DEDUPE_IOU:
+                        existing_area = float(max(1, (dx2 - dx1) * (dy2 - dy1)))
+                        # If this face is Unknown, prefer to replace overlapping boxes (so the clear red face box appears)
+                        if unknown_in_frame:
+                            try:
+                                drawn_boxes.remove((dx1, dy1, dx2, dy2, dcolor))
+                            except ValueError:
+                                pass
+                            # continue checking others
+                            continue
+                        # otherwise preserve the larger existing box and skip drawing current if larger
+                        if existing_area >= face_area:
+                            skip_face = True
+                            break
+                        else:
+                            try:
+                                drawn_boxes.remove((dx1, dy1, dx2, dy2, dcolor))
+                            except ValueError:
+                                pass
+                if not skip_face:
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), face_color, fth)
+                    drawn_boxes.append((int(x1), int(y1), int(x2), int(y2), (int(face_color[0]), int(face_color[1]), int(face_color[2]))))
+            except Exception:
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), face_color, fth)
             face_label = display_name if display_name != "Unknown" else "?"
-            cv2.putText(annotated_frame, face_label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, face_color, 1)
+            cv2.putText(annotated_frame, face_label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, face_color, max(1, fth//2))
 
         # Persist recognized face names to display_last_known so that person-level labels
         # can survive short occlusions or motionless periods. Use the active_tracks
@@ -966,7 +1248,33 @@ def process_frames(frame_q, display_q, stop_event):
                                 display_key = f"tid_{tr.get('track_id')}"
                             else:
                                 display_key = f"pb_{tr_idx}"
-                            display_last_known[display_key] = (display_name, frame_num)
+                            # Label stability: push prediction into short history and only confirm
+                            # if a label appears frequently enough to avoid spurious flips.
+                            hist = display_label_history.get(display_key)
+                            if hist is None:
+                                hist = deque(maxlen=LABEL_HISTORY_LEN)
+                                display_label_history[display_key] = hist
+                            hist.append(display_name)
+                            # count occurrences of each label in history
+                            from collections import Counter
+                            cnt = Counter(hist)
+                            top_label, top_count = cnt.most_common(1)[0]
+                            if top_label != 'Unknown' and top_count >= LABEL_CONFIRM_COUNT:
+                                # store confirmed label and appearance histogram to avoid later mis-assignment
+                                display_last_known[display_key] = (top_label, frame_num)
+                                try:
+                                    # compute appearance hist for this track's bbox (use tr bbox if available)
+                                    tb_box = tr.get('bbox', None)
+                                    if tb_box is None and pb_idx is not None:
+                                        tb_box = people_boxes[pb_idx]
+                                    if tb_box is not None:
+                                        x1a, y1a, x2a, y2a = map(int, tb_box)
+                                        cropa = original_frame[y1a:y2a, x1a:x2a]
+                                        display_appearance[display_key] = compute_hsv_hist(cropa)
+                                except Exception:
+                                    # ignore appearance compute failures
+                                    pass
+                            # else: do not update display_last_known yet (wait for confirmation)
                             break
                     except Exception:
                         continue
@@ -993,6 +1301,8 @@ def process_frames(frame_q, display_q, stop_event):
         for idx, tr in enumerate(active_tracks):
             tb = tr.get('bbox')
             tid = tr.get('track_id', None)
+            # Whether this track bbox was a predicted (Kalman) estimate rather than a fresh detection
+            predicted_flag = tr.get('predicted', False)
             # Map to recognition tracker pid if available via IoU
             matched_pid = find_best_pid(tb, tracked_persons, iou_thresh=IOU_THRESHOLD)
             label = 'Unknown'
@@ -1046,19 +1356,102 @@ def process_frames(frame_q, display_q, stop_event):
                 tbx2 = min(orig_w-1, tbx2); tby2 = min(orig_h-1, tby2)
                 if tbx2 > tbx1 and tby2 > tby1:
                     body_crop = original_frame[tby1:tby2, tbx1:tbx2]
-                    gray_crop = cv2.cvtColor(body_crop, cv2.COLOR_BGR2GRAY)
-                    small = cv2.resize(gray_crop, (32, 32))
-                    small = cv2.GaussianBlur(small, (5,5), 0)
-                    prev_small = display_prev_crop.get(display_key)
-                    if prev_small is not None:
-                        diff = cv2.absdiff(prev_small, small)
-                        motion_score = float(np.mean(diff))
-                        if motion_score > 6.0:
-                            motion_detected = True
-                    display_prev_crop[display_key] = small
+                    gray_crop_full = cv2.cvtColor(body_crop, cv2.COLOR_BGR2GRAY)
+                    # use optical flow (sparse LK) for micro-motion if enabled
+                    motion_detected = False
+                    if FLOW_USE_LK and gray_crop_full.size > 0:
+                        st = display_flow_state.get(display_key)
+                        cur_gray = cv2.resize(gray_crop_full, (max(32, gray_crop_full.shape[1]//2), max(32, gray_crop_full.shape[0]//2)))
+                        cur_gray = cv2.GaussianBlur(cur_gray, (5,5), 0)
+                        need_init = False
+                        if st is None:
+                            need_init = True
+                        else:
+                            # reinit periodically to avoid drift
+                            if (frame_num - st.get('last_init', 0)) > FLOW_REINIT_EVERY or st.get('pts') is None or len(st.get('pts')) < 6:
+                                need_init = True
+                        if need_init:
+                            # detect good features to track
+                            try:
+                                p0 = cv2.goodFeaturesToTrack(cur_gray, mask=None, maxCorners=FLOW_MAX_CORNERS, qualityLevel=FLOW_QUALITY, minDistance=FLOW_MIN_DISTANCE)
+                                if p0 is not None:
+                                    display_flow_state[display_key] = {'prev_gray': cur_gray, 'pts': p0, 'last_init': frame_num}
+                                else:
+                                    display_flow_state[display_key] = {'prev_gray': cur_gray, 'pts': None, 'last_init': frame_num}
+                            except Exception:
+                                display_flow_state[display_key] = {'prev_gray': cur_gray, 'pts': None, 'last_init': frame_num}
+                        else:
+                            try:
+                                prev_gray = st.get('prev_gray')
+                                prev_pts = st.get('pts')
+                                if prev_gray is None or prev_pts is None or len(prev_pts) == 0:
+                                    # force reinit next loop
+                                    display_flow_state[display_key]['last_init'] = 0
+                                else:
+                                    # calculate optical flow
+                                    p1, st_status, err = cv2.calcOpticalFlowPyrLK(prev_gray, cur_gray, prev_pts, None, winSize=(15,15), maxLevel=2,
+                                                                                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+                                    if p1 is not None and st_status is not None:
+                                        good_new = p1[st_status.flatten()==1]
+                                        good_old = prev_pts[st_status.flatten()==1]
+                                        if len(good_new) > 0:
+                                            # compute average motion vector length in pixels
+                                            vecs = good_new - good_old
+                                            lens = np.linalg.norm(vecs, axis=1)
+                                            mean_len = float(np.mean(lens)) if len(lens) > 0 else 0.0
+                                            if mean_len >= FLOW_MOTION_THRESHOLD:
+                                                motion_detected = True
+                                            # update stored points (downscale back)
+                                            # Keep a subset of good_new for next iteration
+                                            pts_next = good_new.reshape(-1,1,2).astype(np.float32)
+                                            display_flow_state[display_key]['pts'] = pts_next
+                                            display_flow_state[display_key]['prev_gray'] = cur_gray
+                                        else:
+                                            # no good points -> reinit next
+                                            display_flow_state[display_key]['last_init'] = 0
+                            except Exception:
+                                # fallback to simple small diff if LK fails
+                                small = cv2.resize(gray_crop_full, (32, 32))
+                                small = cv2.GaussianBlur(small, (5,5), 0)
+                                prev_small = display_prev_crop.get(display_key)
+                                if prev_small is not None:
+                                    diff = cv2.absdiff(prev_small, small)
+                                    motion_score = float(np.mean(diff))
+                                    if motion_score > 6.0:
+                                        motion_detected = True
+                                display_prev_crop[display_key] = small
+                    else:
+                        # fallback to simple small diff
+                        small = cv2.resize(gray_crop_full, (32, 32))
+                        small = cv2.GaussianBlur(small, (5,5), 0)
+                        prev_small = display_prev_crop.get(display_key)
+                        if prev_small is not None:
+                            diff = cv2.absdiff(prev_small, small)
+                            motion_score = float(np.mean(diff))
+                            if motion_score > 6.0:
+                                motion_detected = True
+                        display_prev_crop[display_key] = small
             except Exception:
                 motion_detected = False
-
+            # Update per-display no-motion counter: reset when motion or face or recent person detection
+            if (motion_detected or has_face_now or person_detected_now) and not predicted_flag:
+                display_no_motion_count[display_key] = 0
+            else:
+                display_no_motion_count[display_key] = display_no_motion_count.get(display_key, 0) + 1
+            # If no motion persisted for too long, clean up caches and skip drawing this box
+            if display_no_motion_count.get(display_key, 0) > BODY_DISAPPEAR_FRAMES:
+                try:
+                    # remove caches related to this display_key
+                    for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history, display_last_activity):
+                        try:
+                            if display_key in d:
+                                del d[display_key]
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # skip drawing
+                continue
             # Update display activity: force activity for any active track to keep stationary people visible
             # Active track means: has tid, has matched_pid, or strong IoU overlap with cached box
             has_active_track = (tid is not None) or (matched_pid is not None) or (best_iou >= 0.4 if 'best_iou' in locals() else False)
@@ -1067,7 +1460,7 @@ def process_frames(frame_q, display_q, stop_event):
                 display_last_activity[display_key] = frame_num
                 display_miss_count[display_key] = 0
                 # If we have a matched pid, update the last-known label for this display_key
-                if matched_pid is not None:
+                if matched_pid is not None and not predicted_flag:
                     tdata = tracked_persons.get(matched_pid, {})
                     stable_name = tdata.get('stable_name') or tdata.get('name')
                     if stable_name:
@@ -1122,7 +1515,10 @@ def process_frames(frame_q, display_q, stop_event):
 
                 # Suppress drawing unknown boxes that haven't seen a face recently (likely false positives)
                 grace_ok = False
-                if has_face_now:
+                # If we've previously observed this display_key as Unknown, force showing the box
+                if display_force_show_unknown.get(display_key) is not None:
+                    grace_ok = True
+                elif has_face_now:
                     grace_ok = True
                 elif tid is not None and track_last_face_frame.get(tid) is not None:
                     grace_ok = (frame_num - track_last_face_frame[tid]) <= DRAW_UNKNOWN_GRACE_FRAMES
@@ -1133,7 +1529,7 @@ def process_frames(frame_q, display_q, stop_event):
             # Smooth the displayed box using the consistent display_key computed earlier
             smoothed_tb = tb
             prev = display_box_cache.get(display_key)
-            smoothed_tb = smooth_box(prev, tb, alpha=0.8)
+            smoothed_tb = smooth_box(prev, tb, alpha=0.92)
             display_box_cache[display_key] = smoothed_tb
 
             x1, y1, x2, y2 = smoothed_tb
@@ -1170,28 +1566,33 @@ def process_frames(frame_q, display_q, stop_event):
             def scale_color(c, alpha):
                 return (int(c[0] * alpha), int(c[1] * alpha), int(c[2] * alpha))
             # Use a dimmer version of the person_color so known -> green, unknown -> red
-            try:
-                pw = x2 - x1
-                ph = y2 - y1
-                pad_w = max(8, int(pw * 0.12))
-                extend_down = max(8, int(ph * 0.6))
-                body_x1 = max(0, x1 - pad_w)
-                body_x2 = min(orig_w - 1, x2 + pad_w)
-                body_y1 = max(0, int(y1 + ph * 0.05))
-                body_y2 = min(orig_h - 1, y2 + extend_down)
-                body_box = (body_x1, body_y1, body_x2, body_y2)
-                # dimmer body color based on person_color
-                body_color = (int(person_color[0]*0.45), int(person_color[1]*0.45), int(person_color[2]*0.45))
-                # draw the body box first so the person box overlays it (hollow)
-                draw_stylized_box(annotated_frame, body_box, scale_color(body_color, visual_alpha), thickness=1, fill_alpha=0.0, corner=8)
-                # optional small label for body only for Unknown to emphasize it's unlabeled
-                if label == 'Unknown' and not ghost:
-                    draw_text_with_bg(annotated_frame, 'Body', (body_x1, min(body_y2 + 14, orig_h-6)), 0.45, scale_color(body_color, visual_alpha), thickness=1, bg_color=(10,10,10))
-            except Exception:
-                pass
-
-            # draw person box with scaled color/width when ghosting
-            draw_stylized_box(annotated_frame, (x1, y1, x2, y2), scale_color(person_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                try:
+                    pw = x2 - x1
+                    ph = y2 - y1
+                    pad_w = max(8, int(pw * 0.12))
+                    extend_down = max(8, int(ph * 0.6))
+                    body_x1 = max(0, x1 - pad_w)
+                    body_x2 = min(orig_w - 1, x2 + pad_w)
+                    body_y1 = max(0, int(y1 + ph * 0.05))
+                    body_y2 = min(orig_h - 1, y2 + extend_down)
+                    body_box = (body_x1, body_y1, body_x2, body_y2)
+                    # merge person box and body_box into a single union box and draw only that
+                    union_x1 = min(x1, body_box[0])
+                    union_y1 = min(y1, body_box[1])
+                    union_x2 = max(x2, body_box[2])
+                    union_y2 = max(y2, body_box[3])
+                    merged_box = (union_x1, union_y1, union_x2, union_y2)
+                    merged_color = (int(person_color[0]*0.9), int(person_color[1]*0.9), int(person_color[2]*0.9))
+                    draw_stylized_box(annotated_frame, merged_box, scale_color(merged_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                    # optional small label for body only for Unknown to emphasize it's unlabeled
+                    if label == 'Unknown' and not ghost:
+                        draw_text_with_bg(annotated_frame, 'Body', (body_x1, min(body_y2 + 14, orig_h-6)), 0.45, scale_color(merged_color, visual_alpha), thickness=1, bg_color=(10,10,10))
+                except Exception:
+                    # fallback: draw person box
+                    try:
+                        draw_stylized_box(annotated_frame, (x1, y1, x2, y2), scale_color(person_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                    except Exception:
+                        pass
             label_text = f"{label}"
             if tid is not None:
                 label_text = f"#{tid} {label_text}"
