@@ -36,9 +36,9 @@ class LSTMConfig:
     cache_root: str = os.path.join('datasets', 'cache', 'LSTM') 
     
     # Video processing
-    sequence_length: int = 8              # number of frames sampled per video
+    sequence_length: int = 32              # number of frames sampled per video
     img_size: int = 224                   # resize to this size
-    frame_sampling: str = 'stride'        # 'uniform' | 'stride' | 'random'
+    frame_sampling: str = 'uniform'        # 'uniform' | 'stride' | 'random'
     
     # Dataset settings
     train_split: float = 0.8              # train/test split per class

@@ -142,7 +142,7 @@ class BehaviorInference:
         # Load config and classes
         self.cfg = load_config(model_dir)
         self.classes = load_classes(model_dir)
-        self.seq_len: int = int(self.cfg.get("sequence_length", 8))
+        self.seq_len: int = int(self.cfg.get("sequence_length", 32))
         self.img_size: int = int(self.cfg.get("img_size", 224))
         self.hidden_size: int = int(self.cfg.get("hidden_size", 256))
         self.num_layers: int = int(self.cfg.get("num_layers", 2))
