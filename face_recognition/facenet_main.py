@@ -352,8 +352,7 @@ def process_frames(frame_q, display_q, stop_event):
     display_miss_count = {}
     # per-display consecutive no-motion counter (body region shows no pixel changes)
     display_no_motion_count = {}
-    # once we saw an unknown person for a display_key, force-show their body box even if face isn't visible
-    display_force_show_unknown = {}  # display_key -> first_seen_frame
+    # (deprecated) previously we forced-show unknown persons; force-show removed to avoid lingering boxes
 
     # display smoothing cache for person boxes
     display_box_cache = {}  # track_id -> (x1,y1,x2,y2)
@@ -645,7 +644,7 @@ def process_frames(frame_q, display_q, stop_event):
                             pass
                         try:
                             dk = f"tid_{tid}"
-                            for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history):
+                            for d in (display_last_known, display_appearance, display_box_cache, display_label_history):
                                 try:
                                     if dk in d:
                                         del d[dk]
@@ -785,13 +784,8 @@ def process_frames(frame_q, display_q, stop_event):
                         if frame_num - last_seen <= LABEL_PERSIST_FRAMES:
                             label = last_label
 
-                # If the recognition tracker or face observations mark this display_key as unknown,
-                # set a persistent flag so body boxes remain visible even when the face is not seen.
-                if label == 'Unknown':
-                    # mark the display_key with the first frame we saw it unknown (if not already)
-                    # only set force_show for real observations, not predictions
-                    if not predicted_flag:
-                        display_force_show_unknown.setdefault(display_key, frame_num)
+                # Previously we would mark unknown display_keys for persistent showing;
+                # force-show behavior has been removed to avoid lingering boxes when people leave.
 
                 # color selection: known -> green shades, unknown -> neutral cyan fallback
                 fill_alpha = 0.0
@@ -1442,7 +1436,7 @@ def process_frames(frame_q, display_q, stop_event):
             if display_no_motion_count.get(display_key, 0) > BODY_DISAPPEAR_FRAMES:
                 try:
                     # remove caches related to this display_key
-                    for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history, display_last_activity):
+                    for d in (display_last_known, display_appearance, display_box_cache, display_label_history, display_last_activity):
                         try:
                             if display_key in d:
                                 del d[display_key]
@@ -1516,9 +1510,8 @@ def process_frames(frame_q, display_q, stop_event):
                 # Suppress drawing unknown boxes that haven't seen a face recently (likely false positives)
                 grace_ok = False
                 # If we've previously observed this display_key as Unknown, force showing the box
-                if display_force_show_unknown.get(display_key) is not None:
-                    grace_ok = True
-                elif has_face_now:
+                # Only allow grace if we have a face now or a recent face for this track
+                if has_face_now:
                     grace_ok = True
                 elif tid is not None and track_last_face_frame.get(tid) is not None:
                     grace_ok = (frame_num - track_last_face_frame[tid]) <= DRAW_UNKNOWN_GRACE_FRAMES
