@@ -123,15 +123,20 @@ class SimpleTracker:
 
         return id_to_box
 
+    def get_active_tracks(self) -> Dict[int, np.ndarray]:
+        """Return current active tracks without updating (used when skipping detection)."""
+        return {tid: info["bbox"] for tid, info in self.tracks.items()}
+
 
 class BehaviorInference:
     def __init__(
         self,
         model_dir: str = os.path.join("models", "LSTM_behavior_recognition"),
         yolo_weights: str = None,
-        conf_threshold: float = 0.4,
+        conf_threshold: float = 0.65,
         device_str: str = None,
         log_path: str = os.path.join("logs", "behavior_inference.csv"),
+        sample_stride: int = 3,
     ):
         # Device
         if device_str:
@@ -144,8 +149,8 @@ class BehaviorInference:
         self.classes = load_classes(model_dir)
         self.seq_len: int = int(self.cfg.get("sequence_length", 32))
         self.img_size: int = int(self.cfg.get("img_size", 224))
-        self.hidden_size: int = int(self.cfg.get("hidden_size", 256))
-        self.num_layers: int = int(self.cfg.get("num_layers", 2))
+        self.hidden_size: int = int(self.cfg.get("hidden_size", 512))
+        self.num_layers: int = int(self.cfg.get("num_layers", 3))
         self.bidirectional: bool = bool(self.cfg.get("bidirectional", False))
         self.dropout: float = float(self.cfg.get("dropout", 0.3))
         self.freeze_cnn: bool = bool(self.cfg.get("freeze_cnn", True))
@@ -188,6 +193,22 @@ class BehaviorInference:
         self.tracker = SimpleTracker(iou_thresh=0.3, max_missed=10)
         self.buffers: Dict[int, deque] = {}
         self.last_predictions: Dict[int, Tuple[str, float, float]] = {}  # id -> (label, conf, timestamp)
+        self.last_logits: Dict[int, np.ndarray] = {}  # id -> raw logits (numpy)
+
+        # Frame sampling stride for feature extraction (embeddings); detection still per-frame when motion present
+        self.sample_stride = max(1, int(sample_stride))
+
+        # Motion detection (background subtractor)
+        # Using MOG2 for robustness to lighting changes; tweak thresholds as needed.
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=25, detectShadows=True)
+        self.motion_pixel_threshold = 800  # Minimum foreground pixels to consider motion present
+        self.motion_dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+
+        # Infer neutral class name (case-insensitive match)
+        self.neutral_labels = {c for c in self.classes if c.lower() == "neutral"}
+        if not self.neutral_labels:
+            # Fallback: treat index 0 as neutral if explicit neutral not found
+            self.neutral_labels = {self.classes[0]}
 
         # Logger
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -227,17 +248,69 @@ class BehaviorInference:
         return feats  # device tensor
 
     @torch.no_grad()
-    def predict_sequence(self, emb_seq: torch.Tensor) -> Tuple[int, float]:
+    def batch_embed(self, frame_bgr: np.ndarray, pid_boxes: Dict[int, np.ndarray]) -> Dict[int, torch.Tensor]:
+        """Batch embed multiple person crops for efficiency.
+
+        Parameters
+        ----------
+        frame_bgr : np.ndarray
+            Current frame in BGR format.
+        pid_boxes : Dict[int, np.ndarray]
+            Mapping of track id -> box (x1,y1,x2,y2).
+
+        Returns
+        -------
+        Dict[int, torch.Tensor]
+            Mapping of track id -> embedding tensor (1,512).
+        """
+        if not pid_boxes:
+            return {}
+        crops = []
+        pids = []
+        h, w = frame_bgr.shape[:2]
+        for pid, box in pid_boxes.items():
+            x1, y1, x2, y2 = box.astype(int)
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame_bgr[y1:y2, x1:x2, :]
+            if crop.size == 0:
+                continue
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            t = self.to_tensor(crop_rgb)
+            t = self.resize(t)
+            t = self.normalize(t)
+            crops.append(t)
+            pids.append(pid)
+        if not crops:
+            return {}
+        batch = torch.stack(crops, dim=0).to(self.device)  # (B,3,H,W)
+        feats = self.model.cnn(batch)  # (B,512,1,1)
+        feats = feats.view(feats.size(0), -1)  # (B,512)
+        out: Dict[int, torch.Tensor] = {}
+        for i, pid in enumerate(pids):
+            out[pid] = feats[i : i + 1]  # keep batch dim (1,512)
+        return out
+
+    @torch.no_grad()
+    def predict_sequence(self, emb_seq: torch.Tensor) -> Tuple[int, float, np.ndarray]:
         # emb_seq: (1,T,512)
         lstm_out, _ = self.model.lstm(emb_seq)
+        # Use last timestep representation (standard) for classification
         last = lstm_out[:, -1, :]
-        logits = self.model.classifier(last)
+        logits = self.model.classifier(last)  # (1,num_classes)
         probs = torch.softmax(logits, dim=1)
-        print(probs)
         conf, idx = torch.max(probs, dim=1)
-        return int(idx.item()), float(conf.item())
+        # Store logits (caller can fetch from self.last_logits)
+        return int(idx.item()), float(conf.item()), logits.detach().cpu().numpy()[0]
 
     def log_prediction(self, person_id: int, label: str, conf: float):
+        # Skip logging neutral behaviors entirely
+        if label in self.neutral_labels:
+            return
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(f"{ts},{person_id},{label},{conf:.4f}\n")
@@ -258,6 +331,10 @@ class BehaviorInference:
             )
 
         print(f"Running inference on device: {self.device}")
+        print(self.device)
+        print(next(self.model.parameters()).device)
+        print(self.yolo.device)  # or self.yolo.predict(...).results[0].speed
+
         if isinstance(source, int):
             print(f"Using webcam index {source}")
         else:
@@ -265,57 +342,102 @@ class BehaviorInference:
         print("Press 'q' to quit window early.")
 
         try:
+            prev_time = time.time()
+            fps = 0.0
+            frame_idx = 0  # for sampling stride
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     print("Failed to read frame from camera.")
                     break
+                # -------------------- MOTION DETECTION --------------------
+                fgmask = self.bg_subtractor.apply(frame)
+                # Reduce noise & shadows (shadows often ~127)
+                _, fg_bin = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
+                fg_bin = cv2.dilate(fg_bin, self.motion_dilate_kernel, iterations=1)
+                motion_pixels = cv2.countNonZero(fg_bin)
+                motion_detected = motion_pixels > self.motion_pixel_threshold
 
-                # YOLO person detection
-                yolo_results = self.yolo.predict(source=frame, verbose=False, conf=self.yolo_conf, device=0 if self.device.type == 'cuda' else 'cpu')
-                detections: List[np.ndarray] = []
-                if yolo_results and len(yolo_results) > 0:
-                    res = yolo_results[0]
-                    boxes = res.boxes
-                    if boxes is not None and boxes.xyxy is not None:
-                        xyxy = boxes.xyxy.detach().cpu().numpy()
-                        clss = boxes.cls.detach().cpu().numpy().astype(int)
-                        for i in range(xyxy.shape[0]):
-                            if clss[i] == 0:  # person class
-                                detections.append(xyxy[i])
+                # -------------------- PERSON DETECTION & TRACKING --------------------
+                if motion_detected:
+                    # Run YOLO only when motion present
+                    yolo_results = self.yolo.predict(
+                        source=frame,
+                        verbose=False,
+                        conf=self.yolo_conf,
+                        device=0 if self.device.type == 'cuda' else 'cpu'
+                    )
+                    detections: List[np.ndarray] = []
+                    if yolo_results and len(yolo_results) > 0:
+                        res = yolo_results[0]
+                        boxes = res.boxes
+                        if boxes is not None and boxes.xyxy is not None:
+                            xyxy = boxes.xyxy.detach().cpu().numpy()
+                            clss = boxes.cls.detach().cpu().numpy().astype(int)
+                            for i in range(xyxy.shape[0]):
+                                if clss[i] == 0:  # person class
+                                    detections.append(xyxy[i])
+                    id_to_box = self.tracker.update(detections)
+                else:
+                    # No motion: keep existing tracked boxes
+                    id_to_box = self.tracker.get_active_tracks()
 
-                # Update tracker to get IDs
-                id_to_box = self.tracker.update(detections)
+                # -------------------- BEHAVIOR CLASSIFICATION --------------------
+                # Prepare batch embeddings only on sampled frames (stride) & when motion detected
+                embeddings_this_frame: Dict[int, torch.Tensor] = {}
+                if motion_detected and (frame_idx % self.sample_stride == 0):
+                    embeddings_this_frame = self.batch_embed(frame, id_to_box)
 
-                # For each tracked person, update embedding buffer and possibly predict
                 for pid, box in id_to_box.items():
-                    # Draw bbox
                     x1, y1, x2, y2 = box.astype(int)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label_text = f"ID {pid}: collecting..."
 
-                    # Update buffer
-                    if pid not in self.buffers:
-                        self.buffers[pid] = deque(maxlen=self.seq_len)
+                    predicted_label = None
+                    predicted_conf = None
+                    label_text = f"ID {pid}: neutral"
 
-                    emb = self.embed_frame(frame, box)  # (1,512)
-                    self.buffers[pid].append(emb.squeeze(0))  # (512,)
+                    if motion_detected:
+                        # Initialize buffer if new
+                        if pid not in self.buffers:
+                            self.buffers[pid] = deque(maxlen=self.seq_len)
 
-                    if len(self.buffers[pid]) == self.seq_len:
-                        # Build (1,T,512)
-                        emb_seq = torch.stack(list(self.buffers[pid]), dim=0).unsqueeze(0).to(self.device)
-                        idx, conf = self.predict_sequence(emb_seq)
-                        label = self.classes[idx] if 0 <= idx < len(self.classes) else str(idx)
-                        label_text = f"ID {pid}: {label} ({conf*100:.1f}%)"
+                        # Only append embedding on sampled frames when we computed batch embeddings
+                        if pid in embeddings_this_frame:
+                            self.buffers[pid].append(embeddings_this_frame[pid].squeeze(0))
 
-                        # Log predictions (only if new or changed)
-                        last = self.last_predictions.get(pid)
-                        now = time.time()
-                        if last is None or last[0] != label or (now - last[2]) > 2.0:
-                            self.log_prediction(pid, label, conf)
-                            self.last_predictions[pid] = (label, conf, now)
+                        if len(self.buffers[pid]) == self.seq_len:
+                            emb_seq = torch.stack(list(self.buffers[pid]), dim=0).unsqueeze(0).to(self.device)
+                            idx, conf, logits = self.predict_sequence(emb_seq)
+                            predicted_label = self.classes[idx] if 0 <= idx < len(self.classes) else str(idx)
+                            predicted_conf = conf
+                            self.last_logits[pid] = logits  # store raw logits
 
-                    # Put label text
+                            if predicted_label in self.neutral_labels:
+                                label_text = f"ID {pid}: neutral"
+                            else:
+                                label_text = f"ID {pid}: {predicted_label} ({conf*100:.1f}%)"
+
+                            # Logging logic: only for suspicious (non-neutral)
+                            if predicted_label not in self.neutral_labels:
+                                last = self.last_predictions.get(pid)
+                                now = time.time()
+                                should_log = False
+                                if last is None:
+                                    should_log = True
+                                else:
+                                    last_label, last_conf, _ = last
+                                    if last_label != predicted_label or abs(last_conf - conf) > 0.05:
+                                        should_log = True
+                                if should_log:
+                                    self.log_prediction(pid, predicted_label, conf)
+                                    self.last_predictions[pid] = (predicted_label, conf, now)
+                            else:
+                                self.last_predictions[pid] = (predicted_label, predicted_conf or 0.0, time.time())
+                    else:
+                        # No motion: display neutral only (don't modify buffers to avoid stale sequences)
+                        label_text = f"ID {pid}: neutral"
+
+                    # Draw label text
                     y_text = max(10, y1 - 10)
                     cv2.putText(
                         frame,
@@ -328,6 +450,23 @@ class BehaviorInference:
                         cv2.LINE_AA,
                     )
 
+                # -------------------- FPS DISPLAY --------------------
+                now_t = time.time()
+                dt = now_t - prev_time
+                if dt > 0:
+                    fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else (1.0 / dt)
+                prev_time = now_t
+                cv2.putText(
+                    frame,
+                    f"FPS: {fps:.1f} | Motion: {'YES' if motion_detected else 'NO'}",
+                    (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 255) if motion_detected else (200, 200, 200),
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.imshow("Behavior Recognition", frame)
                 # For files, slow down to (approx) real-time if FPS known; else minimal delay
                 delay = 1
@@ -338,6 +477,7 @@ class BehaviorInference:
                 key = cv2.waitKey(delay) & 0xFF
                 if key == ord('q'):
                     break
+                frame_idx += 1
         finally:
             cap.release()
             cv2.destroyAllWindows()
@@ -365,7 +505,7 @@ def parse_args():
         help="Path to YOLOv8 weights (default: models/YOLOv8/yolov8n.pt or auto-download)",
     )
     p.add_argument(
-        "--conf", type=float, default=0.4, help="YOLO confidence threshold (default: 0.4)"
+        "--conf", type=float, default=0.65, help="YOLO confidence threshold (default: 0.65)"
     )
     p.add_argument(
         "--device", type=str, default=None, help="Torch device string (e.g., 'cuda', 'cpu'). Default auto."
@@ -381,6 +521,12 @@ def parse_args():
         type=str,
         default=os.path.join("logs", "behavior_inference.csv"),
         help="Path to CSV log file",
+    )
+    p.add_argument(
+        "--stride",
+        type=int,
+        default=3,
+        help="Frame sampling stride for embeddings (default: 3)",
     )
     args = p.parse_args()
     # Resolve source (camera index or file)
@@ -405,5 +551,6 @@ if __name__ == "__main__":
         conf_threshold=args.conf,
         device_str=args.device,
         log_path=args.log,
+        sample_stride=args.stride,
     )
     engine.run(source=args.source_val)

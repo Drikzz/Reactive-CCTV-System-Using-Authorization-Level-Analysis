@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import json
 import argparse
+import sys
 from typing import Optional, Tuple, List, Sequence
 
 import torch
@@ -38,6 +39,17 @@ import torchvision.transforms as T
 import numpy as np
 import time
 import csv
+from datetime import datetime
+
+# Optional plotting libs (lazy import later to keep base run lightweight)
+try:
+    import matplotlib.pyplot as plt  # type: ignore
+except Exception:  # pragma: no cover
+    plt = None  # type: ignore
+try:
+    import seaborn as sns  # type: ignore
+except Exception:  # pragma: no cover
+    sns = None  # type: ignore
 
 # Import dataset & model definitions from training file (reuse code if available)
 try:
@@ -86,9 +98,25 @@ def build_dataloaders_from_cfg(cfg_dict: dict, classes: List[str], override_root
         cfg.root_dir = override_root
     if override_cache:
         cfg.cache_root = override_cache
-    video_label_pairs, _classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
-    # ensure classes order matches saved (names must match)
-    train_pairs, test_pairs = make_splits(video_label_pairs, classes, cfg.train_split, cfg.random_seed)
+    video_label_pairs, discovered_classes = discover_videos(cfg.root_dir, cfg.max_videos_per_class)
+    # Remap discovered labels to saved classes list; skip any unknown classes gracefully
+    saved_index = {name: i for i, name in enumerate(classes)}
+    remapped: List[Tuple[str,int]] = []
+    skipped_unknown = 0
+    for path, lab in video_label_pairs:
+        if 0 <= lab < len(discovered_classes):
+            cname = discovered_classes[lab]
+            if cname in saved_index:
+                remapped.append((path, saved_index[cname]))
+            else:
+                skipped_unknown += 1
+        else:
+            skipped_unknown += 1
+    if skipped_unknown > 0:
+        print(f"[WARN] Skipped {skipped_unknown} clip(s) whose class is not in saved model classes.json.")
+    if not remapped:
+        raise RuntimeError("After remapping, no videos matched the saved classes. Ensure dataset structure aligns with classes.json.")
+    train_pairs, test_pairs = make_splits(remapped, classes, cfg.train_split, cfg.random_seed)
     transform = T.Compose([
         T.ToTensor(),
         T.Resize((cfg.img_size, cfg.img_size)),
@@ -292,7 +320,7 @@ def evaluate(
 def parse_args():
     p = argparse.ArgumentParser(description='Evaluate LSTM behavior recognition model (enhanced).')
     p.add_argument('--model-dir', default=None, help='Directory containing checkpoint & metadata (best_model.pth, config.json, classes.json). If omitted, auto-detect.')
-    p.add_argument('--checkpoint', choices=['best','last','file'], default='best', help='Which checkpoint to load (best / last / file)')
+    p.add_argument('--checkpoint', choices=['best','last','file'], default='best', help="Checkpoint to load (default: best). Omit this flag to automatically use best_model.pth.")
     p.add_argument('--checkpoint-path', default=None, help='Explicit checkpoint path if --checkpoint file')
     p.add_argument('--compare-fresh', action='store_true', help='Also evaluate an uninitialized model for baseline comparison')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use (default auto)')
@@ -303,6 +331,10 @@ def parse_args():
     p.add_argument('--verify-inference-path', action='store_true', help='Check that forward() matches manual inference path logits')
     p.add_argument('--data-root', default=None, help='Override dataset root (cfg.root_dir) for evaluation only')
     p.add_argument('--cache-root', default=None, help='Override cache root (cfg.cache_root) for evaluation only')
+    p.add_argument('--cm-fig', default=None, help='Path to save confusion matrix heatmap (PNG). Use with --confusion')
+    p.add_argument('--cm-normalize', choices=['none','true','pred','all'], default='true', help='Normalization mode for confusion matrix plot')
+    p.add_argument('--pr-bar-fig', default=None, help='Path to save per-class precision/recall/F1 bar chart (PNG); requires --per-class')
+    p.add_argument('--fig-dpi', type=int, default=130, help='DPI for saved figures (default: 130)')
     return p.parse_args()
 
 
@@ -337,6 +369,11 @@ def auto_discover_model_dir(explicit: Optional[str]) -> str:
 
 
 def main():
+    # Auto-inject default arguments if user provided none.
+    # This allows simply: python LSTM_evaluate.py (or -m ...) to evaluate best model with rich metrics.
+    if len(sys.argv) == 1:
+        # Replace argv with desired defaults while keeping program name.
+        sys.argv = [sys.argv[0], '--checkpoint', 'best', '--per-class', '--confusion']
     args = parse_args()
     device = torch.device(args.device)
     model_dir = auto_discover_model_dir(args.model_dir)
@@ -404,6 +441,88 @@ def main():
             writer.writerows(metrics['predictions'])
         print(f"Wrote predictions CSV: {args.pred_csv}")
 
+    # ---- Visualization (confusion matrix) ----
+    if args.cm_fig and metrics.get('confusion') is not None:
+        if plt is None:
+            print('Cannot plot confusion matrix: matplotlib not installed.')
+        else:
+            cm = metrics['confusion'].astype(float)
+            norm_mode = args.cm_normalize
+            if norm_mode != 'none':
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    if norm_mode == 'true':
+                        sums = cm.sum(axis=1, keepdims=True)
+                        cm = np.divide(cm, sums, out=np.zeros_like(cm), where=sums>0)
+                    elif norm_mode == 'pred':
+                        sums = cm.sum(axis=0, keepdims=True)
+                        cm = np.divide(cm, sums, out=np.zeros_like(cm), where=sums>0)
+                    elif norm_mode == 'all':
+                        total = cm.sum()
+                        if total > 0:
+                            cm = cm / total
+            # Limit for readability
+            max_classes_to_plot = 60
+            label_subset = classes
+            plot_cm = cm
+            if cm.shape[0] > max_classes_to_plot:
+                plot_cm = cm[:max_classes_to_plot, :max_classes_to_plot]
+                label_subset = classes[:max_classes_to_plot] if classes else [str(i) for i in range(max_classes_to_plot)]
+                print(f"Confusion matrix truncated to first {max_classes_to_plot} classes for plotting.")
+            fig_w = min(20, max(6, 0.35 * plot_cm.shape[0]))
+            fig_h = fig_w
+            plt.figure(figsize=(fig_w, fig_h))
+            if sns is not None:
+                sns.heatmap(plot_cm, annot=plot_cm.shape[0] <= 30, fmt='.2f' if norm_mode!='none' else 'g',
+                            cmap='viridis', cbar=True, xticks=range(len(label_subset)), yticks=range(len(label_subset)))
+            else:
+                plt.imshow(plot_cm, cmap='viridis')
+                if plot_cm.shape[0] <= 30:
+                    for i in range(plot_cm.shape[0]):
+                        for j in range(plot_cm.shape[1]):
+                            val = plot_cm[i, j]
+                            plt.text(j, i, f"{val:.2f}" if norm_mode!='none' else int(val), ha='center', va='center', color='w', fontsize=7)
+                plt.colorbar()
+            plt.title(f"Confusion Matrix ({norm_mode})")
+            plt.xlabel('Predicted')
+            plt.ylabel('True')
+            if label_subset and len(label_subset) <= 60:
+                plt.xticks(ticks=np.arange(len(label_subset))+0.5, labels=[l.split('/')[-1] for l in label_subset], rotation=90, fontsize=8)
+                plt.yticks(ticks=np.arange(len(label_subset))+0.5, labels=[l.split('/')[-1] for l in label_subset], rotation=0, fontsize=8)
+            plt.tight_layout()
+            os.makedirs(os.path.dirname(args.cm_fig) or '.', exist_ok=True)
+            plt.savefig(args.cm_fig, dpi=args.fig_dpi)
+            plt.close()
+            print(f"Saved confusion matrix figure: {args.cm_fig}")
+
+    # ---- Visualization (precision/recall/F1 bar chart) ----
+    if args.pr_bar_fig and metrics.get('per_class'):
+        if plt is None:
+            print('Cannot plot PR/F1 bars: matplotlib not installed.')
+        else:
+            rows = metrics['per_class']
+            names = [r['class'].split('/')[-1] for r in rows]
+            precision = [r['precision'] for r in rows]
+            recall = [r['recall'] for r in rows]
+            f1 = [r['f1'] for r in rows]
+            idx = np.arange(len(rows))
+            bar_w = 0.25
+            fig_w = min(24, max(8, 0.4 * len(rows)))
+            plt.figure(figsize=(fig_w, 6))
+            plt.bar(idx - bar_w, precision, width=bar_w, label='Precision')
+            plt.bar(idx, recall, width=bar_w, label='Recall')
+            plt.bar(idx + bar_w, f1, width=bar_w, label='F1')
+            plt.xticks(idx, names, rotation=90 if len(rows) > 12 else 45, ha='right', fontsize=8)
+            plt.ylim(0, 1.05)
+            plt.ylabel('Score')
+            plt.title('Per-Class Precision / Recall / F1')
+            plt.legend()
+            plt.tight_layout()
+            os.makedirs(os.path.dirname(args.pr_bar_fig) or '.', exist_ok=True)
+            plt.savefig(args.pr_bar_fig, dpi=args.fig_dpi)
+            plt.close()
+            print(f"Saved PR/F1 bar figure: {args.pr_bar_fig}")
+
+    baseline_acc = None
     if args.compare_fresh:
         print('Evaluating fresh (untrained) model for baseline...')
         baseline_model = fresh_model(cfg_dict, len(classes), device)
@@ -411,6 +530,7 @@ def main():
         print(f"Fresh model accuracy: {baseline_acc:.2f}%")
 
     # Optional comparison to last vs best
+    last_metrics_acc = None
     if args.checkpoint == 'best':
         last_path = os.path.join(model_dir, 'last_model.pth')
         if os.path.isfile(last_path):
@@ -418,8 +538,50 @@ def main():
                 last_model_loaded = load_model(cfg_dict, len(classes), last_path, device)
                 last_metrics = evaluate(last_model_loaded, test_loader, device, classes=classes, topk=[1])
                 print(f"Last model accuracy: {last_metrics['accuracy']:.2f}% (difference vs best: {metrics['accuracy'] - last_metrics['accuracy']:+.2f} pp)")
+                last_metrics_acc = last_metrics['accuracy']
             except Exception as e:
                 print(f"Warning: could not evaluate last model: {e}")
+
+    # ---- Always persist metrics JSON ----
+    try:
+        save_dir = model_dir
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        metrics_to_save = {
+            'timestamp_utc': timestamp,
+            'checkpoint_loaded': ckpt_path,
+            'args': {
+                'checkpoint': args.checkpoint,
+                'topk': args.topk,
+                'per_class_requested': args.per_class,
+                'confusion_requested': args.confusion,
+                'verify_inference_path': args.verify_inference_path,
+                'data_root_override': args.data_root,
+                'cache_root_override': args.cache_root,
+            },
+            'accuracy': metrics.get('accuracy'),
+            'topk': metrics.get('topk'),
+            'aggregate_prf': metrics.get('prf'),
+            'samples': metrics.get('samples'),
+            'elapsed_sec': metrics.get('elapsed_sec'),
+            'baseline_accuracy': baseline_acc,
+            'last_model_accuracy': last_metrics_acc,
+        }
+        if args.per_class and metrics.get('per_class') is not None:
+            metrics_to_save['per_class'] = metrics['per_class']
+        if args.confusion and metrics.get('confusion') is not None:
+            # store raw confusion matrix counts (not normalized)
+            metrics_to_save['confusion_matrix'] = metrics['confusion'].tolist()
+        # Write a timestamped file and update a latest pointer
+        ts_file = os.path.join(save_dir, f'eval_metrics_{timestamp}.json')
+        with open(ts_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics_to_save, f, indent=2)
+        latest_file = os.path.join(save_dir, 'eval_metrics_latest.json')
+        with open(latest_file, 'w', encoding='utf-8') as f:
+            json.dump(metrics_to_save, f, indent=2)
+        print(f"Saved metrics: {ts_file} (also updated eval_metrics_latest.json)")
+    except Exception as e:
+        print(f"Warning: failed to save metrics JSON: {e}")
 
     print('Evaluation complete.')
 

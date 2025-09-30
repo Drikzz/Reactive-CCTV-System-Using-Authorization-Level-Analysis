@@ -49,8 +49,8 @@ class LSTMConfig:
     max_videos_per_class: Optional[int] = 200  # cap per class
     
     # Model architecture
-    hidden_size: int = 256                # LSTM hidden size
-    num_layers: int = 2                   # LSTM layers
+    hidden_size: int = 512                # LSTM hidden size
+    num_layers: int = 3                   # LSTM layers
     bidirectional: bool = False
     dropout: float = 0.3                  # LSTM dropout (if num_layers>1)
     freeze_cnn: bool = True               # freeze pretrained CNN weights
