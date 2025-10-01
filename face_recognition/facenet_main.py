@@ -38,6 +38,7 @@ PROCESS_EVERY_N = 3                # process detection/recognition every N frame
 RECOG_THRESHOLD = 0.65             # classifier probability threshold
 RECOG_MARGIN = 0.15                # require top-prob - second-prob >= margin to accept a label
 RECOG_COSINE_THRESHOLD = 0.75      # stricter cosine similarity for attaching embeddings to existing tracks
+FALLBACK_COSINE = 0.78             # fallback cosine threshold to accept centroid match for difficult views
 CAPTURE_QUEUE_SIZE = 4
 DISPLAY_QUEUE_SIZE = 2
 KNOWN_SAVE_INTERVAL_MIN = 5
@@ -76,8 +77,8 @@ LABEL_HISTORY_LEN = 5
 LABEL_CONFIRM_COUNT = 3
 # Display persistence settings (frames)
 # Increased TTLs to reduce flicker for stationary people (tune as needed)
-DISPLAY_TTL = 240   # frames to keep full box after last seen activity (~8s at 30fps)
-GHOST_TTL = 120     # extra frames to show a faded/ghost box before removal (~4s)
+DISPLAY_TTL = 120   # frames to keep full box after last seen activity (~8s at 30fps)
+GHOST_TTL = 0   # extra frames to show a faded/ghost box before removal (~4s)
 IOU_KEEP_THRESHOLD = 0.25  # IoU threshold to consider a person detection matching a track
 BODY_DISAPPEAR_FRAMES = 120  # frames of consecutive no-person/no-motion before we remove a body box (~4s)
 APPEARANCE_MATCH_THRESHOLD = 0.55  # histogram correlation threshold to accept appearance match (0-1)
@@ -352,8 +353,7 @@ def process_frames(frame_q, display_q, stop_event):
     display_miss_count = {}
     # per-display consecutive no-motion counter (body region shows no pixel changes)
     display_no_motion_count = {}
-    # once we saw an unknown person for a display_key, force-show their body box even if face isn't visible
-    display_force_show_unknown = {}  # display_key -> first_seen_frame
+    # (deprecated) previously we forced-show unknown persons; force-show removed to avoid lingering boxes
 
     # display smoothing cache for person boxes
     display_box_cache = {}  # track_id -> (x1,y1,x2,y2)
@@ -367,7 +367,7 @@ def process_frames(frame_q, display_q, stop_event):
     track_kalman = {}
 
     # ---------- drawing helpers ----------
-    def smooth_box(prev_box, new_box, alpha=0.85):
+    def smooth_box(prev_box, new_box, alpha=0.95):
         if prev_box is None or new_box is None:
             return new_box
         x1 = int(prev_box[0] * alpha + new_box[0] * (1 - alpha))
@@ -645,7 +645,7 @@ def process_frames(frame_q, display_q, stop_event):
                             pass
                         try:
                             dk = f"tid_{tid}"
-                            for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history):
+                            for d in (display_last_known, display_appearance, display_box_cache, display_label_history):
                                 try:
                                     if dk in d:
                                         del d[dk]
@@ -785,13 +785,8 @@ def process_frames(frame_q, display_q, stop_event):
                         if frame_num - last_seen <= LABEL_PERSIST_FRAMES:
                             label = last_label
 
-                # If the recognition tracker or face observations mark this display_key as unknown,
-                # set a persistent flag so body boxes remain visible even when the face is not seen.
-                if label == 'Unknown':
-                    # mark the display_key with the first frame we saw it unknown (if not already)
-                    # only set force_show for real observations, not predictions
-                    if not predicted_flag:
-                        display_force_show_unknown.setdefault(display_key, frame_num)
+                # Previously we would mark unknown display_keys for persistent showing;
+                # force-show behavior has been removed to avoid lingering boxes when people leave.
 
                 # color selection: known -> green shades, unknown -> neutral cyan fallback
                 fill_alpha = 0.0
@@ -850,9 +845,11 @@ def process_frames(frame_q, display_q, stop_event):
                     union_x2 = max(x2, body_box[2])
                     union_y2 = max(y2, body_box[3])
                     merged_box = (union_x1, union_y1, union_x2, union_y2)
-                    # choose color using person_color but dimmed slightly for the merged box
-                    merged_color = (int(person_color[0]*0.9), int(person_color[1]*0.9), int(person_color[2]*0.9))
-                    draw_stylized_box(annotated_frame, merged_box, scale_color(merged_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
+                    # if this is a known person, allow the merged (body) box to remove the small face box
+                    replace_over = (label != 'Unknown')
+                    draw_stylized_box(annotated_frame, merged_box, scale_color(person_color, visual_alpha),
+                                      thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10,
+                                      replace_overlaps=replace_over)
                 except Exception:
                     # fallback to drawing the original person box
                     try:
@@ -1228,56 +1225,73 @@ def process_frames(frame_q, display_q, stop_event):
         # can survive short occlusions or motionless periods. Use the active_tracks
         # computed below to determine a stable display_key for each face.
         try:
-            # Ensure active_tracks exists (fallback to people_boxes if not)
             active_tracks = track_list if 'track_list' in locals() and track_list is not None else [{'track_id': None, 'bbox': b} for b in people_boxes]
             for fi, f in enumerate(faces):
-                display_name = face_display_names[fi] if fi < len(face_display_names) else f.get("name", "Unknown")
-                if display_name == 'Unknown':
+                name = face_display_names[fi] if fi < len(face_display_names) else f.get("name", "Unknown")
+                # ignore unknown faces
+                if not name or name == "Unknown":
                     continue
                 pb_idx = face_to_person.get(fi)
-                if pb_idx is None:
-                    continue
-                # Find the track that overlaps this person_box
-                for tr_idx, tr in enumerate(active_tracks):
+                # If the face belongs to a person box, propagate the label to person-level keys.
+                if pb_idx is not None and pb_idx < len(people_boxes):
+                    # primary key tied to person detection index (stable across short moves)
+                    pb_key = f"pb_{pb_idx}"
+                    display_last_known[pb_key] = (name, frame_num)
+                    # store appearance histogram for safer re-identification
                     try:
-                        if compute_iou(tr.get('bbox', (0,0,0,0)), people_boxes[pb_idx]) >= IOU_KEEP_THRESHOLD:
-                            matched_pid = find_best_pid(tr.get('bbox', (0,0,0,0)), tracked_persons, iou_thresh=IOU_THRESHOLD)
-                            if matched_pid is not None:
-                                display_key = f"pid_{matched_pid}"
-                            elif tr.get('track_id') is not None:
-                                display_key = f"tid_{tr.get('track_id')}"
-                            else:
-                                display_key = f"pb_{tr_idx}"
-                            # Label stability: push prediction into short history and only confirm
-                            # if a label appears frequently enough to avoid spurious flips.
-                            hist = display_label_history.get(display_key)
-                            if hist is None:
-                                hist = deque(maxlen=LABEL_HISTORY_LEN)
-                                display_label_history[display_key] = hist
-                            hist.append(display_name)
-                            # count occurrences of each label in history
-                            from collections import Counter
-                            cnt = Counter(hist)
-                            top_label, top_count = cnt.most_common(1)[0]
-                            if top_label != 'Unknown' and top_count >= LABEL_CONFIRM_COUNT:
-                                # store confirmed label and appearance histogram to avoid later mis-assignment
-                                display_last_known[display_key] = (top_label, frame_num)
-                                try:
-                                    # compute appearance hist for this track's bbox (use tr bbox if available)
-                                    tb_box = tr.get('bbox', None)
-                                    if tb_box is None and pb_idx is not None:
-                                        tb_box = people_boxes[pb_idx]
-                                    if tb_box is not None:
-                                        x1a, y1a, x2a, y2a = map(int, tb_box)
-                                        cropa = original_frame[y1a:y2a, x1a:x2a]
-                                        display_appearance[display_key] = compute_hsv_hist(cropa)
-                                except Exception:
-                                    # ignore appearance compute failures
-                                    pass
-                            # else: do not update display_last_known yet (wait for confirmation)
-                            break
+                        bx1, by1, bx2, by2 = map(int, people_boxes[pb_idx])
+                        crop = original_frame[by1:by2, bx1:bx2]
+                        if crop is not None and crop.size > 0:
+                            display_appearance[pb_key] = compute_hsv_hist(crop)
                     except Exception:
-                        continue
+                        pass
+                    # also map to any active track that overlaps this person box (so tid_... keys get the same label)
+                    for tr in active_tracks:
+                        try:
+                            tr_bbox = tr.get('bbox', (0,0,0,0))
+                            if compute_iou(tr_bbox, people_boxes[pb_idx]) >= IOU_KEEP_THRESHOLD:
+                                tid = tr.get('track_id')
+                                if tid is not None:
+                                    tk = f"tid_{tid}"
+                                    display_last_known[tk] = (name, frame_num)
+                                    # copy appearance as well
+                                    if pb_key in display_appearance:
+                                        display_appearance[tk] = display_appearance[pb_key]
+                                # also propagate to matched pid (if RecognitionTracker already assigned)
+                                pid = find_best_pid(tr_bbox, tracked_persons, iou_thresh=IOU_THRESHOLD)
+                                if pid is not None:
+                                    pk = f"pid_{pid}"
+                                    display_last_known[pk] = (name, frame_num)
+                                    if pb_key in display_appearance:
+                                        display_appearance[pk] = display_appearance[pb_key]
+                        except Exception:
+                            continue
+                else:
+                    # No person box found for this face — attempt to attach to any active track by IoU
+                    for tr_idx, tr in enumerate(active_tracks):
+                        try:
+                            tr_bbox = tr.get('bbox', (0,0,0,0))
+                            # small threshold: face box vs track bbox
+                            if compute_iou(tr_bbox, f.get("bbox", (0,0,0,0))) >= 0.15:
+                                # assign to pb_{tr_idx} and tid/pid if available
+                                key = f"pb_{tr_idx}"
+                                display_last_known[key] = (name, frame_num)
+                                try:
+                                    bx1, by1, bx2, by2 = map(int, tr_bbox)
+                                    crop = original_frame[by1:by2, bx1:bx2]
+                                    if crop is not None and crop.size > 0:
+                                        display_appearance[key] = compute_hsv_hist(crop)
+                                except Exception:
+                                    pass
+                                tid = tr.get('track_id')
+                                if tid is not None:
+                                    display_last_known[f"tid_{tid}"] = (name, frame_num)
+                                pid = find_best_pid(tr_bbox, tracked_persons, iou_thresh=IOU_THRESHOLD)
+                                if pid is not None:
+                                    display_last_known[f"pid_{pid}"] = (name, frame_num)
+                                break
+                        except Exception:
+                            continue
         except Exception:
             pass
 
@@ -1442,7 +1456,7 @@ def process_frames(frame_q, display_q, stop_event):
             if display_no_motion_count.get(display_key, 0) > BODY_DISAPPEAR_FRAMES:
                 try:
                     # remove caches related to this display_key
-                    for d in (display_last_known, display_appearance, display_force_show_unknown, display_box_cache, display_label_history, display_last_activity):
+                    for d in (display_last_known, display_appearance, display_box_cache, display_label_history, display_last_activity, display_miss_count, display_no_motion_count, display_prev_crop, display_flow_state):
                         try:
                             if display_key in d:
                                 del d[display_key]
@@ -1516,9 +1530,8 @@ def process_frames(frame_q, display_q, stop_event):
                 # Suppress drawing unknown boxes that haven't seen a face recently (likely false positives)
                 grace_ok = False
                 # If we've previously observed this display_key as Unknown, force showing the box
-                if display_force_show_unknown.get(display_key) is not None:
-                    grace_ok = True
-                elif has_face_now:
+                # Only allow grace if we have a face now or a recent face for this track
+                if has_face_now:
                     grace_ok = True
                 elif tid is not None and track_last_face_frame.get(tid) is not None:
                     grace_ok = (frame_num - track_last_face_frame[tid]) <= DRAW_UNKNOWN_GRACE_FRAMES
@@ -1582,11 +1595,11 @@ def process_frames(frame_q, display_q, stop_event):
                     union_x2 = max(x2, body_box[2])
                     union_y2 = max(y2, body_box[3])
                     merged_box = (union_x1, union_y1, union_x2, union_y2)
-                    merged_color = (int(person_color[0]*0.9), int(person_color[1]*0.9), int(person_color[2]*0.9))
-                    draw_stylized_box(annotated_frame, merged_box, scale_color(merged_color, visual_alpha), thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10)
-                    # optional small label for body only for Unknown to emphasize it's unlabeled
-                    if label == 'Unknown' and not ghost:
-                        draw_text_with_bg(annotated_frame, 'Body', (body_x1, min(body_y2 + 14, orig_h-6)), 0.45, scale_color(merged_color, visual_alpha), thickness=1, bg_color=(10,10,10))
+                    # allow merged box for known persons to remove the small face box to avoid duplicate outlines
+                    replace_over = (label != 'Unknown')
+                    draw_stylized_box(annotated_frame, merged_box, scale_color(merged_color, visual_alpha),
+                                      thickness=max(1, int(thickness * visual_alpha)), fill_alpha=0.0, corner=10,
+                                      replace_overlaps=replace_over)
                 except Exception:
                     # fallback: draw person box
                     try:

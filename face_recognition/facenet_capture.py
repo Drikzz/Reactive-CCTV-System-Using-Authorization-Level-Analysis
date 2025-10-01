@@ -2,8 +2,10 @@ import os
 import sys
 import time
 import cv2
+import numpy as np
+import joblib
 import torch
-from facenet_pytorch import MTCNN
+from facenet_pytorch import MTCNN, InceptionResnetV1, fixed_image_standardization
 
 # Add the root project dir to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
