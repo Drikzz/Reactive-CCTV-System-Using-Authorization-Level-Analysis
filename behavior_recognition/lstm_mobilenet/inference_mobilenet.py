@@ -114,7 +114,7 @@ class BehaviorInferenceMobileNet:
         conf_threshold: float = 0.6,
         device_str: str = None,
         log_path: str = os.path.join('logs', 'behavior_inference_mobilenet.csv'),
-        sample_stride: int = 2,
+        sample_stride: int = 8,
     ):
         # Device
         self.device = torch.device(device_str) if device_str else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -123,7 +123,7 @@ class BehaviorInferenceMobileNet:
         self.cfg = load_config(model_dir)
         self.classes = load_classes(model_dir)
         self.seq_len = int(self.cfg.get('sequence_length', 32))
-        self.img_size = int(self.cfg.get('img_size', 224))
+        self.img_size = int(self.cfg.get('img_size', 160))
         self.hidden_size = int(self.cfg.get('hidden_size', 512))
         self.num_layers = int(self.cfg.get('num_layers', 3))
         self.bidirectional = bool(self.cfg.get('bidirectional', False))
