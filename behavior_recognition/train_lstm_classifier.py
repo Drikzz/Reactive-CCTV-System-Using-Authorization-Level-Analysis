@@ -12,6 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report
+from collections import Counter
 import config
 
 
@@ -26,15 +27,23 @@ class PoseSequenceDataset(Dataset):
         """
         self.data_paths = data_paths
         self.labels = labels
+        self.augmented_data = []
+        self.augmented_start_idx = len(data_paths)
     
     def __len__(self):
-        return len(self.data_paths)
+        return len(self.labels)
     
     def __getitem__(self, idx):
-        # Load tensor: [num_frames, 17, 2]
-        sequence = torch.load(self.data_paths[idx], map_location='cpu')  # Load to CPU first
-        # Flatten keypoints: [num_frames, 34]
-        sequence = sequence.view(sequence.size(0), -1)
+        # Check if this is an augmented sequence (stored in memory)
+        if idx >= self.augmented_start_idx:
+            aug_idx = idx - self.augmented_start_idx
+            sequence = self.augmented_data[aug_idx]
+        else:
+            # Load from file
+            sequence = torch.load(self.data_paths[idx], map_location='cpu')
+            # Flatten keypoints: [num_frames, 17, 2] -> [num_frames, 34]
+            sequence = sequence.view(sequence.size(0), -1)
+        
         label = self.labels[idx]
         return sequence, label
 
@@ -43,11 +52,33 @@ def collate_fn(batch):
     """Custom collate function to pad sequences of variable length."""
     sequences, labels = zip(*batch)
     
-    # Pad sequences to the same length
-    sequences_padded = pad_sequence(sequences, batch_first=True, padding_value=0)
+    # Check if all sequences have the same length (fixed-length mode)
+    seq_lengths = [len(seq) for seq in sequences]
+    if len(set(seq_lengths)) == 1:
+        # All sequences same length - stack directly (faster)
+        sequences_batched = torch.stack(sequences, dim=0)
+    else:
+        # Variable length - pad sequences to the same length
+        sequences_batched = pad_sequence(sequences, batch_first=True, padding_value=0)
+    
     labels = torch.tensor(labels, dtype=torch.long)
     
-    return sequences_padded, labels
+    return sequences_batched, labels
+
+
+def augment_sequence(sequence, noise_std=0.01):
+    """
+    Simple augmentation: add Gaussian noise to keypoints.
+    
+    Args:
+        sequence: torch.Tensor of shape [seq_len, input_dim]
+        noise_std: standard deviation of Gaussian noise
+        
+    Returns:
+        Augmented sequence tensor
+    """
+    noise = torch.randn_like(sequence) * noise_std
+    return sequence + noise
 
 
 class LSTMClassifier(nn.Module):
@@ -153,7 +184,76 @@ def load_dataset():
     val_dataset = PoseSequenceDataset(val_paths, val_labels)
     test_dataset = PoseSequenceDataset(test_paths, test_labels)
     
-    return train_dataset, val_dataset, test_dataset, class_names
+    # ===============================
+    # CLASS WEIGHTING & AUGMENTATION
+    # ===============================
+    
+    print("\n" + "=" * 60)
+    print("CLASS BALANCING")
+    print("=" * 60)
+    
+    # Count sequences per class
+    label_counts = Counter(train_labels)
+    print("\n📊 Sequence counts per class:")
+    for idx, name in enumerate(class_names):
+        count = label_counts[idx]
+        print(f"   {idx}: {name:20s} - {count:3d} sequences")
+    
+    # Compute class weights: inverse frequency
+    total = sum(label_counts.values())
+    num_classes = len(label_counts)
+    class_weights = torch.tensor(
+        [total / (num_classes * label_counts[i]) for i in range(num_classes)],
+        dtype=torch.float32
+    )
+    
+    print("\n⚖️  Class weights (for loss function):")
+    for idx, (name, weight) in enumerate(zip(class_names, class_weights)):
+        print(f"   {idx}: {name:20s} - {weight:.3f}")
+    
+        # Data augmentation for smaller classes
+    max_count = max(label_counts.values())
+    augmentation_threshold = max_count * 0.8  # Augment if < 80% of largest class
+    
+    augmented_sequences = []
+    augmented_labels = []
+    
+    print("\n🔄 Augmenting underrepresented classes...")
+    for idx in range(len(train_dataset)):
+        sequence, label = train_dataset[idx]
+        
+        if label_counts[label] < augmentation_threshold:
+            # Number of augmentations: proportional to class size deficit
+            num_augments = min(3, int((max_count - label_counts[label]) / label_counts[label]))
+            
+            for _ in range(num_augments):
+                aug_seq = augment_sequence(sequence, noise_std=0.01)
+                augmented_sequences.append(aug_seq)
+                augmented_labels.append(label)
+    
+    # Add augmented data to training dataset
+    if len(augmented_sequences) > 0:
+        # Store augmented sequences in memory
+        train_dataset.augmented_data = augmented_sequences
+        train_dataset.augmented_start_idx = len(train_paths)
+        
+        # Extend labels list (no need to extend data_paths for augmented data)
+        train_dataset.labels.extend(augmented_labels)
+        
+        print(f"✅ Added {len(augmented_sequences)} augmented sequences")
+        
+        # Update label counts
+        new_label_counts = Counter(train_dataset.labels)
+        print("\n📊 Updated sequence counts per class:")
+        for idx, name in enumerate(class_names):
+            original = label_counts[idx]
+            updated = new_label_counts[idx]
+            added = updated - original
+            print(f"   {idx}: {name:20s} - {updated:3d} sequences (+{added})")
+    else:
+        print("ℹ️  No augmentation needed (classes are balanced)")
+    
+    return train_dataset, val_dataset, test_dataset, class_names, class_weights
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
@@ -252,7 +352,7 @@ def train_model():
     print("=" * 60)
     
     # Load dataset
-    train_dataset, val_dataset, test_dataset, class_names = load_dataset()
+    train_dataset, val_dataset, test_dataset, class_names, class_weights = load_dataset()
     
     if train_dataset is None:
         return
@@ -308,8 +408,20 @@ def train_model():
     print(f"   Dropout:    {config.DROPOUT}")
     print(f"   Classes:    {num_classes}")
     
+    # Display sequence mode
+    print(f"\n⚙️  Training Configuration:")
+    if config.FIXED_SEQUENCE_LENGTH:
+        print(f"   Sequence mode: Fixed-length ({config.FIXED_SEQUENCE_LENGTH} frames)")
+        print(f"   Padding: None (all sequences same length)")
+    else:
+        print(f"   Sequence mode: Variable-length")
+        print(f"   Padding: Dynamic (padded to batch max)")
+    print(f"   Batch size: {config.BATCH_SIZE}")
+    
     # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
+    # Move class weights to device and use in CrossEntropyLoss
+    class_weights = class_weights.to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
