@@ -821,14 +821,13 @@ def process_frames_with_bytetrack(frame_q, display_q, stop_event):
                         
                         # Enhanced label with lock and pose information
                         pose_info = ""
-                        lock_info = "🔒" if is_locked else ""
                         
                         if consecutive_back > 30:
                             pose_info = f" [BACK:{consecutive_back}f]"
                         elif frames_since_face > 15:
                             pose_info = f" [NO_FACE:{frames_since_face}f]"
                         
-                        label = f"{lock_info}ID:{track_id} {identity_name}"
+                        label = f"ID:{track_id} {identity_name}"
                         if identity_conf > 0:
                             label += f" ({identity_conf:.2f})"
                         label += pose_info
