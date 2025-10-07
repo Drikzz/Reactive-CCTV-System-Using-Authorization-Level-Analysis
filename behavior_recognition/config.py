@@ -17,7 +17,7 @@ YOLO_POSE_MODEL = MODELS_DIR / "YOLOv8" / "yolov8m-pose.pt"
 LSTM_MODEL_DIR = MODELS_DIR / "lstm_mn"
 
 # YOLO Pose extraction settings
-YOLO_CONF_THRESHOLD = 0.75
+YOLO_CONF_THRESHOLD = 0.25  # Lowered from 0.75 - too high was causing detection failures
 NUM_KEYPOINTS = 17  # COCO format
 KEYPOINT_FEATURES = 4  # [x, y, dx, dy] - position + velocity
 FIXED_SEQUENCE_LENGTH = None  # Sample all videos to this many frames (set to None to disable) 90
