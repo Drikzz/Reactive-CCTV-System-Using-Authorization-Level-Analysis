@@ -429,7 +429,7 @@ def train_model():
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
     # ReduceLROnPlateau: reduce LR when validation loss plateaus (better for sequence models)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5)
     
     # Training loop
     best_val_acc = 0.0
