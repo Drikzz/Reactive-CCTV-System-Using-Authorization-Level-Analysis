@@ -11,6 +11,30 @@ from ultralytics import YOLO
 import config
 
 
+def compute_pose_velocity(keypoints_seq):
+    """
+    Compute pose velocity (frame-to-frame movement) and concatenate with positions.
+    
+    Args:
+        keypoints_seq: torch.Tensor of shape [T, 17, 2] containing (x, y) positions
+        
+    Returns:
+        torch.Tensor of shape [T, 17, 4] containing [x, y, dx, dy]
+        where dx, dy represent velocity (change in position between frames)
+    """
+    # Compute velocity between consecutive frames
+    velocity = torch.zeros_like(keypoints_seq)
+    velocity[1:] = keypoints_seq[1:] - keypoints_seq[:-1]  # Frame-to-frame difference
+    
+    # Normalize velocity: Since positions are already normalized (0-1),
+    # velocities are also in normalized space. No additional normalization needed,
+    # but velocities are already relative to frame size due to position normalization.
+    
+    # Concatenate position and velocity: [x, y, dx, dy]
+    pose_with_velocity = torch.cat([keypoints_seq, velocity], dim=-1)
+    return pose_with_velocity
+
+
 def select_best_person(keypoints_data, boxes_data, strategy='largest'):
     """
     Select the best person from multiple detections.
@@ -61,7 +85,7 @@ def resample_sequence(sequence, target_length):
 def extract_keypoints_from_video(video_path, model, conf_threshold=0.3, 
                                   fixed_length=None, person_strategy='largest'):
     """
-    Extract normalized keypoints from a video file.
+    Extract normalized keypoints with velocity features from a video file.
     
     Args:
         video_path: Path to input video
@@ -71,8 +95,8 @@ def extract_keypoints_from_video(video_path, model, conf_threshold=0.3,
         person_strategy: 'largest' (closest to camera) or 'first' for multi-person videos
         
     Returns:
-        torch.Tensor of shape [num_frames, 17, 2] or [fixed_length, 17, 2] 
-        containing normalized (x, y) coordinates
+        torch.Tensor of shape [num_frames, 17, 4] or [fixed_length, 17, 4] 
+        containing [x, y, dx, dy] where dx, dy are velocities
     """
     cap = cv2.VideoCapture(str(video_path))
     
@@ -137,7 +161,11 @@ def extract_keypoints_from_video(video_path, model, conf_threshold=0.3,
     
     # Convert to tensor: [num_frames, 17, 2] or [fixed_length, 17, 2]
     keypoints_tensor = torch.tensor(keypoints_array, dtype=torch.float32)
-    return keypoints_tensor
+    
+    # Add velocity features: [num_frames, 17, 2] -> [num_frames, 17, 4]
+    pose_with_velocity = compute_pose_velocity(keypoints_tensor)
+    
+    return pose_with_velocity
 
 
 def process_all_videos():
