@@ -41,7 +41,8 @@ class PoseSequenceDataset(Dataset):
         else:
             # Load from file
             sequence = torch.load(self.data_paths[idx], map_location='cpu')
-            # Flatten keypoints: [num_frames, 17, 2] -> [num_frames, 34]
+            # Flatten keypoints: [num_frames, 17, 4] -> [num_frames, 68]
+            # Features: [x, y, dx, dy] for each of 17 keypoints
             sequence = sequence.view(sequence.size(0), -1)
         
         label = self.labels[idx]
@@ -66,17 +67,21 @@ def collate_fn(batch):
     return sequences_batched, labels
 
 
-def augment_sequence(sequence, noise_std=0.01):
+def augment_sequence(sequence, noise_std=None):
     """
     Simple augmentation: add Gaussian noise to keypoints.
     
     Args:
         sequence: torch.Tensor of shape [seq_len, input_dim]
-        noise_std: standard deviation of Gaussian noise
+        noise_std: standard deviation of Gaussian noise (if None, randomized)
         
     Returns:
         Augmented sequence tensor
     """
+    # Randomize noise standard deviation to prevent overfitting to fixed noise
+    if noise_std is None:
+        noise_std = np.random.uniform(0.005, 0.02)
+    
     noise = torch.randn_like(sequence) * noise_std
     return sequence + noise
 
@@ -390,7 +395,7 @@ def train_model():
         print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
     
     # Create model
-    input_dim = config.NUM_KEYPOINTS * 2  # 17 keypoints * 2 (x, y)
+    input_dim = config.NUM_KEYPOINTS * config.KEYPOINT_FEATURES  # 17 keypoints * 4 (x, y, dx, dy)
     num_classes = len(class_names)
     
     model = LSTMClassifier(
@@ -423,7 +428,8 @@ def train_model():
     class_weights = class_weights.to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    # ReduceLROnPlateau: reduce LR when validation loss plateaus (better for sequence models)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5, verbose=True)
     
     # Training loop
     best_val_acc = 0.0
@@ -442,11 +448,11 @@ def train_model():
         # Validate
         val_loss, val_acc = validate(model, val_loader, criterion, device)
         
-        # Update learning rate
-        scheduler.step()
-        
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
         print(f"Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
+        
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
         
         # Save best model
         if val_acc > best_val_acc:

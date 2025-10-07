@@ -1,1 +1,3 @@
 *.code-workspace
+check_tensors.py
+inspect_cache.py
