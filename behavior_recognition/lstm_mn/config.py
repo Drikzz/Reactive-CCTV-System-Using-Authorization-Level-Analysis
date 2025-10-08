@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 # Base paths
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).parent.parent.parent
 DATASETS_DIR = BASE_DIR / "datasets"
 MODELS_DIR = BASE_DIR / "models"
 
@@ -34,7 +34,7 @@ LSTM_NUM_LAYERS = 2  # Number of LSTM layers
 LSTM_DROPOUT = 0.3  # Dropout rate for LSTM
 
 # Training Settings
-BATCH_SIZE = 8  # Smaller batch size due to sequence processing
+BATCH_SIZE = 4# Smaller batch size due to sequence processing
 LEARNING_RATE = 1e-4
 NUM_EPOCHS = 50
 EARLY_STOPPING_PATIENCE = 10
