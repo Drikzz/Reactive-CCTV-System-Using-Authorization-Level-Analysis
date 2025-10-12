@@ -1,0 +1,38 @@
+{
+  "model_info": {
+    "name": "DlibCNN",
+    "full_name": "Dlib CNN Face Recognition",
+    "version": "ResNet v1",
+    "architecture": "CNN-based face detector + ResNet embeddings"
+  },
+  "video_info": {
+    "name": "ThesisMP4TEST3",
+    "analysis_timestamp": "20251012_173207"
+  },
+  "performance_metrics": {
+    "core_metrics": {
+      "average_confidence": 0.0,
+      "average_inference_time_ms": 0.0,
+      "average_accuracy": 0.0
+    },
+    "detection_stats": {
+      "total_detections": 94,
+      "successful_recognitions": 0,
+      "recognition_rate": 0.0
+    },
+    "advanced_tracking": {
+      "back_view_detections": 0,
+      "back_view_percentage": 0.0,
+      "locked_detections": 0,
+      "locked_percentage": 0.0,
+      "unique_tracks": 1,
+      "final_locked_tracks": 0
+    }
+  },
+  "tracking_details": {
+    "locking_mechanism": "Enhanced identity locking with consistency tracking",
+    "back_view_support": "Body pose detection with similarity matching",
+    "global_identity_database": "Face encoding similarity with cosine distance",
+    "conflict_resolution": "Multi-frame consistency with lock strength"
+  }
+}
