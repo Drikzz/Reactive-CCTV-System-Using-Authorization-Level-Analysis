@@ -1,0 +1,38 @@
+{
+  "model_info": {
+    "name": "ArcFace",
+    "full_name": "ArcFace Enhanced Recognition",
+    "version": "ResNet50 + Custom Enhancement",
+    "architecture": "ArcFace loss with enhanced tracking"
+  },
+  "video_info": {
+    "name": "ThesisMP4TEST3",
+    "analysis_timestamp": "20251012_175902"
+  },
+  "performance_metrics": {
+    "core_metrics": {
+      "average_confidence": 0.6286743223829072,
+      "average_inference_time_ms": 30.991001854607873,
+      "average_accuracy": 0.8748019017432647
+    },
+    "detection_stats": {
+      "total_detections": 631,
+      "successful_recognitions": 552,
+      "recognition_rate": 0.8748019017432647
+    },
+    "advanced_tracking": {
+      "back_view_detections": 5,
+      "back_view_percentage": 0.7923930269413629,
+      "locked_detections": 552,
+      "locked_percentage": 87.48019017432647,
+      "unique_tracks": 1,
+      "final_locked_tracks": 1
+    }
+  },
+  "tracking_details": {
+    "locking_mechanism": "Enhanced identity locking with adaptive thresholds",
+    "back_view_support": "Body pose detection with temporal consistency",
+    "face_detection": "Multi-library support (InsightFace, MTCNN, Haar)",
+    "embedding_method": "InsightFace or custom ResNet50 backbone"
+  }
+}

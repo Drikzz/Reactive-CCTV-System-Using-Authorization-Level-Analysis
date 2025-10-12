@@ -1,0 +1,16 @@
+{
+  "model_name": "DlibCNN",
+  "video_name": "ThesisMP4TEST3",
+  "timestamp": "20251012_171842",
+  "total_tracks": 1,
+  "track_details": {
+    "1": {
+      "identity": "Unknown",
+      "locked": false,
+      "lock_strength": 0,
+      "lock_confidence": 0.0,
+      "conflicting_detections": 0,
+      "last_seen": 1276
+    }
+  }
+}

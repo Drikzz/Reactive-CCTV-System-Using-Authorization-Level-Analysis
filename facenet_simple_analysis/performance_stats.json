@@ -1,0 +1,8 @@
+{
+  "avg_confidence": 0.6678048613523802,
+  "avg_inference_time_ms": 32.514665470637155,
+  "avg_accuracy": 0.10776545166402536,
+  "total_detections": 631,
+  "successful_recognitions": 68,
+  "recognition_rate": 0.10776545166402536
+}
