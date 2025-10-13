@@ -2,7 +2,7 @@ import cv2
 import pyvirtualcam
 
 # --- CAMERA CONNECTION SETUP ---
-ip_address = '192.168.1.244'  # replace with your Tapo camera IP
+ip_address = '192.168.1.245'  # replace with your Tapo camera IP
 port = '554'
 username = 'reactivecctv101'
 password = 'reactivecctv101'

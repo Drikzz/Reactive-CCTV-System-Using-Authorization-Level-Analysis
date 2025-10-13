@@ -7,7 +7,7 @@
 import cv2
 
 # Set up camera connection details
-ip_address = '192.168.1.244' # Replace with the IP address of your camera
+ip_address = '192.168.1.245' # Replace with the IP address of your camera
 port = '554'          # Replace with the port number for your camera
 username = 'reactivecctv101'    # Replace with the username for your camera
 password = 'reactivecctv101' # Replace with the password for your camera
