@@ -1,0 +1,22 @@
+# Requirements for MobileNetV2 + LSTM Behavior Recognition
+
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Computer Vision
+opencv-python>=4.8.0
+ultralytics>=8.0.0
+pillow>=10.0.0
+
+# Data Processing
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# Utilities
+tqdm>=4.65.0
+pathlib
+
+# Optional (for visualization)
+matplotlib>=3.7.0
+seaborn>=0.12.0

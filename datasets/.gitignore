@@ -1,3 +1,7 @@
 # Ignore full dataset
-behavior_clips/
 faces/
+cache/
+!behavior_clips/
+test/
+train/
+valid/
