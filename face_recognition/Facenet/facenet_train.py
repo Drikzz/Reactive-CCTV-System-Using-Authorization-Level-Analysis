@@ -33,6 +33,7 @@ from sklearn.metrics import accuracy_score
 import torch
 from torchvision import transforms
 from facenet_pytorch import InceptionResnetV1
+import glob
 
 # --- Config ---
 DATASET_DIR = "datasets/faces"
@@ -98,6 +99,95 @@ def load_dataset(dataset_dir: str):
     return X, y  # return lists, not numpy arrays
 
 
+# Add this function to properly load images from the multi-angle structure
+
+def load_dataset_multiangle(dataset_dir):
+    """Load dataset from multi-angle folder structure"""
+    images = []
+    labels = []
+    label_names = []
+    
+    print(f"[INFO] Loading dataset from: {dataset_dir}")
+    
+    if not os.path.exists(dataset_dir):
+        print(f"[ERROR] Dataset directory not found: {dataset_dir}")
+        return [], [], []
+    
+    # Get all person directories
+    person_dirs = [d for d in os.listdir(dataset_dir) 
+                   if os.path.isdir(os.path.join(dataset_dir, d))]
+    
+    if not person_dirs:
+        print(f"[ERROR] No person directories found in {dataset_dir}")
+        return [], [], []
+    
+    print(f"[INFO] Found {len(person_dirs)} person directories: {person_dirs}")
+    
+    for person_name in person_dirs:
+        person_path = os.path.join(dataset_dir, person_name)
+        label_names.append(person_name)
+        person_images = []
+        
+        # Check for multi-angle structure
+        angle_dirs = [d for d in os.listdir(person_path) 
+                     if os.path.isdir(os.path.join(person_path, d))]
+        
+        if angle_dirs:
+            # Multi-angle structure
+            print(f"[INFO] Processing {person_name} with angles: {angle_dirs}")
+            
+            for angle_dir in angle_dirs:
+                angle_path = os.path.join(person_path, angle_dir)
+                
+                # Get all image files from this angle
+                image_files = []
+                for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+                    image_files.extend(glob.glob(os.path.join(angle_path, ext)))
+                
+                print(f"[INFO]   {angle_dir}: {len(image_files)} images")
+                
+                for img_path in image_files:
+                    try:
+                        img = cv2.imread(img_path)
+                        if img is not None:
+                            person_images.append(img)
+                        else:
+                            print(f"[WARN] Could not load image: {img_path}")
+                    except Exception as e:
+                        print(f"[WARN] Error loading {img_path}: {e}")
+        else:
+            # Flat structure (images directly in person folder)
+            print(f"[INFO] Processing {person_name} with flat structure")
+            
+            image_files = []
+            for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp']:
+                image_files.extend(glob.glob(os.path.join(person_path, ext)))
+            
+            print(f"[INFO]   Found {len(image_files)} images")
+            
+            for img_path in image_files:
+                try:
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        person_images.append(img)
+                    else:
+                        print(f"[WARN] Could not load image: {img_path}")
+                except Exception as e:
+                    print(f"[WARN] Error loading {img_path}: {e}")
+        
+        # Add all person images with the same label
+        if person_images:
+            images.extend(person_images)
+            labels.extend([len(label_names) - 1] * len(person_images))
+            print(f"[INFO] Loaded {len(person_images)} images for {person_name}")
+        else:
+            print(f"[WARN] No valid images found for {person_name}")
+            label_names.pop()  # Remove the label we just added
+    
+    print(f"[INFO] Total: {len(images)} images from {len(label_names)} classes")
+    return images, labels, label_names
+
+
 def compute_threshold(embeddings: np.ndarray, labels: np.ndarray) -> float:
     """Compute intra-class distance threshold (mean + 2σ)."""
     distances = []
@@ -115,10 +205,19 @@ def compute_threshold(embeddings: np.ndarray, labels: np.ndarray) -> float:
 def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # --- Load dataset ---
-    print("[INFO] Loading dataset...")
-    X, y = load_dataset(DATASET_DIR)
-    print(f"[INFO] Loaded {len(X)} images from {len(set(y))} classes.")
+    # --- Load dataset (multi-angle aware) ---
+    print("[INFO] Loading dataset (multi-angle aware)...")
+    X, label_idxs, label_names = load_dataset_multiangle(DATASET_DIR)
+    if len(X) == 0:
+        print("[ERROR] No images loaded. Check dataset directory structure.")
+        return
+
+    # Convert numeric label indices to person name strings for compatibility with LabelEncoder
+    y = [label_names[idx] for idx in label_idxs]
+
+    unique_classes = sorted(list(set(y)))
+    print(f"[INFO] Loaded {len(X)} images from {len(unique_classes)} classes.")
+    print(f"[INFO] Classes: {unique_classes}")
 
     # --- Split ---
     try:
