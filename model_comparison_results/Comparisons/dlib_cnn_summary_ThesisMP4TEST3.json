@@ -1,0 +1,10 @@
+{
+  "model": "DlibCNN",
+  "video": "ThesisMP4TEST3",
+  "metrics": {
+    "avg_confidence": 0.817969517921174,
+    "avg_inference_time_ms": 66.35113101702905,
+    "avg_accuracy": 0.9841897233201581
+  },
+  "timestamp": "20251014_143811"
+}

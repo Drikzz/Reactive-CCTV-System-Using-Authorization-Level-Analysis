@@ -1051,7 +1051,7 @@ class FaceNetVideoAnalyzer:
             json.dump(stats, f, indent=2)
         print(f"[INFO] ✅ Saved standard statistics: {standard_stats_path}")
         
-        # Save tracking summary
+        # Save tracking summary - FIX: Convert numpy.int64 keys to regular int/str
         tracking_summary = {
             'model_name': 'FaceNet',
             'video_name': self.video_name,
@@ -1061,14 +1061,17 @@ class FaceNetVideoAnalyzer:
         }
         
         for track_id, identity in self.track_identities.items():
-            tracking_summary['track_details'][track_id] = {
+            # FIX: Convert numpy.int64 to regular int for JSON serialization
+            track_key = int(track_id) if hasattr(track_id, 'item') else track_id
+            
+            tracking_summary['track_details'][track_key] = {
                 'name': identity['name'],
-                'confidence': identity['confidence'],
-                'is_locked': identity.get('identity_locked', False),
-                'lock_strength': identity.get('lock_strength', 0.0),
-                'consecutive_back_frames': identity.get('consecutive_back_frames', 0),
-                'total_face_detections': identity.get('total_face_detections', 0),
-                'frames_since_face_lost': identity.get('frames_since_face_lost', 0)
+                'confidence': float(identity['confidence']),  # Also ensure float
+                'is_locked': bool(identity.get('identity_locked', False)),  # Ensure bool
+                'lock_strength': float(identity.get('lock_strength', 0.0)),
+                'consecutive_back_frames': int(identity.get('consecutive_back_frames', 0)),
+                'total_face_detections': int(identity.get('total_face_detections', 0)),
+                'frames_since_face_lost': int(identity.get('frames_since_face_lost', 0))
             }
         
         tracking_filename = f"facenet_tracking_{self.video_name}_{timestamp}.json"
@@ -1082,19 +1085,23 @@ class FaceNetVideoAnalyzer:
             'model': 'FaceNet',
             'video': self.video_name,
             'metrics': {
-                'avg_confidence': stats['avg_confidence'],
-                'avg_inference_time_ms': stats['avg_inference_time_ms'],
-                'avg_accuracy': stats['avg_accuracy']
+                'avg_confidence': float(stats['avg_confidence']),
+                'avg_inference_time_ms': float(stats['avg_inference_time_ms']),
+                'avg_accuracy': float(stats['avg_accuracy'])
             },
             'additional_stats': {
-                'total_detections': stats['total_detections'],
-                'back_view_percentage': stats['back_view_percentage'],
-                'locked_percentage': stats['locked_percentage']
+                'total_detections': int(stats['total_detections']),
+                'back_view_percentage': float(stats['back_view_percentage']),
+                'locked_percentage': float(stats['locked_percentage'])
             },
             'timestamp': timestamp
         }
         
-        comparison_path = os.path.join(self.base_output_dir, "Comparisons", f"facenet_summary_{self.video_name}.json")
+        # Save to Comparisons/summaries/ folder for comparison analyzer
+        comparisons_summaries_dir = os.path.join(self.base_output_dir, "Comparisons", "summaries")
+        os.makedirs(comparisons_summaries_dir, exist_ok=True)
+        
+        comparison_path = os.path.join(comparisons_summaries_dir, f"facenet_summary_latest.json")
         with open(comparison_path, 'w') as f:
             json.dump(summary_for_comparison, f, indent=2)
         print(f"[INFO] ✅ Saved comparison summary: {comparison_path}")

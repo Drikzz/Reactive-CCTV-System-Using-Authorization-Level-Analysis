@@ -1,0 +1,3 @@
+Model,Avg Confidence,Avg Inference (ms),Avg Accuracy,Total Detections,Back View %,Locked %
+ArcFace,0.633,26.0,82.1%,631,0.8%,82.1%
+DlibCNN,0.750,150.0,100.0%,1,0.0%,0.0%
