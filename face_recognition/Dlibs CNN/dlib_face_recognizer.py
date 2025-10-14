@@ -11,13 +11,33 @@ import torch
 import torchvision.transforms as transforms
 from sklearn.svm import SVC
 from sklearn.preprocessing import LabelEncoder
+from mtcnn import MTCNN
 
 class DlibCNNRecognizer:
-    def __init__(self, models_dir):
+    def __init__(self, models_dir="models/Dlib"):
         self.models_dir = models_dir
-        # GPU setup
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"[INFO] Using device: {self.device}")
+        
+        # Device setup - ensure MTCNN gets a string, not torch.device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device_str = "cuda" if torch.cuda.is_available() else "cpu"  # ADD THIS LINE
+        print(f"[INFO] Using device: {self.device_str}")
+        
+        # Initialize MTCNN for face detection (PyTorch-based)
+        try:
+            self.mtcnn = MTCNN(
+                image_size=160,
+                margin=0,
+                min_face_size=20,
+                thresholds=[0.6, 0.7, 0.7],
+                factor=0.709,
+                post_process=True,
+                device=self.device_str,  # CHANGE: use string instead of torch.device
+                keep_all=True
+            )
+            print(f"[INFO] MTCNN detector loaded on {self.device_str}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load MTCNN: {e}")
+            self.mtcnn = None
         
         # CPU detectors (fallbacks)
         self.detector = None
@@ -25,7 +45,6 @@ class DlibCNNRecognizer:
         self.opencv_detector = None
         
         # GPU-accelerated detectors
-        self.mtcnn_detector = None
         self.retinaface_detector = None
         self.yolo_face_detector = None
         
@@ -254,85 +273,147 @@ class DlibCNNRecognizer:
         return faces
     
     def detect_faces(self, image):
-        """Detect faces using GPU-first approach with CPU fallbacks"""
-        if not self.loaded:
-            return []
-        
-        try:
-            # Try GPU detectors first
-            faces = self.detect_faces_gpu(image)
-            if faces:
-                return faces
-            
-            # Fallback to CPU detectors
-            return self.detect_faces_cpu(image)
-            
-        except Exception as e:
-            print(f"[ERROR] Face detection failed: {e}")
-            return []
-    
-    def detect_faces_cpu(self, image):
-        """CPU fallback face detection"""
+        """Detect faces using MTCNN with fallback to other detectors"""
         faces = []
         
-        # Convert to RGB
-        if len(image.shape) == 3:
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        else:
-            rgb_image = image
+        # Try MTCNN first
+        if self.mtcnn is not None:
+            try:
+                boxes, probs, landmarks = self.mtcnn.detect(image, landmarks=True)
+                if boxes is not None:
+                    for i, (box, prob) in enumerate(zip(boxes, probs)):
+                        if prob > 0.9:
+                            x1, y1, x2, y2 = box.astype(int)
+                            x1, y1 = max(0, x1), max(0, y1)
+                            x2 = min(image.shape[1], x2)
+                            y2 = min(image.shape[0], y2)
+                            
+                            face_data = {
+                                'rect': dlib.rectangle(int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': float(prob),
+                                'landmarks': landmarks[i] if landmarks is not None else None,
+                                'detector': 'MTCNN'
+                            }
+                            faces.append(face_data)
+                    if faces:
+                        return faces
+            except Exception as e:
+                print(f"[DEBUG] MTCNN failed: {e}")
+        
+        # Try InsightFace RetinaFace (usually most accurate)
+        if self.retinaface_detector is not None:
+            try:
+                if hasattr(self.retinaface_detector, 'get'):  # insightface version
+                    results = self.retinaface_detector.get(image)
+                    for face in results:
+                        bbox = face.bbox.astype(int)
+                        x1, y1, x2, y2 = bbox
+                        rect = dlib.rectangle(x1, y1, x2, y2)
+                        faces.append({
+                            'box': (x1, y1, x2-x1, y2-y1),
+                            'confidence': face.det_score,
+                            'rect': rect
+                        })
+                else:  # retinaface package
+                    results = self.retinaface_detector.detect_faces(image)
+                    for key, face in results.items():
+                        if face['score'] > 0.5:
+                            area = face['facial_area']
+                            x1, y1, x2, y2 = area
+                            rect = dlib.rectangle(x1, y1, x2, y2)
+                            faces.append({
+                                'box': (x1, y1, x2-x1, y2-y1),
+                                'confidence': face['score'],
+                                'rect': rect
+                            })
+                if faces:
+                    return faces
+            except Exception as e:
+                print(f"[DEBUG] RetinaFace failed: {e}")
+        
+        # 3. YOLO-Face
+        if self.yolo_face_detector is not None:
+            try:
+                results = self.yolo_face_detector(image, verbose=False)
+                for result in results:
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            conf = float(box.conf[0])
+                            if conf > 0.5:
+                                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                                rect = dlib.rectangle(x1, y1, x2, y2)
+                                faces.append({
+                                    'box': (x1, y1, x2-x1, y2-y1),
+                                    'confidence': conf,
+                                    'rect': rect
+                                })
+                if faces:
+                    return faces
+            except Exception as e:
+                print(f"[DEBUG] YOLO-Face failed: {e}")
         
         # Try Dlib CNN detector
         if self.detector is not None:
-            detections = self.detector(rgb_image)
-            
-            for detection in detections:
-                rect = detection.rect
-                x1, y1 = rect.left(), rect.top()
-                x2, y2 = rect.right(), rect.bottom()
+            try:
+                detections = self.detector(image)
                 
-                faces.append({
-                    'box': (x1, y1, x2 - x1, y2 - y1),
-                    'confidence': detection.confidence,
-                    'rect': rect
-                })
-            
-            if faces:
-                return faces
-            
+                for detection in detections:
+                    rect = detection.rect
+                    x1, y1 = rect.left(), rect.top()
+                    x2, y2 = rect.right(), rect.bottom()
+                    
+                    faces.append({
+                        'box': (x1, y1, x2 - x1, y2 - y1),
+                        'confidence': detection.confidence,
+                        'rect': rect
+                    })
+                
+                if faces:
+                    return faces
+            except Exception as e:
+                print(f"[DEBUG] Dlib CNN detector failed: {e}")
+        
         # Try HOG detector
         if self.hog_detector is not None:
-            hog_faces = self.hog_detector(rgb_image)
-            
-            for rect in hog_faces:
-                x1, y1 = rect.left(), rect.top()
-                x2, y2 = rect.right(), rect.bottom()
+            try:
+                hog_faces = self.hog_detector(image)
                 
-                faces.append({
-                    'box': (x1, y1, x2 - x1, y2 - y1),
-                    'confidence': 0.8,
-                    'rect': rect
-                })
-            
-            if faces:
-                return faces
+                for rect in hog_faces:
+                    x1, y1 = rect.left(), rect.top()
+                    x2, y2 = rect.right(), rect.bottom()
+                    
+                    faces.append({
+                        'box': (x1, y1, x2 - x1, y2 - y1),
+                        'confidence': 0.8,
+                        'rect': rect
+                    })
+                
+                if faces:
+                    return faces
+            except Exception as e:
+                print(f"[DEBUG] HOG detector failed: {e}")
         
         # Try OpenCV detectors
         if self.opencv_detector is not None:
-            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY) if len(rgb_image.shape) == 3 else rgb_image
-            opencv_faces = self.opencv_detector.detectMultiScale(gray, 1.1, 4)
-            
-            # Also try profile detector
-            if len(opencv_faces) == 0 and self.opencv_profile_detector is not None:
-                opencv_faces = self.opencv_profile_detector.detectMultiScale(gray, 1.1, 4)
-            
-            for (x, y, w, h) in opencv_faces:
-                rect = dlib.rectangle(x, y, x + w, y + h)
+            try:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+                opencv_faces = self.opencv_detector.detectMultiScale(gray, 1.1, 4)
                 
-                faces.append({
-                    'box': (x, y, w, h),
-                    'confidence': 0.7,
-                    'rect': rect
-                })
+                # Also try profile detector
+                if len(opencv_faces) == 0 and self.opencv_profile_detector is not None:
+                    opencv_faces = self.opencv_profile_detector.detectMultiScale(gray, 1.1, 4)
+                
+                for (x, y, w, h) in opencv_faces:
+                    rect = dlib.rectangle(x, y, x + w, y + h)
+                    
+                    faces.append({
+                        'box': (x, y, w, h),
+                        'confidence': 0.7,
+                        'rect': rect
+                    })
+            except Exception as e:
+                print(f"[DEBUG] OpenCV detectors failed: {e}")
         
         return faces
     

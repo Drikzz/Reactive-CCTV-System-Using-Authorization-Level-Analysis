@@ -1,0 +1,16 @@
+{
+  "model_name": "ArcFace",
+  "video_name": "ThesisMP4TEST3",
+  "avg_confidence": 0.7621906611601876,
+  "avg_inference_time_ms": 22.063002194443794,
+  "avg_accuracy": 0.4623287671232877,
+  "total_detections": 292,
+  "successful_recognitions": 135,
+  "recognition_rate": 0.4623287671232877,
+  "back_view_detections": 0,
+  "back_view_percentage": 0.0,
+  "locked_detections": 135,
+  "locked_percentage": 46.23287671232877,
+  "unique_tracks": 1,
+  "locked_tracks": 1
+}
