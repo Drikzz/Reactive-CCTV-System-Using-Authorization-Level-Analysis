@@ -1,0 +1,17 @@
+{
+  "model_name": "ArcFace",
+  "video_name": "ThesisMP4TEST3",
+  "timestamp": "20251014_143714",
+  "total_tracks": 1,
+  "track_details": {
+    "1": {
+      "name": "Jude",
+      "confidence": 0.4470051176101712,
+      "identity_locked": true,
+      "lock_strength": 0.8365475006128305,
+      "consecutive_back_frames": 5,
+      "total_face_detections": 10,
+      "frames_since_face_lost": 330
+    }
+  }
+}

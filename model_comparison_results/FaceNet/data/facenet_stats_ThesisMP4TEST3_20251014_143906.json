@@ -1,0 +1,16 @@
+{
+  "model_name": "FaceNet",
+  "video_name": "ThesisMP4TEST3",
+  "avg_confidence": 0.7785700017464714,
+  "avg_inference_time_ms": 26.028650876270422,
+  "avg_accuracy": 1.0,
+  "total_detections": 631,
+  "successful_recognitions": 631,
+  "recognition_rate": 1.0,
+  "back_view_detections": 9,
+  "back_view_percentage": 1.4263074484944533,
+  "locked_detections": 631,
+  "locked_percentage": 100.0,
+  "unique_tracks": 1,
+  "locked_tracks": 1
+}
