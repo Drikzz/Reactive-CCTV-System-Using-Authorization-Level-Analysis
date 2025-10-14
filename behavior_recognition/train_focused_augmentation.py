@@ -54,12 +54,15 @@ def train_focused(data_dir, num_epochs=30, batch_size=16, learning_rate=0.0001,
         num_epochs (int): Training epochs
         batch_size (int): Batch size  
         learning_rate (float): Learning rate
-        save_dir (str): Model save directory
+        save_dir (str): Model save directory (relative to project root)
         model_name (str): Model filename
         device (str): Device
     """
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     data_dir = Path(data_dir)
+    
+    # Ensure save_dir is relative to project root (BASE_DIR)
+    save_dir = BASE_DIR / save_dir if not Path(save_dir).is_absolute() else Path(save_dir)
     
     print("\n" + "="*70)
     print("FOCUSED AUGMENTATION TRAINING")
@@ -251,7 +254,7 @@ def train_focused(data_dir, num_epochs=30, batch_size=16, learning_rate=0.0001,
         # Save best
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            save_path = Path(save_dir) / model_name
+            save_path = save_dir / model_name
             save_path.parent.mkdir(parents=True, exist_ok=True)
             
             checkpoint = {

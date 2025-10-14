@@ -182,8 +182,23 @@ class MobileNetV2Inference:
         
         # Save annotated image if requested
         if save_output:
-            cv2.imwrite(save_output, annotated_image)
-            print(f"✓ Annotated image saved to: {save_output}\n")
+            # Convert to Path for easier manipulation
+            save_path = Path(save_output)
+            
+            # If only a filename is provided (no directory), default to outputs/
+            if not save_path.parent.name or save_path.parent == Path('.'):
+                save_path = Path('outputs') / save_path.name
+                print(f"ℹ️  No directory specified. Saving to outputs folder: {save_path.name}")
+            
+            # Convert to absolute path relative to BASE_DIR
+            if not save_path.is_absolute():
+                save_path = BASE_DIR / save_path
+            
+            # Create parent directory if it doesn't exist
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            cv2.imwrite(str(save_path), annotated_image)
+            print(f"✓ Annotated image saved to: {save_path}\n")
         
         # Display image with prediction
         if display:
@@ -231,9 +246,30 @@ class MobileNetV2Inference:
         # Setup video writer if saving output
         out = None
         if save_output:
+            # Convert to Path for easier manipulation
+            save_path = Path(save_output)
+            
+            # If only a filename is provided (no directory), default to outputs/
+            if not save_path.parent.name or save_path.parent == Path('.'):
+                save_path = Path('outputs') / save_path.name
+                print(f"ℹ️  No directory specified. Saving to outputs folder: {save_path.name}")
+            
+            # Convert to absolute path relative to BASE_DIR
+            if not save_path.is_absolute():
+                save_path = BASE_DIR / save_path
+            
+            # Create parent directory if it doesn't exist
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(save_output, fourcc, fps, (width, height))
-            print(f"✓ Saving output to: {save_output}\n")
+            out = cv2.VideoWriter(str(save_path), fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                print(f"⚠️ Warning: Could not create video writer at: {save_path}")
+                print(f"          Video will not be saved!")
+                out = None
+            else:
+                print(f"✓ Saving output to: {save_path}\n")
         
         # Process video
         predictions = []
@@ -403,8 +439,8 @@ def main():
     
     # Model configuration
     parser.add_argument('--model', type=str, 
-                       default='models/mobilenet/mobilenet_best.pth',
-                       help='Path to trained model checkpoint (default: models/mobilenet/mobilenet_best.pth)')
+                       default='models/mobilenet/mobilenet_focused.pth',
+                       help='Path to trained model checkpoint (default: models/mobilenet/mobilenet_focused.pth)')
     parser.add_argument('--classes', type=str, nargs='+',
                        help='Class names (optional, will auto-detect if not provided)')
     
