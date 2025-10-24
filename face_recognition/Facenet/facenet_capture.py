@@ -7,8 +7,11 @@ import joblib
 import torch
 from facenet_pytorch import MTCNN, InceptionResnetV1, fixed_image_standardization
 
-# Add the root project dir to sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Add the root project dir to sys.path so local package imports work when running this file directly
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
 from utils.common import align_face, compute_blur_score, estimate_brightness, eye_angle_deg
 
 # --- Config ---

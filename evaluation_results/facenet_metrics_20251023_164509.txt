@@ -1,0 +1,14 @@
+============================================================
+FaceNet Evaluation Metrics
+============================================================
+
+Total crops processed: 482
+Recognized (not Unknown): 150 (31.1%)
+Dataset verified: 0
+Correct predictions: 0
+Dataset accuracy: 0.0%
+Average confidence: 0.534
+Average inference time: 19.71ms
+
+Top predictions:
+  Kiann_Lloyd: 150

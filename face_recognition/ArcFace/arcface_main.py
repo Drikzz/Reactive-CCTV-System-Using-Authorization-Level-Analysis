@@ -1492,6 +1492,29 @@ class ArcFaceSystem:
                         
         except Exception as e:
             print(f"⚠️  Failed to save face: {e}")
+    def extract_face_embedding_direct(self, img):
+        """
+        Directly extract ArcFace embedding from an image (bypasses recognition logic).
+        Returns a normalized 512D embedding or None if detection fails.
+        """
+        try:
+            if img is None:
+                return None
+            if hasattr(self, "app"):  # insightface model
+                faces = self.app.get(img)
+                if len(faces) == 0:
+                    return None
+                emb = faces[0].embedding
+                emb = emb / np.linalg.norm(emb)
+                return emb.astype(np.float32)
+            else:
+                print("[WARN] ArcFace app not initialized")
+                return None
+        except Exception as e:
+            print(f"[ERROR] Failed to extract embedding: {e}")
+            return None
+
+            
 
 def main():
     """Command-line interface for ArcFace system."""

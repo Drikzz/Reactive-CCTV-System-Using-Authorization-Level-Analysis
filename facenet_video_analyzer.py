@@ -15,12 +15,50 @@ from collections import defaultdict, deque
 from pathlib import Path
 from facenet_pytorch import MTCNN, InceptionResnetV1, fixed_image_standardization
 from ultralytics import YOLO
+import pandas as pd
 
 # Set style for better plots
 plt.style.use('default')
 sns.set_palette("husl")
 plt.rcParams['figure.figsize'] = (12, 8)
 plt.rcParams['font.size'] = 12
+
+def load_ground_truth_csv(gt_path):
+    """Load ground-truth CSV in a few supported formats and return a mapping + format type."""
+    if not gt_path or not os.path.exists(gt_path):
+        return {}, None
+    try:
+        df = pd.read_csv(gt_path)
+    except Exception:
+        return {}, None
+    cols = set([c.lower() for c in df.columns])
+    # normalize column names
+    lower_map = {c.lower(): c for c in df.columns}
+    if {'frame', 'track_id', 'name'}.issubset(cols):
+        df_cols = {'frame': lower_map['frame'], 'track_id': lower_map['track_id'], 'name': lower_map['name']}
+        mapping = {}
+        for _, row in df.iterrows():
+            key = (int(row[df_cols['frame']]), int(row[df_cols['track_id']]))
+            mapping[key] = str(row[df_cols['name']])
+        return mapping, 'frame_track'
+    if {'frame', 'name'}.issubset(cols):
+        df_cols = {'frame': lower_map['frame'], 'name': lower_map['name']}
+        mapping = {int(row[df_cols['frame']]): str(row[df_cols['name']]) for _, row in df.iterrows()}
+        return mapping, 'frame'
+    if {'file', 'name'}.issubset(cols) or {'filename', 'name'}.issubset(cols):
+        file_col = lower_map.get('file', lower_map.get('filename'))
+        name_col = lower_map['name']
+        mapping = {str(row[file_col]): str(row[name_col]) for _, row in df.iterrows()}
+        return mapping, 'file'
+    return {}, None
+
+def _norm(s):
+    if s is None:
+        return ""
+    s = str(s)
+    return "".join(c.lower() for c in s if c.isalnum())
+
+DEFAULT_DATASET_ROOT = os.path.join("datasets", "faces")
 
 class FaceNetVideoAnalyzer:
     def __init__(self, video_path, output_dir="model_comparison_results"):
@@ -62,6 +100,14 @@ class FaceNetVideoAnalyzer:
         self.track_face_history = defaultdict(lambda: deque(maxlen=self.EXTENDED_MEMORY_FRAMES))
         self.track_body_history = defaultdict(lambda: deque(maxlen=60))
         self.track_last_face_frame = {}
+        
+        # Ground-truth mapping (optional)
+        self.ground_truth_map = {}
+        self.ground_truth_format = None
+        # Dataset embeddings (optional)
+        self.dataset_embs = None
+        self.dataset_names = []
+        self.dataset_threshold = 0.90  # FaceNet default; can be overridden by load_dataset_embeddings
         
         print(f"[INFO] FaceNet Video Analyzer initialized")
         print(f"[INFO] Video: {video_path}")
@@ -242,7 +288,7 @@ class FaceNetVideoAnalyzer:
                 identity['last_face_frame'] = frame_num
                 identity['max_confidence_seen'] = max(identity['max_confidence_seen'], conf)
                 identity['consecutive_back_frames'] = 0
-                identity['frames_since_face_lost'] = 0
+                identity['frames_since_face'] = 0
                 
                 # Enhanced locking logic
                 identity['identity_locked'] = True
@@ -269,7 +315,7 @@ class FaceNetVideoAnalyzer:
                 identity['stable'] = True
                 identity['last_face_frame'] = frame_num
                 identity['consecutive_back_frames'] = 0
-                identity['frames_since_face_lost'] = 0
+                identity['frames_since_face'] = 0
                 
                 # Strengthen existing lock
                 if identity['identity_locked']:
@@ -537,21 +583,24 @@ class FaceNetVideoAnalyzer:
                                         'name': candidate,
                                         'confidence': confidence,
                                         'face_bbox': (face_x1_orig, face_y1_orig, face_x2_orig, face_y2_orig),
-                                        'inference_time': inference_time
+                                        'inference_time': inference_time,
+                                        'embedding': emb_norm
                                     }
                             else:
                                 return {
                                     'name': candidate,
                                     'confidence': confidence,
                                     'face_bbox': (face_x1_orig, face_y1_orig, face_x2_orig, face_y2_orig),
-                                    'inference_time': inference_time
+                                    'inference_time': inference_time,
+                                    'embedding': emb_norm
                                 }
                         else:
                             return {
                                 'name': candidate,
                                 'confidence': confidence,
                                 'face_bbox': (face_x1_orig, face_y1_orig, face_x2_orig, face_y2_orig),
-                                'inference_time': inference_time
+                                'inference_time': inference_time,
+                                'embedding': emb_norm
                             }
                     
                 except Exception as e:
@@ -559,10 +608,11 @@ class FaceNetVideoAnalyzer:
             
             inference_time = (time.time() - inference_start) * 1000
             return {
-                'name': 'Unknown', 
-                'confidence': 0.0, 
+                'name': 'Unknown',
+                'confidence': 0.0,
                 'face_bbox': (face_x1_orig, face_y1_orig, face_x2_orig, face_y2_orig),
-                'inference_time': inference_time
+                'inference_time': inference_time,
+                'embedding': None
             }
             
         except Exception as e:
@@ -631,6 +681,14 @@ class FaceNetVideoAnalyzer:
             print(f"[ERROR] Failed to load models: {e}")
             return False
         
+        # Optionally load dataset embeddings (if provided under default path)
+        # You can override by calling analyzer.load_dataset_embeddings(path) before processing
+        try:
+            if os.path.exists(DEFAULT_DATASET_ROOT):
+                self.load_dataset_embeddings(DEFAULT_DATASET_ROOT, threshold=0.90)
+        except Exception:
+            pass
+
         # Open video
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
@@ -727,37 +785,97 @@ class FaceNetVideoAnalyzer:
                             
                             # Face recognition using exact mechanics
                             face_result = self.recognize_face_in_crop(person_crop, original_frame, person_bbox)
-                            
-                            # Update tracking history with back view support
-                            self.update_track_identity(track_id, face_result, person_crop, frame_count)
-                            
-                            # Update frame numbers
-                            if face_result['name'] != 'Unknown':
-                                self.track_last_face_frame[track_id] = frame_count
-                            
-                            # Get consensus identity with back view tracking
-                            frames_since_face = frame_count - self.track_last_face_frame.get(track_id, frame_count)
-                            identity_name, identity_conf = self.get_consensus_identity(track_id, frames_since_face)
-                            
-                            # Get pose and tracking info for display
-                            pose, pose_confidence = self.detect_person_pose_from_body(person_crop)
+
+                            # --- Ensure track state is updated and derive local vars used below ---
+                            try:
+                                # update track identity state (will populate pose_history, confidence, locks, etc.)
+                                self.update_track_identity(track_id, face_result, person_crop, frame_count)
+                            except Exception as _e:
+                                print(f"[WARN] update_track_identity failed for track {track_id}: {_e}")
+
+                            # derive current identity name/confidence via consensus helper
+                            try:
+                                # frames_since_face_lost stored in track state; pass as heuristic to consensus
+                                frames_since_face = int(self.track_identities.get(track_id, {}).get('frames_since_face_lost', 0))
+                                identity_name, identity_conf = self.get_consensus_identity(track_id, frames_since_face)
+                            except Exception:
+                                identity_name, identity_conf = 'Unknown', 0.0
+
+                            # derive other fields from track state with safe defaults
                             identity = self.track_identities.get(track_id, {})
-                            is_locked = identity.get('identity_locked', False)
-                            consecutive_back = identity.get('consecutive_back_frames', 0)
-                            
-                            # Store recognition data with enhanced tracking info
+                            is_locked = bool(identity.get('identity_locked', False))
+                            consecutive_back = int(identity.get('consecutive_back_frames', 0))
+                            # frames_since_face variable expected elsewhere — use frames_since_face_lost as substitute
+                            frames_since_face = int(identity.get('frames_since_face_lost', frames_since_face))
+                            # current pose and pose_confidence from recent pose_history if available
+                            pose, pose_confidence = ("unknown", 0.0)
+                            try:
+                                ph = identity.get('pose_history')
+                                if ph and len(ph) > 0:
+                                    last = ph[-1]
+                                    pose = last[0] if len(last) > 0 else "unknown"
+                                    pose_confidence = float(last[1]) if len(last) > 1 else 0.0
+                            except Exception:
+                                pass
+
+                            # If dataset embeddings loaded and embedding available, compute nearest dataset match
+                            ds_pred = ""
+                            ds_conf = ""
+                            emb_vec = face_result.get('embedding') if isinstance(face_result, dict) else None
+                            if emb_vec is not None and self.dataset_embs is not None and len(self.dataset_names) == self.dataset_embs.shape[0]:
+                                try:
+                                    sims = self.dataset_embs.dot(np.asarray(emb_vec, dtype=np.float32))
+                                    best_idx = int(np.argmax(sims))
+                                    best_score = float(sims[best_idx])
+                                    if best_score >= self.dataset_threshold:
+                                        ds_pred = self.dataset_names[best_idx]
+                                        ds_conf = best_score
+                                    else:
+                                        ds_pred = ""
+                                        ds_conf = best_score
+                                except Exception:
+                                    ds_pred = ""
+                                    ds_conf = ""
+
                             recognition_data = {
                                 'frame': frame_count,
                                 'track_id': track_id,
                                 'name': identity_name,
                                 'confidence': identity_conf,
-                                'inference_time_ms': face_result['inference_time'],
+                                'inference_time_ms': float(face_result.get('inference_time', 0.0)),
                                 'pose': pose,
                                 'pose_confidence': pose_confidence,
                                 'is_locked': is_locked,
                                 'consecutive_back_frames': consecutive_back,
-                                'frames_since_face': frames_since_face
+                                'frames_since_face': frames_since_face,
+                                'ground_truth': self._get_ground_truth_for(frame=frame_count, track_id=track_id),
+                                'dataset_predicted': ds_pred,
+                                'dataset_confidence': ds_conf,
+                               # add embedding and bbox so verifiers don't need the video
+                               'embedding': None,
+                               'face_bbox': None
                             }
+
+                            # attach embedding string if recognize_face_in_crop returned one
+                            emb = None
+                            try:
+                                emb = face_result.get('embedding') if isinstance(face_result, dict) else None
+                            except Exception:
+                                emb = None
+                            if emb is not None:
+                                # store as plain Python list (CSV writer will stringify) or JSON if you prefer
+                                try:
+                                    recognition_data['embedding'] = emb.tolist() if hasattr(emb, 'tolist') else list(map(float, emb))
+                                except Exception:
+                                    recognition_data['embedding'] = list(map(float, emb))
+
+                            # store canonical face bbox (x1,y1,x2,y2) if available
+                            try:
+                                fb = face_result.get('face_bbox') if isinstance(face_result, dict) else None
+                                if fb:
+                                    recognition_data['face_bbox'] = (int(fb[0]), int(fb[1]), int(fb[2]), int(fb[3]))
+                            except Exception:
+                                pass
                             
                             all_recognitions.append(recognition_data)
                             
@@ -879,51 +997,81 @@ class FaceNetVideoAnalyzer:
     
     def calculate_simple_metrics(self):
         """Calculate the 3 requested metrics with back view tracking insights"""
-        
+
         if not self.results['recognitions']:
             print("[ERROR] No recognition data to analyze")
             return None
-        
+
         recognitions = self.results['recognitions']
         df = pd.DataFrame(recognitions)
-        
+
         # 1. Average Confidence (only for known faces)
         known_faces = df[df['name'] != 'Unknown']
         if len(known_faces) > 0:
-            avg_confidence = known_faces['confidence'].mean()
+            avg_confidence = float(known_faces['confidence'].mean())
         else:
             avg_confidence = 0.0
-        
+
         # 2. Average Inference Time
-        avg_inference_time = df['inference_time_ms'].mean()
-        
-        # 3. Average Accuracy (recognition success rate)
+        avg_inference_time = float(df['inference_time_ms'].mean())
+
+        # 3. Recognition rate (known vs Unknown)
         total_detections = len(df)
         successful_recognitions = len(known_faces)
-        avg_accuracy = (successful_recognitions / total_detections) if total_detections > 0 else 0.0
-        
-        # Additional back view tracking stats
-        back_view_detections = len(df[df['pose'] == 'back_view'])
-        locked_detections = len(df[df['is_locked'] == True])
-        
+        recognition_rate = (successful_recognitions / total_detections) if total_detections > 0 else 0.0
+        avg_accuracy = recognition_rate  # default: recognition-rate (known vs Unknown)
+
+        # If ground-truth labels are available in the recognitions rows, compute true accuracy:
+        true_accuracy = None
+        if 'ground_truth' in df.columns:
+            labeled = df[df['ground_truth'].notna() & (df['ground_truth'] != '')]
+            if len(labeled) > 0:
+                correct = (labeled['name'].str.lower().str.replace(r'[^0-9a-z]', '', regex=True) ==
+                           labeled['ground_truth'].str.lower().str.replace(r'[^0-9a-z]', '', regex=True)).sum()
+                true_accuracy = float(correct) / float(len(labeled))
+            else:
+                true_accuracy = 0.0
+
+        # If true_accuracy is available, use it as the reported accuracy (measures correctness vs GT).
+        if true_accuracy is not None:
+            avg_accuracy = true_accuracy
+
+        # Compute dataset agreement if dataset_predicted exists
+        dataset_agreement = None
+        agree = 0
+        if 'dataset_predicted' in df.columns:
+            valid = df[(df['dataset_predicted'].notna()) & (df['dataset_predicted'] != '')]
+            if len(valid) > 0:
+                agree = ((valid['name'].str.lower().str.replace(r'[^0-9a-z]', '', regex=True)) ==
+                         (valid['dataset_predicted'].str.lower().str.replace(r'[^0-9a-z]', '', regex=True))).sum()
+                dataset_agreement = float(agree) / float(len(valid))
+            else:
+                dataset_agreement = 0.0
+
+        # assemble stats
         stats = {
             'model_name': 'FaceNet',
             'video_name': self.video_name,
             'avg_confidence': avg_confidence,
             'avg_inference_time_ms': avg_inference_time,
-            'avg_accuracy': avg_accuracy,
+            'avg_accuracy': avg_accuracy,   # true accuracy when GT present, else recognition-rate
+            'recognition_rate': recognition_rate,
+            'true_accuracy': true_accuracy,
             'total_detections': total_detections,
             'successful_recognitions': successful_recognitions,
-            'recognition_rate': avg_accuracy,
             # Enhanced stats with back view tracking
-            'back_view_detections': back_view_detections,
-            'back_view_percentage': (back_view_detections / total_detections) * 100 if total_detections > 0 else 0,
-            'locked_detections': locked_detections,
-            'locked_percentage': (locked_detections / total_detections) * 100 if total_detections > 0 else 0,
+            'back_view_detections': int(len(df[df['pose'] == 'back_view'])),
+            'back_view_percentage': (len(df[df['pose'] == 'back_view']) / total_detections) * 100 if total_detections > 0 else 0,
+            'locked_detections': int(len(df[df['is_locked'] == True])),
+            'locked_percentage': (len(df[df['is_locked'] == True]) / total_detections) * 100 if total_detections > 0 else 0,
             'unique_tracks': len(self.track_identities),
             'locked_tracks': sum(1 for t in self.track_identities.values() if t.get('identity_locked', False))
         }
-        
+
+        if dataset_agreement is not None:
+            stats['dataset_agreement'] = dataset_agreement
+            stats['dataset_agreement_count'] = int(agree)
+
         return stats
     
     def create_simple_graph(self, stats):
@@ -1160,16 +1308,72 @@ class FaceNetVideoAnalyzer:
         
         print("=" * 70)
 
+    def load_ground_truth(self, gt_csv_path):
+        """Load ground-truth CSV into the analyzer (uses load_ground_truth_csv helper)."""
+        mapping, fmt = load_ground_truth_csv(gt_csv_path)
+        self.ground_truth_map = mapping or {}
+        self.ground_truth_format = fmt
+        if fmt:
+            print(f"[INFO] Loaded ground-truth ({fmt}) entries: {len(self.ground_truth_map)}")
+        else:
+            if gt_csv_path:
+                print(f"[WARN] Ground-truth file provided but could not be parsed: {gt_csv_path}")
+    
+    def _get_ground_truth_for(self, frame=None, track_id=None, filename=None):
+        """Resolve ground-truth for a recognition based on loaded GT mapping and format."""
+        if not self.ground_truth_format or not self.ground_truth_map:
+            return ""
+        try:
+            if self.ground_truth_format == 'frame_track' and frame is not None and track_id is not None:
+                return self.ground_truth_map.get((int(frame), int(track_id)), "")
+            if self.ground_truth_format == 'frame' and frame is not None:
+                return self.ground_truth_map.get(int(frame), "")
+            if self.ground_truth_format == 'file' and filename:
+                return self.ground_truth_map.get(str(filename), "")
+        except Exception:
+            return ""
+        return ""
+
+    def load_dataset_embeddings(self, dataset_root, threshold=0.90):
+        """Load embeddings.npy + names.npy from dataset_root and normalize them."""
+        try:
+            root = str(dataset_root)
+            emb_p = os.path.join(root, "embeddings.npy")
+            names_p = os.path.join(root, "names.npy")
+            if not os.path.exists(emb_p):
+                return False
+            embs = np.load(emb_p)
+            if os.path.exists(names_p):
+                names = list(np.load(names_p).astype(str))
+            else:
+                names = []
+            if embs is None or len(embs) == 0 or len(names) == 0:
+                return False
+            # normalize
+            norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10
+            embs = (embs.astype(np.float32) / norms).astype(np.float32)
+            self.dataset_embs = embs
+            self.dataset_names = names
+            self.dataset_threshold = float(threshold)
+            print(f"[INFO] Loaded dataset embeddings: {len(names)} vectors from {root} (threshold={self.dataset_threshold})")
+            return True
+        except Exception as e:
+            print(f"[WARN] Failed to load dataset embeddings: {e}")
+            return False
+
 def main():
     """Main function with organized folder structure"""
     
     parser = argparse.ArgumentParser(description="FaceNet video analysis with organized output structure")
     parser.add_argument("--video", "-v", 
-                       default=r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST3.mp4",
+                       default=r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST5.mp4",
                        help="Path to video file")
     parser.add_argument("--output", "-o", 
                        default="model_comparison_results",
                        help="Base output directory for organized results")
+    parser.add_argument("--ground-truth", "-g",
+                       default="",
+                       help="Optional path to ground-truth CSV (formats: frame,track_id,name  |  frame,name  |  file,name)")
     parser.add_argument("--no-display", "-n", 
                        action="store_true",
                        help="Run without video display (headless mode)")
@@ -1193,6 +1397,8 @@ def main():
     
     # Initialize analyzer with organized output
     analyzer = FaceNetVideoAnalyzer(args.video, args.output)
+    if args.ground_truth:
+        analyzer.load_ground_truth(args.ground_truth)
     
     # Process video
     if not analyzer.process_video_with_analysis(show_video=not args.no_display):

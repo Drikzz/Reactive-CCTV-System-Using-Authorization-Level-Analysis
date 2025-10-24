@@ -1,0 +1,9 @@
+# Ignore all files in this folder (YOLO crops, images, etc.)
+*
+
+# But keep this .gitignore and the ground-truth CSV
+!.gitignore
+!ground_truth.csv
+
+# If you want to keep a README, uncomment:
+# !README.md

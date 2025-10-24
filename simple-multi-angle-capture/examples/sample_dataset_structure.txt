@@ -1,0 +1,30 @@
+datasets/
+└── <your_name>/
+    ├── frontal/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    ├── left_profile/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    ├── right_profile/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    ├── quarter_left/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    ├── quarter_right/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    ├── up/
+    │   ├── <image_01>.jpg
+    │   ├── <image_02>.jpg
+    │   └── ...
+    └── down/
+        ├── <image_01>.jpg
+        ├── <image_02>.jpg
+        └── ...

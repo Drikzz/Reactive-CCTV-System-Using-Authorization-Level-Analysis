@@ -1,0 +1,3 @@
+=== PLACEHOLDER MODEL ===
+This is a placeholder file created to avoid FileNotFoundError.
+Replace this file with the real pretrained model before running real inference.
