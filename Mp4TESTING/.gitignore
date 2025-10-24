@@ -1,0 +1,6 @@
+# Ignore all files in this folder (video files, intermediate outputs, etc.)
+*
+
+# Keep the .gitignore itself and README if you want to track it
+!.gitignore
+!README.md
