@@ -42,7 +42,11 @@ This will:
 Run all three trackers on the same video:
 
 ```bash
+# Compare transfer learning models (default)
 python compare_trackers.py --video ../path/to/test_video.mp4
+
+# Compare feature extraction models
+python compare_trackers.py --video ../path/to/test_video.mp4 --mode feature_extraction
 ```
 
 This will:
@@ -53,15 +57,17 @@ This will:
 
 **Optional: Save output videos**
 ```bash
-python compare_trackers.py --video ../test.mp4 --save-outputs
+python compare_trackers.py --video ../test.mp4 --mode feature_extraction --save-outputs
 ```
 
 **Output files:**
 - `tracker_comparison.txt` - Text report with performance metrics
 - `tracker_comparison.md` - Markdown report for thesis
-- `outputs/comparison_mobilenetv2.mp4` - Output from MobileNetV2 (if --save-outputs)
-- `outputs/comparison_mobilenetv3small.mp4` - Output from MobileNetV3-Small (if --save-outputs)
-- `outputs/comparison_shufflenetv2.mp4` - Output from ShuffleNetV2 (if --save-outputs)
+- `outputs/comparison_mobilenetv2_[mode].mp4` - Output from MobileNetV2 (if --save-outputs)
+- `outputs/comparison_mobilenetv3small_[mode].mp4` - Output from MobileNetV3-Small (if --save-outputs)
+- `outputs/comparison_shufflenetv2_[mode].mp4` - Output from ShuffleNetV2 (if --save-outputs)
+
+Where `[mode]` is either `transfer` or `feature_ext` depending on which models you compared.
 
 ---
 
@@ -137,6 +143,7 @@ python compare_trackers.py --video <path> [OPTIONS]
 |----------|---------|-------------|
 | `--video` | Required | Path to input video file |
 | `--webcam` | - | Use webcam (not recommended for comparison) |
+| `--mode` | `transfer` | Training mode: `transfer` (fine-tuning) or `feature_extraction` (frozen backbone) |
 | `--yolo-model` | `models/YOLOv8/yolov8m.pt` | Path to YOLOv8 model |
 | `--conf` | 0.5 | YOLO confidence threshold |
 | `--iou` | 0.7 | YOLO IOU threshold |
@@ -147,27 +154,32 @@ python compare_trackers.py --video <path> [OPTIONS]
 
 ### Examples
 
-**Basic comparison:**
+**Basic comparison (transfer learning):**
 ```bash
 python compare_trackers.py --video ../Mp4TESTING/test_video.mp4
 ```
 
+**Compare feature extraction models:**
+```bash
+python compare_trackers.py --video ../Mp4TESTING/test_video.mp4 --mode feature_extraction
+```
+
 **Save output videos:**
 ```bash
-python compare_trackers.py --video ../test.mp4 --save-outputs
+python compare_trackers.py --video ../test.mp4 --mode feature_extraction --save-outputs
 ```
 
 **Custom YOLO settings:**
 ```bash
-python compare_trackers.py --video ../test.mp4 --conf 0.6 --iou 0.75
+python compare_trackers.py --video ../test.mp4 --mode feature_extraction --conf 0.6 --iou 0.75
 ```
 
 **Custom output files:**
 ```bash
-python compare_trackers.py --video ../test.mp4 \
-    --save-report my_tracker_comparison.md \
-    --save-txt my_tracker_comparison.txt \
-    --save-json tracker_metrics.json
+python compare_trackers.py --video ../test.mp4 --mode feature_extraction \
+    --save-report feature_ext_tracker_comparison.md \
+    --save-txt feature_ext_tracker_comparison.txt \
+    --save-json feature_ext_tracker_metrics.json
 ```
 
 ### Output Metrics
@@ -214,10 +226,14 @@ python compare_training_metrics.py
 
 Review `training_comparison.md` for accuracy comparison.
 
-### 3. Compare Tracker Performance
+### 3. Compare Tracker Performance (Both Modes)
 
 ```bash
-python compare_trackers.py --video ../Mp4TESTING/test_video.mp4 --save-outputs
+# Compare transfer learning models
+python compare_trackers.py --video ../Mp4TESTING/test_video.mp4 --mode transfer --save-outputs
+
+# Compare feature extraction models
+python compare_trackers.py --video ../Mp4TESTING/test_video.mp4 --mode feature_extraction --save-outputs
 ```
 
 Review `tracker_comparison.md` for speed comparison.
@@ -403,26 +419,62 @@ The results demonstrate a clear accuracy-efficiency tradeoff:
 
 ### Automated Comparison Script
 
-Create a shell script to run complete comparison:
+Create a PowerShell script to run complete comparison:
 
-```bash
-#!/bin/bash
-# complete_comparison.sh
+**For Transfer Learning Models:**
+```powershell
+# complete_comparison_transfer.ps1
 
-echo "Comparing training metrics..."
-python compare_training_metrics.py
+Write-Host "Comparing training metrics (Transfer Learning)..."
+python compare_training_metrics.py --mode transfer
 
-echo "Comparing tracker performance..."
-python compare_trackers.py --video ../test_video.mp4 --save-outputs
+Write-Host "Comparing tracker performance (Transfer Learning)..."
+python compare_trackers.py --video ../test_video.mp4 --mode transfer --save-outputs
 
-echo "Comparison complete!"
-echo "Check training_comparison.md and tracker_comparison.md"
+Write-Host "Comparison complete!"
+Write-Host "Check training_comparison.md and tracker_comparison.md"
+```
+
+**For Feature Extraction Models:**
+```powershell
+# complete_comparison_feature_ext.ps1
+
+Write-Host "Comparing training metrics (Feature Extraction)..."
+python compare_training_metrics.py --mode feature_extraction
+
+Write-Host "Comparing tracker performance (Feature Extraction)..."
+python compare_trackers.py --video ../test_video.mp4 --mode feature_extraction --save-outputs
+
+Write-Host "Comparison complete!"
+Write-Host "Check training_comparison.md and tracker_comparison.md"
+```
+
+**For Both Modes (Complete Analysis):**
+```powershell
+# complete_comparison_all.ps1
+
+Write-Host "Comparing ALL training metrics (6 models)..."
+python compare_training_metrics.py --mode both --save all_models_comparison.md
+
+Write-Host "Comparing tracker performance (Transfer)..."
+python compare_trackers.py --video ../test_video.mp4 --mode transfer --save-outputs `
+    --save-report transfer_tracker_comparison.md --save-txt transfer_tracker_comparison.txt
+
+Write-Host "Comparing tracker performance (Feature Extraction)..."
+python compare_trackers.py --video ../test_video.mp4 --mode feature_extraction --save-outputs `
+    --save-report feature_ext_tracker_comparison.md --save-txt feature_ext_tracker_comparison.txt
+
+Write-Host "All comparisons complete!"
+Write-Host "Check all_models_comparison.md, transfer_tracker_comparison.md, and feature_ext_tracker_comparison.md"
 ```
 
 Run with:
-```bash
-chmod +x complete_comparison.sh
-./complete_comparison.sh
+```powershell
+.\complete_comparison_transfer.ps1
+# or
+.\complete_comparison_feature_ext.ps1
+# or
+.\complete_comparison_all.ps1
 ```
 
 ---

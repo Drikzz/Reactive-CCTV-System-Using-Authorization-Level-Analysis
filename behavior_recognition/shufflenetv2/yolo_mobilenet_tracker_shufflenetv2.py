@@ -108,7 +108,18 @@ class YOLOShuffleNetV2Tracker:
         # Build model architecture - ShuffleNetV2 x1.0
         model = models.shufflenet_v2_x1_0(weights=None)
         in_features = model.fc.in_features
-        model.fc = nn.Linear(in_features, num_classes)
+        
+        # Check if this is a feature extraction model (Sequential with Dropout)
+        # or transfer learning model (simple Linear)
+        if 'fc.1.weight' in checkpoint['model_state_dict']:
+            # Feature extraction model - Sequential(Dropout, Linear)
+            model.fc = nn.Sequential(
+                nn.Dropout(p=0.2),
+                nn.Linear(in_features, num_classes)
+            )
+        else:
+            # Transfer learning model - simple Linear
+            model.fc = nn.Linear(in_features, num_classes)
         
         # Load weights
         model.load_state_dict(checkpoint['model_state_dict'])

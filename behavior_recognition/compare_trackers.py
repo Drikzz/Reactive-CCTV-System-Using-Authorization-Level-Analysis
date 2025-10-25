@@ -3,11 +3,20 @@ Compare All Three Trackers on the Same Video
 
 This script runs MobileNetV2, MobileNetV3-Small, and ShuffleNetV2 trackers on the same 
 input video and generates a comprehensive performance comparison including FPS, detection 
-counts, classification times, and more.
+counts, classification times, and more. Supports comparing both transfer learning 
+(fine-tuning) and feature extraction (frozen backbone) trained models.
 
 Usage:
+    # Compare transfer learning models (default)
     python compare_trackers.py --video path/to/video.mp4
+    
+    # Compare feature extraction models
+    python compare_trackers.py --video path/to/video.mp4 --mode feature_extraction
+    
+    # Save output videos
     python compare_trackers.py --video path/to/video.mp4 --save-outputs
+    
+    # Use webcam (not recommended for comparison)
     python compare_trackers.py --webcam
 """
 
@@ -28,7 +37,8 @@ class TrackerComparator:
     """Compare multiple tracking models on the same video."""
     
     def __init__(self, video_path: str, save_outputs: bool = False, 
-                 yolo_model: str = None, conf: float = 0.5, iou: float = 0.7):
+                 yolo_model: str = None, conf: float = 0.5, iou: float = 0.7,
+                 mode: str = 'transfer', min_class_conf: float = 0.6):
         """
         Initialize tracker comparator.
         
@@ -38,31 +48,59 @@ class TrackerComparator:
             yolo_model: YOLOv8 model path
             conf: YOLO confidence threshold
             iou: YOLO IOU threshold
+            mode: Training mode - 'transfer', 'feature_extraction', or 'both'
+            min_class_conf: Minimum classification confidence (0-1) to accept behavior
         """
         self.video_path = video_path
         self.save_outputs = save_outputs
         self.yolo_model = yolo_model or 'models/YOLOv8/yolov8m.pt'
         self.conf = conf
         self.iou = iou
+        self.mode = mode
+        self.min_class_conf = min_class_conf
         
-        # Define models to compare
-        self.models = {
-            'MobileNetV2': {
-                'script': 'behavior_recognition/MobileNetV2/yolo_mobilenet_tracker.py',
-                'model_path': 'models/mobilenetv2/mobilenet_transfer.pth',
-                'output': 'outputs/comparison_mobilenetv2.mp4'
-            },
-            'MobileNetV3-Small': {
-                'script': 'behavior_recognition/mobilenetv3-small/yolo_mobilenet_tracker_mnv3small.py',
-                'model_path': 'models/mobilenetv3-small/mobilenet_v3_small_transfer.pth',
-                'output': 'outputs/comparison_mobilenetv3small.mp4'
-            },
-            'ShuffleNetV2': {
-                'script': 'behavior_recognition/shufflenetv2/yolo_mobilenet_tracker_shufflenetv2.py',
-                'model_path': 'models/shufflenetv2/shufflenet_v2_transfer.pth',
-                'output': 'outputs/comparison_shufflenetv2.mp4'
-            }
-        }
+        # Define model paths based on training mode
+        self.models = {}
+        
+        if mode == 'both' or mode == 'feature_extraction':
+            model_suffix = 'Feature Ext'
+            self.models.update({
+                f'MobileNetV2 ({model_suffix})': {
+                    'script': 'behavior_recognition/MobileNetV2/yolo_mobilenet_tracker.py',
+                    'model_path': 'models/mobilenetv2/mobilenet_feature_extraction.pth',
+                    'output': 'outputs/comparison_mobilenetv2_feature_ext.mp4'
+                },
+                f'MobileNetV3-Small ({model_suffix})': {
+                    'script': 'behavior_recognition/mobilenetv3-small/yolo_mobilenet_tracker_mnv3small.py',
+                    'model_path': 'models/mobilenetv3-small/mobilenetv3_small_feature_extraction.pth',
+                    'output': 'outputs/comparison_mobilenetv3small_feature_ext.mp4'
+                },
+                f'ShuffleNetV2 ({model_suffix})': {
+                    'script': 'behavior_recognition/shufflenetv2/yolo_mobilenet_tracker_shufflenetv2.py',
+                    'model_path': 'models/shufflenetv2/shufflenetv2_feature_extraction.pth',
+                    'output': 'outputs/comparison_shufflenetv2_feature_ext.mp4'
+                }
+            })
+        
+        if mode == 'both' or mode == 'transfer':
+            model_suffix = 'Transfer'
+            self.models.update({
+                f'MobileNetV2 ({model_suffix})': {
+                    'script': 'behavior_recognition/MobileNetV2/yolo_mobilenet_tracker.py',
+                    'model_path': 'models/mobilenetv2/mobilenet_transfer.pth',
+                    'output': 'outputs/comparison_mobilenetv2_transfer.mp4'
+                },
+                f'MobileNetV3-Small ({model_suffix})': {
+                    'script': 'behavior_recognition/mobilenetv3-small/yolo_mobilenet_tracker_mnv3small.py',
+                    'model_path': 'models/mobilenetv3-small/mobilenet_v3_small_transfer.pth',
+                    'output': 'outputs/comparison_mobilenetv3small_transfer.mp4'
+                },
+                f'ShuffleNetV2 ({model_suffix})': {
+                    'script': 'behavior_recognition/shufflenetv2/yolo_mobilenet_tracker_shufflenetv2.py',
+                    'model_path': 'models/shufflenetv2/shufflenet_v2_transfer.pth',
+                    'output': 'outputs/comparison_shufflenetv2_transfer.mp4'
+                }
+            })
         
         self.results = {}
     
@@ -97,6 +135,7 @@ class TrackerComparator:
             '--mobilenet-model', str(model_path),
             '--conf', str(self.conf),
             '--iou', str(self.iou),
+            '--min-class-conf', str(self.min_class_conf),
             '--no-display'  # Don't display during comparison
         ]
         
@@ -171,57 +210,8 @@ class TrackerComparator:
         
         return metrics
     
-    def run_all(self) -> Dict[str, Dict]:
-        """
-        Run all trackers on the same video.
-        
-        Returns:
-            Dictionary mapping model names to their metrics
-        """
-        print("\n" + "="*100)
-        print("TRACKER COMPARISON")
-        print("="*100)
-        print(f"Video: {self.video_path}")
-        print(f"YOLO Model: {self.yolo_model}")
-        print(f"Save Outputs: {self.save_outputs}")
-        print("="*100 + "\n")
-        
-        for model_name, model_info in self.models.items():
-            print(f"Running {model_name}...")
-            result = self.run_tracker(model_name, model_info)
-            self.results[model_name] = result
-            print()
-        
-        return self.results
-    
-    def generate_comparison_report(self) -> str:
-        """Generate a formatted comparison report."""
-        output = []
-        output.append("="*100)
-        output.append("TRACKER PERFORMANCE COMPARISON")
-        output.append("="*100)
-        output.append(f"Video: {self.video_path}")
-        output.append(f"YOLO Model: {self.yolo_model}")
-        output.append("")
-        
-        # Check for errors
-        models_with_errors = [m for m, r in self.results.items() if 'error' in r]
-        if models_with_errors:
-            output.append(f"⚠️  Models with errors: {', '.join(models_with_errors)}")
-            output.append("")
-        
-        # Performance metrics table
-        models = [m for m in self.models.keys() if 'error' not in self.results.get(m, {})]
-        
-        if not models:
-            output.append("❌ No successful runs to compare")
-            return '\n'.join(output)
-        
-        output.append("PERFORMANCE METRICS")
-        output.append("-"*100)
-        output.append(f"{'Metric':<35} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
-        output.append("-"*100)
-        
+    def _add_metrics_rows(self, output: List[str], models: List[str]):
+        """Helper method to add metric rows to the output."""
         metrics_to_compare = [
             ('frames', 'Total Frames Processed', ''),
             ('detections', 'Total Person Detections', ''),
@@ -251,9 +241,133 @@ class TrackerComparator:
                 else:
                     values.append("N/A")
             
-            output.append(f"{label:<35} | {values[0]:<20} | {values[1]:<20} | {values[2]:<20}")
+            # Build row dynamically based on number of values
+            row = f"{label:<35} | " + " | ".join(f"{v:<20}" for v in values)
+            output.append(row)
+    
+    def _add_markdown_metrics_rows(self, output: List[str], models: List[str]):
+        """Helper method to add metric rows to markdown output."""
+        metrics_to_compare = [
+            ('frames', 'Total Frames'),
+            ('detections', 'Person Detections'),
+            ('classifications', 'Classifications'),
+            ('classification_rate', 'Classification Rate (%)'),
+            ('avg_classification_time', 'Avg Classification Time (ms)'),
+            ('final_fps', '**Final Processing FPS**'),
+            ('final_interval', 'Final Interval (frames)'),
+            ('unique_tracks', 'Unique Tracks'),
+            ('total_execution_time', 'Execution Time (s)')
+        ]
         
-        output.append("-"*100)
+        for key, label in metrics_to_compare:
+            values = []
+            for model in models:
+                if key in self.results[model]:
+                    val = self.results[model][key]
+                    if isinstance(val, float):
+                        if 'fps' in key.lower():
+                            values.append(f"{val:.1f}")
+                        else:
+                            values.append(f"{val:.2f}")
+                    else:
+                        values.append(str(val))
+                else:
+                    values.append("N/A")
+            
+            output.append(f"| {label} | " + " | ".join(values) + " |")
+    
+    def run_all(self) -> Dict[str, Dict]:
+        """
+        Run all trackers on the same video.
+        
+        Returns:
+            Dictionary mapping model names to their metrics
+        """
+        print("\n" + "="*100)
+        print("TRACKER COMPARISON")
+        print("="*100)
+        print(f"Video: {self.video_path}")
+        print(f"YOLO Model: {self.yolo_model}")
+        print(f"Training Mode: {self.mode}")
+        print(f"Save Outputs: {self.save_outputs}")
+        print("="*100 + "\n")
+        
+        for model_name, model_info in self.models.items():
+            print(f"Running {model_name}...")
+            result = self.run_tracker(model_name, model_info)
+            self.results[model_name] = result
+            print()
+        
+        return self.results
+    def generate_comparison_report(self) -> str:
+        """Generate a formatted comparison report."""
+        output = []
+        output.append("="*100)
+        output.append("TRACKER PERFORMANCE COMPARISON")
+        output.append("="*100)
+        output.append(f"Video: {self.video_path}")
+        output.append(f"YOLO Model: {self.yolo_model}")
+        output.append(f"Training Mode: {self.mode}")
+        output.append("")
+        
+        # Check for errors
+        models_with_errors = [m for m, r in self.results.items() if 'error' in r]
+        if models_with_errors:
+            output.append(f"⚠️  Models with errors: {', '.join(models_with_errors)}")
+            output.append("")
+        
+        # Performance metrics table
+        models = [m for m in self.models.keys() if 'error' not in self.results.get(m, {})]
+        
+        if not models:
+            output.append("❌ No successful runs to compare")
+            return '\n'.join(output)
+        
+        # Check if we're comparing both modes (6 models)
+        if self.mode == 'both' and len(models) == 6:
+            # Split into two tables: Feature Extraction and Transfer Learning
+            fe_models = [m for m in models if 'Feature Ext' in m]
+            transfer_models = [m for m in models if 'Transfer' in m]
+            
+            # Feature Extraction Table
+            output.append("PERFORMANCE METRICS - FEATURE EXTRACTION MODELS")
+            output.append("-"*100)
+            output.append(f"{'Metric':<35} | {fe_models[0]:<20} | {fe_models[1]:<20} | {fe_models[2]:<20}")
+            output.append("-"*100)
+            
+            self._add_metrics_rows(output, fe_models)
+            
+            output.append("-"*100)
+            output.append("")
+            
+            # Transfer Learning Table
+            output.append("PERFORMANCE METRICS - TRANSFER LEARNING MODELS")
+            output.append("-"*100)
+            output.append(f"{'Metric':<35} | {transfer_models[0]:<20} | {transfer_models[1]:<20} | {transfer_models[2]:<20}")
+            output.append("-"*100)
+            
+            self._add_metrics_rows(output, transfer_models)
+            
+            output.append("-"*100)
+        else:
+            # Single table for 1-3 models
+            output.append("PERFORMANCE METRICS")
+            output.append("-"*100)
+            
+            # Build header dynamically based on number of models
+            if len(models) == 1:
+                output.append(f"{'Metric':<35} | {models[0]:<20}")
+            elif len(models) == 2:
+                output.append(f"{'Metric':<35} | {models[0]:<20} | {models[1]:<20}")
+            else:  # 3 models
+                output.append(f"{'Metric':<35} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
+            output.append("-"*100)
+            
+            self._add_metrics_rows(output, models)
+            
+            output.append("-"*100)
+            output.append("-"*100)
+        
         output.append("")
         
         # Analysis
@@ -307,7 +421,8 @@ class TrackerComparator:
         output = []
         output.append("# Tracker Performance Comparison\n")
         output.append(f"**Video:** `{self.video_path}`  ")
-        output.append(f"**YOLO Model:** `{self.yolo_model}`\n")
+        output.append(f"**YOLO Model:** `{self.yolo_model}`  ")
+        output.append(f"**Training Mode:** `{self.mode}`\n")
         
         models = [m for m in self.models.keys() if 'error' not in self.results.get(m, {})]
         
@@ -315,39 +430,32 @@ class TrackerComparator:
             output.append("❌ No successful runs to compare")
             return '\n'.join(output)
         
-        # Performance table
-        output.append("## Performance Metrics\n")
-        output.append("| Metric | " + " | ".join(models) + " |")
-        output.append("|" + "---|" * (len(models) + 1))
-        
-        metrics_to_compare = [
-            ('frames', 'Total Frames'),
-            ('detections', 'Person Detections'),
-            ('classifications', 'Classifications'),
-            ('classification_rate', 'Classification Rate (%)'),
-            ('avg_classification_time', 'Avg Classification Time (ms)'),
-            ('final_fps', '**Final Processing FPS**'),
-            ('final_interval', 'Final Interval (frames)'),
-            ('unique_tracks', 'Unique Tracks'),
-            ('total_execution_time', 'Execution Time (s)')
-        ]
-        
-        for key, label in metrics_to_compare:
-            values = []
-            for model in models:
-                if key in self.results[model]:
-                    val = self.results[model][key]
-                    if isinstance(val, float):
-                        if 'fps' in key.lower():
-                            values.append(f"{val:.1f}")
-                        else:
-                            values.append(f"{val:.2f}")
-                    else:
-                        values.append(str(val))
-                else:
-                    values.append("N/A")
+        # Check if we're comparing both modes (6 models)
+        if self.mode == 'both' and len(models) == 6:
+            # Split into two tables: Feature Extraction and Transfer Learning
+            fe_models = [m for m in models if 'Feature Ext' in m]
+            transfer_models = [m for m in models if 'Transfer' in m]
             
-            output.append(f"| {label} | " + " | ".join(values) + " |")
+            # Feature Extraction Table
+            output.append("## Performance Metrics - Feature Extraction Models\n")
+            output.append("| Metric | " + " | ".join(fe_models) + " |")
+            output.append("|" + "---|" * (len(fe_models) + 1))
+            
+            self._add_markdown_metrics_rows(output, fe_models)
+            
+            output.append("\n## Performance Metrics - Transfer Learning Models\n")
+            output.append("| Metric | " + " | ".join(transfer_models) + " |")
+            output.append("|" + "---|" * (len(transfer_models) + 1))
+            
+            self._add_markdown_metrics_rows(output, transfer_models)
+        else:
+            # Single table for 1-3 models
+            output.append("## Performance Metrics\n")
+            output.append("| Metric | " + " | ".join(models) + " |")
+            output.append("|" + "---|" * (len(models) + 1))
+            
+            self._add_markdown_metrics_rows(output, models)
+            self._add_markdown_metrics_rows(output, models)
         
         output.append("\n## Analysis\n")
         
@@ -371,7 +479,6 @@ class TrackerComparator:
         
         return '\n'.join(output)
 
-
 def main():
     parser = argparse.ArgumentParser(
         description='Compare all three trackers on the same video'
@@ -383,6 +490,9 @@ def main():
     input_group.add_argument('--webcam', action='store_true', help='Use webcam (not recommended for comparison)')
     
     # Configuration
+    parser.add_argument('--mode', type=str, choices=['transfer', 'feature_extraction', 'both'],
+                       default='transfer',
+                       help='Training mode to compare: transfer, feature_extraction, or both (default: transfer)')
     parser.add_argument('--yolo-model', type=str,
                        default='models/YOLOv8/yolov8m.pt',
                        help='Path to YOLOv8 model (default: models/YOLOv8/yolov8m.pt)')
@@ -390,14 +500,16 @@ def main():
                        help='YOLO confidence threshold (default: 0.5)')
     parser.add_argument('--iou', type=float, default=0.7,
                        help='YOLO IOU threshold (default: 0.7)')
+    parser.add_argument('--min-class-conf', type=float, default=0.6,
+                       help='Minimum classification confidence (0-1) to accept behavior (default: 0.6)')
     
     # Output
     parser.add_argument('--save-outputs', action='store_true',
                        help='Save output videos for each model')
-    parser.add_argument('--save-report', type=str, default='tracker_comparison.md',
-                       help='Save comparison report (default: tracker_comparison.md)')
-    parser.add_argument('--save-txt', type=str, default='tracker_comparison.txt',
-                       help='Save text report (default: tracker_comparison.txt)')
+    parser.add_argument('--save-report', type=str, default=None,
+                       help='Save comparison report (default: tracker_comparison_{mode}.md)')
+    parser.add_argument('--save-txt', type=str, default=None,
+                       help='Save text report (default: tracker_comparison_{mode}.txt)')
     parser.add_argument('--save-json', type=str, default=None,
                        help='Save raw metrics as JSON')
     
@@ -415,7 +527,9 @@ def main():
         save_outputs=args.save_outputs,
         yolo_model=args.yolo_model,
         conf=args.conf,
-        iou=args.iou
+        iou=args.iou,
+        mode=args.mode,
+        min_class_conf=args.min_class_conf
     )
     
     # Run comparison
@@ -428,6 +542,12 @@ def main():
     # Print to console
     print(text_report)
     print()
+    
+    # Set default filenames based on mode if not provided
+    if args.save_txt is None:
+        args.save_txt = f'tracker_comparison_{args.mode}.txt'
+    if args.save_report is None:
+        args.save_report = f'tracker_comparison_{args.mode}.md'
     
     # Save reports
     txt_path = Path(args.save_txt)

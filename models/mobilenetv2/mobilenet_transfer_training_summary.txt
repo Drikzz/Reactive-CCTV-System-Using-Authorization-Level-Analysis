@@ -1,0 +1,25 @@
+============================================================
+TRAINING SUMMARY - TRANSFER LEARNING (MobileNetV2)
+============================================================
+Training Mode: Transfer Learning (Full Fine-Tuning)
+Total Epochs: 30
+Best Val Acc: 86.55% (Epoch 25)
+Final Train Loss: 0.0319
+Final Val Loss: 0.4817
+Final Train Acc: 99.39%
+Final Val Acc: 83.61%
+Train-Val Gap: 15.78%
+Status: ❌ High overfitting
+
+============================================================
+FINAL TEST EVALUATION
+============================================================
+Overall Test Accuracy: 87.29%
+Per-class test accuracy:
+  holding-object: 80.0% (24/30)
+  opening-cabinet: 82.8% (24/29)
+  opening-door: 90.0% (27/30)
+  using-computer: 96.6% (28/29)
+Saved plots: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv2/mobilenet_transfer_training_curves.png
+Saved summary: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv2/mobilenet_transfer_training_summary.txt
+Total training time: 4.09 minutes

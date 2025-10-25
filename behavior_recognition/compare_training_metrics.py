@@ -2,12 +2,22 @@
 Compare Training Metrics Across Models
 
 This script reads and compares training summary files from MobileNetV2, MobileNetV3-Small, 
-and ShuffleNetV2 models. It generates a comprehensive comparison table and saves it as both
-a text file and a formatted markdown file suitable for thesis inclusion.
+and ShuffleNetV2 models. It supports comparing both transfer learning (fine-tuning) and 
+feature extraction (frozen backbone) training modes. Generates comprehensive comparison 
+tables and saves them as both text and markdown files suitable for thesis inclusion.
 
 Usage:
+    # Compare transfer learning (default)
     python compare_training_metrics.py
-    python compare_training_metrics.py --save comparison_results.md
+    
+    # Compare feature extraction
+    python compare_training_metrics.py --mode feature_extraction
+    
+    # Compare both modes (6 models total)
+    python compare_training_metrics.py --mode both
+    
+    # Custom output file
+    python compare_training_metrics.py --save my_comparison.md
 """
 
 import argparse
@@ -109,8 +119,21 @@ def format_comparison_table(metrics_dict: Dict[str, Dict]) -> str:
     # Overall Metrics Table
     output.append("OVERALL TRAINING METRICS")
     output.append("-"*100)
-    output.append(f"{'Metric':<30} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
-    output.append("-"*100)
+    
+    # For 6 models, split into two tables (3 models each) for better readability
+    if len(models) > 3:
+        # First table - first 3 models
+        output.append(f"{'Metric':<30} | {models[0]:<25} | {models[1]:<25} | {models[2]:<25}")
+        output.append("-"*100)
+    else:
+        # Original format for 3 or fewer models
+        if len(models) == 3:
+            output.append(f"{'Metric':<30} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
+        elif len(models) == 2:
+            output.append(f"{'Metric':<30} | {models[0]:<20} | {models[1]:<20}")
+        else:
+            output.append(f"{'Metric':<30} | {models[0]:<20}")
+        output.append("-"*100)
     
     # Metrics to compare
     metric_labels = [
@@ -143,16 +166,78 @@ def format_comparison_table(metrics_dict: Dict[str, Dict]) -> str:
             else:
                 values.append("N/A")
         
-        output.append(f"{label:<30} | {values[0]:<20} | {values[1]:<20} | {values[2]:<20}")
+        # Build rows based on number of models
+        if len(models) > 3:
+            # Split into two rows for 6 models
+            row1 = f"{label:<30} | {values[0]:<25} | {values[1]:<25} | {values[2]:<25}"
+            output.append(row1)
+        else:
+            # Original single row for 3 or fewer models
+            if len(models) == 3:
+                output.append(f"{label:<30} | {values[0]:<20} | {values[1]:<20} | {values[2]:<20}")
+            elif len(models) == 2:
+                output.append(f"{label:<30} | {values[0]:<20} | {values[1]:<20}")
+            else:
+                output.append(f"{label:<30} | {values[0]:<20}")
+    
+    # If more than 3 models, add second table
+    if len(models) > 3:
+        output.append("")
+        output.append("-"*100)
+        output.append(f"{'Metric':<30} | {models[3]:<25} | {models[4]:<25} | {models[5]:<25}")
+        output.append("-"*100)
+        
+        for key, label, unit in metric_labels:
+            values = []
+            for model in models[3:]:  # Get remaining models
+                if key in metrics_dict[model]:
+                    val = metrics_dict[model][key]
+                    if isinstance(val, float):
+                        if 'loss' in key.lower():
+                            values.append(f"{val:.4f}{unit}")
+                        elif 'time' in key.lower():
+                            values.append(f"{val:.2f}{unit}")
+                        else:
+                            values.append(f"{val:.2f}{unit}")
+                    else:
+                        values.append(f"{val}{unit}")
+                else:
+                    values.append("N/A")
+            
+            row2 = f"{label:<30} | {values[0]:<25} | {values[1]:<25} | {values[2]:<25}"
+            output.append(row2)
     
     # Status
     output.append("-"*100)
-    output.append(f"{'Overfitting Status':<30} | ", end='')
-    for i, model in enumerate(models):
-        status = metrics_dict[model].get('status', 'N/A')
-        output[-1] += f"{status:<20}"
-        if i < len(models) - 1:
-            output[-1] += " | "
+    
+    # Split status for 6 models
+    if len(models) > 3:
+        status_line1 = f"{'Overfitting Status':<30} | "
+        for i in range(3):
+            status = metrics_dict[models[i]].get('status', 'N/A')
+            status_line1 += f"{status:<25}"
+            if i < 2:
+                status_line1 += " | "
+        output.append(status_line1)
+        output.append("")
+        output.append("-"*100)
+        
+        status_line2 = f"{'Overfitting Status':<30} | "
+        for i in range(3, 6):
+            status = metrics_dict[models[i]].get('status', 'N/A')
+            status_line2 += f"{status:<25}"
+            if i < 5:
+                status_line2 += " | "
+        output.append(status_line2)
+    else:
+        status_line = f"{'Overfitting Status':<30} | "
+        for i, model in enumerate(models):
+            status = metrics_dict[model].get('status', 'N/A')
+            status_line += f"{status:<20}"
+            if i < len(models) - 1:
+                status_line += " | "
+        output.append(status_line)
+    
     output.append("")
     output.append("")
     
@@ -167,21 +252,58 @@ def format_comparison_table(metrics_dict: Dict[str, Dict]) -> str:
             all_classes.update(metrics_dict[model]['per_class_test'].keys())
     
     if all_classes:
-        output.append(f"{'Class':<25} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
-        output.append("-"*100)
-        
-        for class_name in sorted(all_classes):
-            values = []
-            for model in models:
-                if 'per_class_test' in metrics_dict[model] and class_name in metrics_dict[model]['per_class_test']:
-                    acc = metrics_dict[model]['per_class_test'][class_name]['accuracy']
-                    correct = metrics_dict[model]['per_class_test'][class_name]['correct']
-                    total = metrics_dict[model]['per_class_test'][class_name]['total']
-                    values.append(f"{acc:.1f}% ({correct}/{total})")
-                else:
-                    values.append("N/A")
+        # Split into two tables for 6 models
+        if len(models) > 3:
+            output.append(f"{'Class':<25} | {models[0]:<25} | {models[1]:<25} | {models[2]:<25}")
+            output.append("-"*100)
             
-            output.append(f"{class_name:<25} | {values[0]:<20} | {values[1]:<20} | {values[2]:<20}")
+            for class_name in sorted(all_classes):
+                values = []
+                for model in models[:3]:
+                    if 'per_class_test' in metrics_dict[model] and class_name in metrics_dict[model]['per_class_test']:
+                        acc = metrics_dict[model]['per_class_test'][class_name]['accuracy']
+                        correct = metrics_dict[model]['per_class_test'][class_name]['correct']
+                        total = metrics_dict[model]['per_class_test'][class_name]['total']
+                        values.append(f"{acc:.1f}% ({correct}/{total})")
+                    else:
+                        values.append("N/A")
+                
+                output.append(f"{class_name:<25} | {values[0]:<25} | {values[1]:<25} | {values[2]:<25}")
+            
+            output.append("")
+            output.append("-"*100)
+            output.append(f"{'Class':<25} | {models[3]:<25} | {models[4]:<25} | {models[5]:<25}")
+            output.append("-"*100)
+            
+            for class_name in sorted(all_classes):
+                values = []
+                for model in models[3:]:
+                    if 'per_class_test' in metrics_dict[model] and class_name in metrics_dict[model]['per_class_test']:
+                        acc = metrics_dict[model]['per_class_test'][class_name]['accuracy']
+                        correct = metrics_dict[model]['per_class_test'][class_name]['correct']
+                        total = metrics_dict[model]['per_class_test'][class_name]['total']
+                        values.append(f"{acc:.1f}% ({correct}/{total})")
+                    else:
+                        values.append("N/A")
+                
+                output.append(f"{class_name:<25} | {values[0]:<25} | {values[1]:<25} | {values[2]:<25}")
+        else:
+            # Original format for 3 or fewer models
+            output.append(f"{'Class':<25} | {models[0]:<20} | {models[1]:<20} | {models[2]:<20}")
+            output.append("-"*100)
+            
+            for class_name in sorted(all_classes):
+                values = []
+                for model in models:
+                    if 'per_class_test' in metrics_dict[model] and class_name in metrics_dict[model]['per_class_test']:
+                        acc = metrics_dict[model]['per_class_test'][class_name]['accuracy']
+                        correct = metrics_dict[model]['per_class_test'][class_name]['correct']
+                        total = metrics_dict[model]['per_class_test'][class_name]['total']
+                        values.append(f"{acc:.1f}% ({correct}/{total})")
+                    else:
+                        values.append("N/A")
+                
+                output.append(f"{class_name:<25} | {values[0]:<20} | {values[1]:<20} | {values[2]:<20}")
     
     output.append("-"*100)
     output.append("")
@@ -338,15 +460,15 @@ def format_markdown_table(metrics_dict: Dict[str, Dict]) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description='Compare training metrics across models')
-    parser.add_argument('--mobilenetv2-summary', type=str,
-                       default='models/mobilenetv2/mobilenet_transfer_training_summary.txt',
-                       help='Path to MobileNetV2 training summary')
-    parser.add_argument('--mobilenetv3-summary', type=str,
-                       default='models/mobilenetv3-small/mobilenet_v3_small_transfer_training_summary.txt',
-                       help='Path to MobileNetV3-Small training summary')
-    parser.add_argument('--shufflenet-summary', type=str,
-                       default='models/shufflenetv2/shufflenet_v2_transfer_training_summary.txt',
-                       help='Path to ShuffleNetV2 training summary')
+    parser.add_argument('--mode', type=str, choices=['transfer', 'feature_extraction', 'both'],
+                       default='transfer',
+                       help='Training mode to compare: transfer (fine-tuning), feature_extraction, or both (default: transfer)')
+    parser.add_argument('--mobilenetv2-summary', type=str, default=None,
+                       help='Path to MobileNetV2 training summary (overrides default)')
+    parser.add_argument('--mobilenetv3-summary', type=str, default=None,
+                       help='Path to MobileNetV3-Small training summary (overrides default)')
+    parser.add_argument('--shufflenet-summary', type=str, default=None,
+                       help='Path to ShuffleNetV2 training summary (overrides default)')
     parser.add_argument('--save', type=str, default='training_comparison.md',
                        help='Output filename for markdown comparison (default: training_comparison.md)')
     parser.add_argument('--save-txt', type=str, default='training_comparison.txt',
@@ -359,12 +481,31 @@ def main():
     # Get base directory
     base_dir = Path(__file__).parent.parent
     
-    # Parse all summaries
-    summaries = {
-        'MobileNetV2': base_dir / args.mobilenetv2_summary,
-        'MobileNetV3-Small': base_dir / args.mobilenetv3_summary,
-        'ShuffleNetV2': base_dir / args.shufflenet_summary
-    }
+    # Determine which summaries to compare based on mode
+    if args.mode == 'transfer':
+        summaries = {
+            'MobileNetV2 (Transfer)': args.mobilenetv2_summary or 'models/mobilenetv2/mobilenet_transfer_training_summary.txt',
+            'MobileNetV3-Small (Transfer)': args.mobilenetv3_summary or 'models/mobilenetv3-small/mobilenet_v3_small_transfer_training_summary.txt',
+            'ShuffleNetV2 (Transfer)': args.shufflenet_summary or 'models/shufflenetv2/shufflenet_v2_transfer_training_summary.txt'
+        }
+    elif args.mode == 'feature_extraction':
+        summaries = {
+            'MobileNetV2 (Feature Ext)': args.mobilenetv2_summary or 'models/mobilenetv2/mobilenet_feature_extraction_training_summary.txt',
+            'MobileNetV3-Small (Feature Ext)': args.mobilenetv3_summary or 'models/mobilenetv3-small/mobilenetv3_small_feature_extraction_training_summary.txt',
+            'ShuffleNetV2 (Feature Ext)': args.shufflenet_summary or 'models/shufflenetv2/shufflenetv2_feature_extraction_training_summary.txt'
+        }
+    else:  # both
+        summaries = {
+            'MobileNetV2 (Transfer)': 'models/mobilenetv2/mobilenet_transfer_training_summary.txt',
+            'MobileNetV2 (Feature Ext)': 'models/mobilenetv2/mobilenet_feature_extraction_training_summary.txt',
+            'MobileNetV3-Small (Transfer)': 'models/mobilenetv3-small/mobilenet_v3_small_transfer_training_summary.txt',
+            'MobileNetV3-Small (Feature Ext)': 'models/mobilenetv3-small/mobilenetv3_small_feature_extraction_training_summary.txt',
+            'ShuffleNetV2 (Transfer)': 'models/shufflenetv2/shufflenet_v2_transfer_training_summary.txt',
+            'ShuffleNetV2 (Feature Ext)': 'models/shufflenetv2/shufflenetv2_feature_extraction_training_summary.txt'
+        }
+    
+    # Convert to Path objects
+    summaries = {name: base_dir / path for name, path in summaries.items()}
     
     print("\n" + "="*100)
     print("TRAINING METRICS COMPARISON")
