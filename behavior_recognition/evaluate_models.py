@@ -138,7 +138,8 @@ class ModelEvaluator:
                 
         elif self.model_name == 'mobilenetv3':
             model = models.mobilenet_v3_small(weights=None)
-            in_features = model.classifier[3].in_features
+            # MobileNetV3-Small's feature extractor outputs 576 features
+            in_features = 576
             
             # Check if feature extraction model
             if 'classifier.3.weight' in checkpoint['model_state_dict']:
@@ -382,12 +383,16 @@ class ModelEvaluator:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         
+        # Create organized folder structure: save_dir/model_name/mode/
+        model_folder = save_dir / self.model_name / self.mode
+        model_folder.mkdir(parents=True, exist_ok=True)
+        
         # Save confusion matrix plot
-        cm_path = save_dir / f"{self.model_name}_{self.mode}_confusion_matrix.png"
+        cm_path = model_folder / "confusion_matrix.png"
         self.plot_confusion_matrix(results['confusion_matrix'], cm_path)
         
         # Save metrics to JSON
-        metrics_path = save_dir / f"{self.model_name}_{self.mode}_metrics.json"
+        metrics_path = model_folder / "metrics.json"
         
         # Convert numpy arrays to lists for JSON serialization
         serializable_metrics = {
@@ -418,7 +423,7 @@ class ModelEvaluator:
         print(f"✓ Metrics saved to: {metrics_path}")
         
         # Save text report
-        report_path = save_dir / f"{self.model_name}_{self.mode}_report.txt"
+        report_path = model_folder / "report.txt"
         with open(report_path, 'w') as f:
             # Redirect print to file
             import io
@@ -431,6 +436,153 @@ class ModelEvaluator:
             f.write(str_io.getvalue())
         
         print(f"✓ Text report saved to: {report_path}")
+
+
+def plot_combined_confusion_matrices(results_dict, class_names, save_path, title="Combined Confusion Matrices"):
+    """
+    Plot multiple confusion matrices in a single figure.
+    
+    Args:
+        results_dict: Dictionary of {model_name: results}
+        class_names: List of class names
+        save_path: Path to save the combined plot
+        title: Overall title for the figure
+    """
+    n_models = len(results_dict)
+    
+    # Determine grid layout
+    if n_models == 1:
+        rows, cols = 1, 1
+        figsize = (8, 6)
+    elif n_models == 2:
+        rows, cols = 1, 2
+        figsize = (16, 6)
+    elif n_models == 3:
+        rows, cols = 1, 3
+        figsize = (18, 5)
+    elif n_models == 4:
+        rows, cols = 2, 2
+        figsize = (14, 12)
+    elif n_models <= 6:
+        rows, cols = 2, 3
+        figsize = (18, 10)
+    else:
+        rows, cols = 3, 3
+        figsize = (18, 15)
+    
+    fig, axes = plt.subplots(rows, cols, figsize=figsize)
+    
+    # Flatten axes for easier iteration
+    if n_models == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    # Plot each confusion matrix
+    for idx, (model_key, results) in enumerate(results_dict.items()):
+        ax = axes[idx]
+        cm = results['confusion_matrix']
+        
+        # Create heatmap
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                   xticklabels=class_names,
+                   yticklabels=class_names,
+                   ax=ax,
+                   cbar=True,
+                   square=True)
+        
+        # Format model name for display
+        model_name, mode = model_key.rsplit('_', 1)
+        display_name = f"{model_name.upper()}\n({mode.replace('_', ' ').title()})"
+        
+        ax.set_title(display_name, fontsize=10, fontweight='bold', pad=10)  # Added padding
+        ax.set_ylabel('True Label', fontsize=9)
+        ax.set_xlabel('Predicted Label', fontsize=9, labelpad=8)  # Added padding
+        
+        # Rotate labels for readability
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right', fontsize=8)
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=8)
+    
+    # Hide unused subplots
+    for idx in range(n_models, len(axes)):
+        axes[idx].axis('off')
+    
+    # Overall title - positioned higher to avoid overlap
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.995)
+    
+    # Add padding between subplots and leave space for suptitle
+    plt.tight_layout(h_pad=3.0, w_pad=2.0, rect=[0, 0, 1, 0.97])
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Combined confusion matrices saved to: {save_path}")
+    plt.close()
+
+
+def plot_metrics_comparison(results_dict, save_path, title="Model Performance Comparison"):
+    """
+    Plot bar chart comparing metrics across models.
+    
+    Args:
+        results_dict: Dictionary of {model_name: results}
+        save_path: Path to save the comparison plot
+        title: Overall title for the figure
+    """
+    # Extract metrics
+    model_names = []
+    accuracies = []
+    precisions = []
+    recalls = []
+    f1_scores = []
+    
+    for model_key, results in results_dict.items():
+        metrics = results['metrics']
+        
+        # Format model name
+        model_name, mode = model_key.rsplit('_', 1)
+        display_name = f"{model_name}\n({mode[:4]})"  # Abbreviated mode
+        
+        model_names.append(display_name)
+        accuracies.append(metrics['accuracy'] * 100)
+        precisions.append(metrics['precision_macro'] * 100)
+        recalls.append(metrics['recall_macro'] * 100)
+        f1_scores.append(metrics['f1_macro'] * 100)
+    
+    # Create bar chart
+    x = np.arange(len(model_names))
+    width = 0.2
+    
+    fig, ax = plt.subplots(figsize=(max(12, len(model_names) * 1.5), 6))
+    
+    bars1 = ax.bar(x - 1.5*width, accuracies, width, label='Accuracy', color='#2E86AB')
+    bars2 = ax.bar(x - 0.5*width, precisions, width, label='Precision', color='#A23B72')
+    bars3 = ax.bar(x + 0.5*width, recalls, width, label='Recall', color='#F18F01')
+    bars4 = ax.bar(x + 1.5*width, f1_scores, width, label='F1-Score', color='#C73E1D')
+    
+    # Add value labels on bars
+    def add_labels(bars):
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{height:.1f}%',
+                   ha='center', va='bottom', fontsize=8)
+    
+    add_labels(bars1)
+    add_labels(bars2)
+    add_labels(bars3)
+    add_labels(bars4)
+    
+    ax.set_xlabel('Model', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Score (%)', fontsize=12, fontweight='bold')
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names, fontsize=9)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.set_ylim([0, 105])
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Metrics comparison saved to: {save_path}")
+    plt.close()
 
 
 def main():
@@ -506,6 +658,70 @@ def main():
     print("="*70)
     print(f"\nResults saved to: {args.save_dir}/")
     print(f"Total evaluations: {len(all_results)}")
+    
+    # Generate combined visualizations if multiple models evaluated
+    if len(all_results) > 0:
+        save_dir = Path(args.save_dir)
+        
+        # Get class names (same for all models)
+        first_result = next(iter(all_results.values()))
+        class_names = first_result['class_names']
+        
+        # 1. Combined confusion matrix for ALL models (if evaluating multiple)
+        if len(all_results) >= 2:
+            print(f"\n📊 Generating combined visualizations...")
+            
+            combined_cm_path = save_dir / "all_models_confusion_matrices.png"
+            plot_combined_confusion_matrices(
+                all_results, 
+                class_names,
+                combined_cm_path,
+                title="Confusion Matrices - All Models"
+            )
+            
+            # Metrics comparison chart
+            metrics_comparison_path = save_dir / "all_models_metrics_comparison.png"
+            plot_metrics_comparison(
+                all_results,
+                metrics_comparison_path,
+                title="Performance Comparison - All Models"
+            )
+        
+        # 2. Feature Extraction models only (if 3 or more FE models)
+        fe_results = {k: v for k, v in all_results.items() if 'feature_extraction' in k}
+        if len(fe_results) >= 2:
+            fe_cm_path = save_dir / "feature_extraction_confusion_matrices.png"
+            plot_combined_confusion_matrices(
+                fe_results,
+                class_names,
+                fe_cm_path,
+                title="Confusion Matrices - Feature Extraction Models"
+            )
+            
+            fe_metrics_path = save_dir / "feature_extraction_metrics_comparison.png"
+            plot_metrics_comparison(
+                fe_results,
+                fe_metrics_path,
+                title="Performance Comparison - Feature Extraction Models"
+            )
+        
+        # 3. Transfer Learning models only (if 3 or more TL models)
+        tl_results = {k: v for k, v in all_results.items() if 'transfer' in k and 'feature_extraction' not in k}
+        if len(tl_results) >= 2:
+            tl_cm_path = save_dir / "transfer_learning_confusion_matrices.png"
+            plot_combined_confusion_matrices(
+                tl_results,
+                class_names,
+                tl_cm_path,
+                title="Confusion Matrices - Transfer Learning Models"
+            )
+            
+            tl_metrics_path = save_dir / "transfer_learning_metrics_comparison.png"
+            plot_metrics_comparison(
+                tl_results,
+                tl_metrics_path,
+                title="Performance Comparison - Transfer Learning Models"
+            )
     
     # Print comparison table if multiple models evaluated
     if len(all_results) > 1:
