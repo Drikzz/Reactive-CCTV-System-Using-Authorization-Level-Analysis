@@ -87,8 +87,9 @@ def plot_and_save(history, save_dir, model_name):
     summary_path = save_dir / model_name.replace('.pth', '_training_summary.txt')
     with open(summary_path, 'w') as f:
         f.write('='*60 + '\n')
-        f.write('TRAINING SUMMARY\n')
+        f.write('TRAINING SUMMARY - TRANSFER LEARNING (MobileNetV2)\n')
         f.write('='*60 + '\n')
+        f.write(f"Training Mode: Transfer Learning (Full Fine-Tuning)\n")
         f.write(f"Total Epochs: {len(epochs)}\n")
         best_val_acc = max(history['val_acc']) if history['val_acc'] else 0
         best_epoch = history['val_acc'].index(best_val_acc) + 1 if history['val_acc'] else 0
