@@ -1,0 +1,26 @@
+============================================================
+TRAINING SUMMARY - FEATURE EXTRACTION (MobileNetV2)
+============================================================
+Training Mode: Feature Extraction (Frozen Backbone)
+Total Epochs: 27
+Best Val Acc: 73.95% (Epoch 17)
+Final Train Loss: 0.6810
+Final Val Loss: 0.7112
+Final Train Acc: 70.82%
+Final Val Acc: 68.91%
+Train-Val Gap: 1.92%
+Status: ✅ Excellent
+
+============================================================
+FINAL TEST EVALUATION
+============================================================
+Overall Test Accuracy: 68.64%
+Per-class test accuracy:
+  holding-object: 70.0% (21/30)
+  opening-cabinet: 69.0% (20/29)
+  opening-door: 60.0% (18/30)
+  using-computer: 75.9% (22/29)
+Trainable parameters: 5,124 / 2,228,996
+Saved plots: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv2/mobilenet_feature_extraction_training_curves.png
+Saved summary: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv2/mobilenet_feature_extraction_training_summary.txt
+Total training time: 3.39 minutes

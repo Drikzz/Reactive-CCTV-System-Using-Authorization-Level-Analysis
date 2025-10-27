@@ -2,6 +2,3 @@
 faces/
 cache/
 !behavior_clips/
-test/
-train/
-valid/
