@@ -1,0 +1,15 @@
+{
+  "model": "FaceNet",
+  "video": "ThesisMP4TEST5",
+  "metrics": {
+    "avg_confidence": 0.8497054631204756,
+    "avg_inference_time_ms": 56.6732774306094,
+    "avg_accuracy": 0.0
+  },
+  "additional_stats": {
+    "total_detections": 1398,
+    "back_view_percentage": 19.814020028612305,
+    "locked_percentage": 28.683834048640914
+  },
+  "timestamp": "20251023_155658"
+}

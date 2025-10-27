@@ -7,10 +7,10 @@
 import cv2
 
 # Set up camera connection details
-ip_address = '192.168.1.245' # Replace with the IP address of your camera
+ip_address = '192.168.1.234' # Replace with the IP address of your camera
 port = '554'          # Replace with the port number for your camera
-username = 'reactivecctv101'    # Replace with the username for your camera
-password = 'reactivecctv101' # Replace with the password for your camera
+username = 'CakeyFudo'    # Replace with the username for your camera
+password = 'xkobex62' # Replace with the password for your camera
 
 # Construct the RTSP stream URLs using variables
 url_640x480 = f"rtsp://{username}:{password}@{ip_address}:{port}/stream2"

@@ -20,7 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # -------------------- CONFIG --------------------
 USE_WEBCAM = False
-VIDEO_PATH = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST3.mp4"
+VIDEO_PATH = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST5.mp4"
 YOLO_MODEL_PATH = "models/YOLOv8/yolov8n.pt"
 
 LOGS_BASE = os.path.join("logs", "FaceNet")
@@ -80,16 +80,24 @@ print(f"[INFO] Using device: {device}")
 # YOLO with ByteTrack
 yolo = YOLO(YOLO_MODEL_PATH)
 
+def make_mtcnn(image_size=160, margin=0, keep_all=True, device=None):
+    try:
+        from facenet_pytorch import MTCNN as MTCNN_FP
+        return MTCNN_FP(image_size=image_size, margin=margin, keep_all=keep_all, device=device)
+    except Exception:
+        try:
+            from mtcnn import MTCNN as MTCNN_IP
+            # ipazc/mtcnn constructor doesn't accept image_size — return default instance
+            return MTCNN_IP()
+        except Exception as e:
+            raise RuntimeError("No usable MTCNN found (install facenet-pytorch or mtcnn). Error: " + str(e))
+
 # MTCNN
-mtcnn = MTCNN(
+mtcnn = make_mtcnn(
     image_size=160, 
     margin=0, 
     keep_all=True, 
-    device=device, 
-    post_process=False,
-    min_face_size=MIN_FACE_SIZE,
-    thresholds=[0.6, 0.7, 0.7],
-    factor=0.7
+    device=device
 )
 
 # FaceNet embedder

@@ -17,7 +17,7 @@ from datetime import datetime
 from collections import defaultdict, deque
 from pathlib import Path
 from ultralytics import YOLO
-
+    
 # Try to import face detection libraries
 try:
     from facenet_pytorch import MTCNN

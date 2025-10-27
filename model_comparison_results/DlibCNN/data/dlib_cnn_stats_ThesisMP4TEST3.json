@@ -1,16 +1,16 @@
 {
   "model_name": "DlibCNN",
   "video_name": "ThesisMP4TEST3",
-  "avg_confidence": 0.0,
-  "avg_inference_time_ms": 0.0,
-  "avg_accuracy": 0.0,
-  "total_detections": 94,
-  "successful_recognitions": 0,
-  "recognition_rate": 0.0,
-  "back_view_detections": 0,
-  "back_view_percentage": 0.0,
-  "locked_detections": 0,
-  "locked_percentage": 0.0,
-  "unique_tracks": 1,
-  "locked_tracks": 0
+  "avg_confidence": 0.817969517921174,
+  "avg_inference_time_ms": 66.35113101702905,
+  "avg_accuracy": 0.9841897233201581,
+  "total_detections": 253,
+  "successful_recognitions": 249,
+  "recognition_rate": 0.9841897233201581,
+  "back_view_detections": 5,
+  "back_view_percentage": 1.9762845849802373,
+  "locked_detections": 249,
+  "locked_percentage": 98.41897233201581,
+  "unique_tracks": 2,
+  "locked_tracks": 2
 }

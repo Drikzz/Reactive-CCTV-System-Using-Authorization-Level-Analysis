@@ -7,9 +7,9 @@
     "avg_accuracy": 0.0
   },
   "additional_stats": {
-    "total_detections": 94,
+    "total_detections": 115,
     "back_view_percentage": 0.0,
     "locked_percentage": 0.0
   },
-  "timestamp": "20251012_173207"
+  "timestamp": "20251014_140551"
 }

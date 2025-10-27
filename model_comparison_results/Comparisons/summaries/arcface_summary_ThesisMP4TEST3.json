@@ -2,14 +2,14 @@
   "model": "ArcFace",
   "video": "ThesisMP4TEST3",
   "metrics": {
-    "avg_confidence": 0.6286743223829072,
-    "avg_inference_time_ms": 30.991001854607873,
-    "avg_accuracy": 0.8748019017432647
+    "avg_confidence": 0.6328072960942434,
+    "avg_inference_time_ms": 26.001070267424907,
+    "avg_accuracy": 0.820919175911252
   },
   "additional_stats": {
     "total_detections": 631,
     "back_view_percentage": 0.7923930269413629,
-    "locked_percentage": 87.48019017432647
+    "locked_percentage": 82.0919175911252
   },
-  "timestamp": "20251012_175902"
+  "timestamp": "20251014_143714"
 }

@@ -7,24 +7,24 @@
   },
   "video_info": {
     "name": "ThesisMP4TEST3",
-    "analysis_timestamp": "20251012_175902"
+    "analysis_timestamp": "20251014_143714"
   },
   "performance_metrics": {
     "core_metrics": {
-      "average_confidence": 0.6286743223829072,
-      "average_inference_time_ms": 30.991001854607873,
-      "average_accuracy": 0.8748019017432647
+      "average_confidence": 0.6328072960942434,
+      "average_inference_time_ms": 26.001070267424907,
+      "average_accuracy": 0.820919175911252
     },
     "detection_stats": {
       "total_detections": 631,
-      "successful_recognitions": 552,
-      "recognition_rate": 0.8748019017432647
+      "successful_recognitions": 518,
+      "recognition_rate": 0.820919175911252
     },
     "advanced_tracking": {
       "back_view_detections": 5,
       "back_view_percentage": 0.7923930269413629,
-      "locked_detections": 552,
-      "locked_percentage": 87.48019017432647,
+      "locked_detections": 518,
+      "locked_percentage": 82.0919175911252,
       "unique_tracks": 1,
       "final_locked_tracks": 1
     }

@@ -1,0 +1,14 @@
+{
+  "model": "DlibCNN",
+  "metrics": {
+    "avg_confidence": 0.75,
+    "avg_inference_time_ms": 150.0,
+    "avg_accuracy": 1.0
+  },
+  "additional_stats": {
+    "total_detections": 1,
+    "unique_identities": 1,
+    "recognition_rate": 1.0
+  },
+  "timestamp": "20251014_141539"
+}

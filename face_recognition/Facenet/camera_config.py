@@ -6,7 +6,7 @@ Supports webcam, video files, and RTSP IP cameras (Tapo C200)
 # ==================== CAMERA SOURCE SETTINGS ====================
 
 # Camera Mode: "webcam", "video", or "rtsp"
-CAMERA_MODE = "webcam"  # Change to "rtsp" for Tapo camera
+CAMERA_MODE = "rtsp"  # Change to "rtsp" for Tapo camera
 
 # Webcam Settings
 WEBCAM_ID = 0  # Usually 0 for default webcam
@@ -17,10 +17,10 @@ VIDEO_FILE_PATH = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-Syste
 # RTSP Camera Settings (Tapo C200)
 RTSP_CAMERAS = {
     "tapo_c200_main": {
-        "ip": "192.168.1.245",
+        "ip": "192.168.1.234",
         "port": "554",
-        "username": "reactivecctv101",
-        "password": "reactivecctv101",
+        "username": "CakeyFudo",
+        "password": "xkobex62",
         "stream": "stream1",  # stream1 = 1080p, stream2 = 640x480
         "enabled": True
     },

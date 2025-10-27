@@ -7,7 +7,7 @@
   },
   "video_info": {
     "name": "ThesisMP4TEST3",
-    "analysis_timestamp": "20251012_173207"
+    "analysis_timestamp": "20251014_140551"
   },
   "performance_metrics": {
     "core_metrics": {
@@ -16,7 +16,7 @@
       "average_accuracy": 0.0
     },
     "detection_stats": {
-      "total_detections": 94,
+      "total_detections": 115,
       "successful_recognitions": 0,
       "recognition_rate": 0.0
     },

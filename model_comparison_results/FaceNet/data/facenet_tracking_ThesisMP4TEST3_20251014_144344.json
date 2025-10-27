@@ -1,0 +1,17 @@
+{
+  "model_name": "FaceNet",
+  "video_name": "ThesisMP4TEST3",
+  "timestamp": "20251014_144344",
+  "total_tracks": 1,
+  "track_details": {
+    "1": {
+      "name": "myke",
+      "confidence": 0.8177451519944258,
+      "is_locked": true,
+      "lock_strength": 0.9101443205431473,
+      "consecutive_back_frames": 0,
+      "total_face_detections": 141,
+      "frames_since_face_lost": 75
+    }
+  }
+}
