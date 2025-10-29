@@ -64,7 +64,8 @@ class IntegratedRecognitionSystem:
                  behavior_model_path='models/mobilenetv3-small/mobilenetv3_small_feature_extraction.pth',
                  device=None,
                  save_logs=False,
-                 min_class_conf: float = None):
+                 min_class_conf: float = None,
+                 smoothing_window: int = 7):
         """
         Initialize integrated system
         
@@ -74,9 +75,11 @@ class IntegratedRecognitionSystem:
             behavior_model_path: Path to MobileNetV3-Small behavior model
             device: Device to use ('cuda' or 'cpu')
             save_logs: Whether to save logs and frames
+            smoothing_window: Temporal smoothing window size (default: 7 frames)
         """
         self.device = device if device else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.save_logs = save_logs
+        self.smoothing_window = max(1, int(smoothing_window))
         
         print("\n" + "="*80)
         print("INITIALIZING INTEGRATED RECOGNITION SYSTEM")
@@ -223,7 +226,11 @@ class IntegratedRecognitionSystem:
         self.behavior_cache = {}  # {track_id: {'class': name, 'confidence': conf, 'last_frame': num}}
         self.behavior_interval = 10  # Classify every N frames
         
+        # Temporal smoothing: store recent probability vectors per track
+        self.prob_history = defaultdict(lambda: deque(maxlen=self.smoothing_window))
+        
         print(f"  ✓ Behavior classes: {self.behavior_classes}")
+        print(f"  ✓ Temporal smoothing window: {self.smoothing_window} frames")
     
     def _setup_logging(self):
         """Setup logging directories and CSV"""
@@ -670,7 +677,7 @@ class IntegratedRecognitionSystem:
         Classify behavior from person crop
         
         Returns:
-            dict: {'class_name': str, 'confidence': float}
+            dict: {'class_name': str, 'confidence': float, 'probs': np.ndarray}
         """
         try:
             # Convert BGR to RGB
@@ -685,6 +692,7 @@ class IntegratedRecognitionSystem:
                 outputs = self.behavior_model(crop_tensor)
                 probs = torch.nn.functional.softmax(outputs, dim=1)
                 confidence, predicted = torch.max(probs, 1)
+                probs_np = probs.squeeze(0).cpu().numpy()
             
             class_id = predicted.item()
             class_name = self.behavior_classes[class_id]
@@ -695,11 +703,19 @@ class IntegratedRecognitionSystem:
                 class_name = "Neutral"
                 conf = 1.0 - conf
             
-            return {'class_name': class_name, 'confidence': conf}
+            return {
+                'class_name': class_name, 
+                'confidence': conf,
+                'probs': probs_np
+            }
             
         except Exception as e:
             print(f"[ERROR] Behavior classification failed: {e}")
-            return {'class_name': 'Neutral', 'confidence': 0.0}
+            return {
+                'class_name': 'Neutral', 
+                'confidence': 0.0,
+                'probs': np.zeros(len(self.behavior_classes))
+            }
     
     def should_reclassify_behavior(self, track_id, current_frame):
         """Check if behavior should be re-classified for this track"""
@@ -979,8 +995,43 @@ class IntegratedRecognitionSystem:
                             if self.should_reclassify_behavior(track_id, frame_num):
                                 result = self.classify_behavior(person_crop)
                                 if result:
-                                    behavior_class = result['class']
-                                    behavior_conf = result['confidence']
+                                    # Store probability vector in history
+                                    probs = result.get('probs')
+                                    if probs is not None:
+                                        self.prob_history[track_id].append(probs)
+                                    
+                                    # Apply temporal smoothing if we have history
+                                    if len(self.prob_history[track_id]) > 0:
+                                        # Average probability vectors across recent frames
+                                        avg_probs = np.mean(list(self.prob_history[track_id]), axis=0)
+                                        
+                                        # Get final class from averaged probabilities
+                                        smoothed_class_id = np.argmax(avg_probs)
+                                        smoothed_conf = avg_probs[smoothed_class_id]
+                                        
+                                        # Apply confidence threshold to smoothed result
+                                        if smoothed_conf >= self.min_class_conf:
+                                            behavior_class = self.behavior_classes[smoothed_class_id]
+                                            behavior_conf = smoothed_conf
+                                        else:
+                                            behavior_class = "Neutral"
+                                            behavior_conf = smoothed_conf
+                                    else:
+                                        # Fallback to direct result
+                                        behavior_class = result['class_name']
+                                        behavior_conf = result['confidence']
+                                    
+                                    # Update cache with smoothed result
+                                    self.behavior_cache[track_id] = {
+                                        'class': behavior_class,
+                                        'confidence': behavior_conf,
+                                        'last_frame': frame_num
+                                    }
+                            else:
+                                # Use cached classification
+                                if track_id in self.behavior_cache:
+                                    behavior_class = self.behavior_cache[track_id]['class']
+                                    behavior_conf = self.behavior_cache[track_id]['confidence']
                         
                         # Check for alerts
                         alert_triggered = False
@@ -1185,6 +1236,8 @@ def main():
                        help='Device to use (default: auto-detect)')
     parser.add_argument('--min-class-conf', type=float, default=None,
                        help='Minimum behavior classification confidence (0-1) to accept behavior; below this will be treated as Neutral')
+    parser.add_argument('--smooth-window', type=int, default=7,
+                       help='Temporal smoothing window size in frames (default: 7)')
     
     args = parser.parse_args()
     
@@ -1198,7 +1251,8 @@ def main():
         behavior_model_path=args.behavior_model,
         device=args.device,
         save_logs=args.save_logs,
-        min_class_conf=args.min_class_conf
+        min_class_conf=args.min_class_conf,
+        smoothing_window=args.smooth_window
     )
     
     # Process video
