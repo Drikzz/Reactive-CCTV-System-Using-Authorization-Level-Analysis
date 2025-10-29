@@ -35,6 +35,8 @@ from pathlib import Path
 from datetime import datetime
 from collections import defaultdict, deque
 from PIL import Image
+from threading import Thread, Event
+from queue import Queue, Empty
 
 # Deep learning models
 from facenet_pytorch import MTCNN, InceptionResnetV1
@@ -97,6 +99,33 @@ class IntegratedRecognitionSystem:
         # Tracking state
         self.track_identities = {}  # {track_id: identity_info}
         self.track_behaviors = {}   # {track_id: behavior_info}
+        
+        # Enhanced face tracking with pose and body matching
+        self.track_face_history = defaultdict(lambda: deque(maxlen=90))  # Recent face recognitions
+        self.track_body_history = defaultdict(lambda: deque(maxlen=60))  # Body crops for matching
+        self.track_last_face_frame = {}  # {track_id: last frame with face detected}
+        
+        # Identity persistence settings
+        self.identity_memory_frames = 90
+        self.identity_confidence_decay = 0.995
+        self.min_identity_confidence = 0.15
+        self.face_lost_tolerance = 180
+        self.back_view_tolerance_frames = 600
+        self.body_match_threshold = 0.5
+        self.min_body_match_confidence = 0.4
+        
+        # ByteTrack tuning constants
+        self.bytetrack_track_thresh = 0.6    # High threshold for track confirmation
+        self.bytetrack_track_buffer = 90     # Frames to keep lost tracks
+        self.bytetrack_match_thresh = 0.7    # Matching threshold
+        
+        # Periodic face saving (for known faces)
+        self.known_last_saved = {}  # {name: last_save_datetime}
+        self.known_save_interval_minutes = 3  # Save known faces every N minutes
+        
+        # Threading settings
+        self.capture_queue_size = 4
+        self.display_queue_size = 2
         
         # Alert tracking
         self.alerts_sent = []
@@ -221,6 +250,207 @@ class IntegratedRecognitionSystem:
         
         print(f"  ✓ CSV logging to: {self.csv_path}")
     
+    def detect_person_pose_from_body(self, person_crop):
+        """
+        Detect if person is facing away based on body characteristics.
+        
+        Returns:
+            tuple: (pose, confidence) where pose is 'front', 'back', or 'side'
+        """
+        try:
+            if person_crop is None or person_crop.size == 0:
+                return ('unknown', 0.0)
+            
+            h, w = person_crop.shape[:2]
+            if h < 80 or w < 40:
+                return ('unknown', 0.0)
+            
+            gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+            
+            # Divide person into regions
+            head_region = gray[:h//3, :]          # Top 1/3
+            torso_region = gray[h//3:2*h//3, :]   # Middle 1/3
+            
+            # Analyze head region for back-of-head characteristics
+            head_edges = cv2.Canny(head_region, 30, 100)
+            head_edge_density = np.count_nonzero(head_edges) / max(head_edges.size, 1)
+            
+            # Analyze symmetry (back view tends to be more symmetric)
+            left_half = gray[:, :w//2]
+            right_half = cv2.flip(gray[:, w//2:], 1)
+            
+            # Resize to match if needed
+            min_w = min(left_half.shape[1], right_half.shape[1])
+            left_half = left_half[:, :min_w]
+            right_half = right_half[:, :min_w]
+            
+            # Calculate symmetry score
+            symmetry = cv2.matchTemplate(left_half, right_half, cv2.TM_CCOEFF_NORMED)[0][0]
+            
+            # Heuristic scoring
+            back_score = 0.0
+            
+            # Low edge density in head = smoother back of head
+            if head_edge_density < 0.15:
+                back_score += 0.3
+            
+            # High symmetry = likely back view
+            if symmetry > 0.7:
+                back_score += 0.4
+            elif symmetry > 0.5:
+                back_score += 0.2
+            
+            # Determine pose
+            if back_score > 0.5:
+                return ('back', back_score)
+            elif back_score > 0.3:
+                return ('side', 0.5)
+            else:
+                return ('front', 1.0 - back_score)
+                
+        except Exception as e:
+            return ('unknown', 0.0)
+    
+    def calculate_body_similarity(self, template_crop, current_crop):
+        """
+        Calculate body similarity score between two person crops.
+        Uses HSV color histograms with correlation.
+        
+        Returns:
+            float: Similarity score [0.0, 1.0] where 1.0 means identical
+        """
+        try:
+            if template_crop is None or current_crop is None:
+                return 0.0
+            
+            if template_crop.size == 0 or current_crop.size == 0:
+                return 0.0
+            
+            # Resize both to same size for comparison
+            target_size = (64, 128)
+            template_resized = cv2.resize(template_crop, target_size)
+            current_resized = cv2.resize(current_crop, target_size)
+            
+            # Convert to HSV
+            template_hsv = cv2.cvtColor(template_resized, cv2.COLOR_BGR2HSV)
+            current_hsv = cv2.cvtColor(current_resized, cv2.COLOR_BGR2HSV)
+            
+            # Calculate histograms
+            hist_bins = [30, 32]  # H, S bins
+            hist_ranges = [0, 180, 0, 256]  # H: 0-180, S: 0-256
+            
+            template_hist = cv2.calcHist([template_hsv], [0, 1], None, hist_bins, hist_ranges)
+            current_hist = cv2.calcHist([current_hsv], [0, 1], None, hist_bins, hist_ranges)
+            
+            # Normalize
+            cv2.normalize(template_hist, template_hist, 0, 1, cv2.NORM_MINMAX)
+            cv2.normalize(current_hist, current_hist, 0, 1, cv2.NORM_MINMAX)
+            
+            # Compare using correlation
+            similarity = cv2.compareHist(template_hist, current_hist, cv2.HISTCMP_CORREL)
+            
+            # Clamp to [0, 1]
+            similarity = max(0.0, min(1.0, similarity))
+            
+            return float(similarity)
+            
+        except Exception:
+            return 0.0
+    
+    def apply_clahe_rgb(self, rgb_image, clip_limit=2.0, tile_grid_size=8):
+        """
+        Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to RGB image.
+        Improves face detection in low-light conditions.
+        
+        Args:
+            rgb_image: RGB image (numpy array)
+            clip_limit: Threshold for contrast limiting
+            tile_grid_size: Size of grid for histogram equalization
+            
+        Returns:
+            Enhanced RGB image
+        """
+        if rgb_image is None or rgb_image.size == 0:
+            return rgb_image
+        
+        img = rgb_image
+        if img.dtype != 'uint8':
+            img = (np.clip(img, 0.0, 1.0) * 255).astype('uint8')
+        
+        # Convert to LAB color space
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Apply CLAHE to L channel
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_grid_size, tile_grid_size))
+        cl = clahe.apply(l)
+        
+        # Merge and convert back to RGB
+        limg = cv2.merge((cl, a, b))
+        return cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
+    
+    def estimate_brightness(self, gray_img):
+        """Return mean brightness of grayscale image"""
+        if gray_img is None or gray_img.size == 0:
+            return 0.0
+        return float(np.mean(gray_img))
+    
+    def auto_gamma_correction(self, img, target_mean=100.0, max_gamma=1.8, min_gamma=0.6):
+        """
+        Apply automatic gamma correction based on image brightness.
+        Brightens dark images, darkens overly bright images.
+        
+        Args:
+            img: BGR image
+            target_mean: Target mean brightness (0-255)
+            max_gamma: Maximum gamma value
+            min_gamma: Minimum gamma value
+            
+        Returns:
+            Gamma-corrected BGR image
+        """
+        if img is None or img.size == 0:
+            return img
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean = self.estimate_brightness(gray)
+        if mean <= 0:
+            return img
+        
+        gamma = float(target_mean) / float(mean)
+        gamma = max(min(gamma, max_gamma), min_gamma)
+        invGamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(256)]).astype('uint8')
+        return cv2.LUT(img, table)
+    
+    def filter_quality_faces(self, face_boxes, face_probs, min_size=30, min_prob=0.8):
+        """
+        Filter faces by size and detection confidence.
+        
+        Args:
+            face_boxes: Detected face bounding boxes
+            face_probs: Detection probabilities
+            min_size: Minimum face size (width or height)
+            min_prob: Minimum detection probability
+            
+        Returns:
+            Tuple of (filtered_boxes, filtered_probs) or (None, None)
+        """
+        if face_boxes is None or face_probs is None:
+            return None, None
+        
+        filtered_boxes = []
+        filtered_probs = []
+        
+        for box, prob in zip(face_boxes, face_probs):
+            face_area = (box[2] - box[0]) * (box[3] - box[1])
+            if prob >= min_prob and face_area >= min_size * min_size:
+                filtered_boxes.append(box)
+                filtered_probs.append(prob)
+        
+        return (np.array(filtered_boxes) if filtered_boxes else None, 
+                np.array(filtered_probs) if filtered_probs else None)
+    
     def recognize_face(self, person_crop, original_frame):
         """
         Recognize face within person crop
@@ -232,11 +462,26 @@ class IntegratedRecognitionSystem:
             return None
         
         try:
+            # Apply preprocessing for better face detection
+            processed_crop = person_crop.copy()
+            
+            # Auto gamma correction for low-light images
+            gray_check = cv2.cvtColor(processed_crop, cv2.COLOR_BGR2GRAY)
+            mean_brightness = self.estimate_brightness(gray_check)
+            if mean_brightness < 80:  # Image is dark
+                processed_crop = self.auto_gamma_correction(processed_crop, target_mean=100.0)
+            
             # Convert BGR to RGB
-            crop_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+            crop_rgb = cv2.cvtColor(processed_crop, cv2.COLOR_BGR2RGB)
+            
+            # Apply CLAHE for contrast enhancement
+            crop_rgb = self.apply_clahe_rgb(crop_rgb, clip_limit=2.0, tile_grid_size=8)
             
             # Detect faces with MTCNN
             face_boxes, face_probs = self.mtcnn.detect(crop_rgb)
+            
+            # Filter faces by quality
+            face_boxes, face_probs = self.filter_quality_faces(face_boxes, face_probs, min_size=30, min_prob=0.8)
             
             if face_boxes is None or len(face_boxes) == 0:
                 return None
@@ -245,9 +490,6 @@ class IntegratedRecognitionSystem:
             best_idx = np.argmax(face_probs)
             face_box = face_boxes[best_idx]
             face_prob = face_probs[best_idx]
-            
-            if face_prob < 0.9:  # Face detection confidence threshold
-                return None
             
             # Extract face crop
             x1, y1, x2, y2 = [int(c) for c in face_box]
@@ -290,6 +532,138 @@ class IntegratedRecognitionSystem:
         except Exception as e:
             print(f"[ERROR] Face recognition failed: {e}")
             return None
+    
+    def update_track_identity(self, track_id, face_result, person_crop, frame_num):
+        """
+        Enhanced identity tracking with pose detection and body matching.
+        
+        Args:
+            track_id: Track identifier
+            face_result: Result from recognize_face() or None
+            person_crop: Current person crop
+            frame_num: Current frame number
+        """
+        # Detect person pose
+        pose, pose_confidence = self.detect_person_pose_from_body(person_crop)
+        
+        # Initialize tracking data for new track
+        if track_id not in self.track_identities:
+            if face_result:
+                self.track_identities[track_id] = {
+                    'name': face_result['name'],
+                    'confidence': face_result['confidence'],
+                    'stable': False,
+                    'identity_locked': False,
+                    'lock_confidence_threshold': 0.75,
+                    'frames_confirmed': 0,
+                    'last_seen_frame': frame_num,
+                    'pose_history': deque(maxlen=30),
+                    'body_template': person_crop.copy() if person_crop is not None else None
+                }
+            else:
+                self.track_identities[track_id] = {
+                    'name': 'Unknown',
+                    'confidence': 0.0,
+                    'stable': False,
+                    'identity_locked': False,
+                    'lock_confidence_threshold': 0.75,
+                    'frames_confirmed': 0,
+                    'last_seen_frame': frame_num,
+                    'pose_history': deque(maxlen=30),
+                    'body_template': person_crop.copy() if person_crop is not None else None
+                }
+        
+        identity = self.track_identities[track_id]
+        identity['pose_history'].append((pose, pose_confidence, frame_num))
+        identity['last_seen_frame'] = frame_num
+        
+        # Store body crop for matching
+        if person_crop is not None and person_crop.size > 0:
+            self.track_body_history[track_id].append({
+                'crop': person_crop.copy(),
+                'frame': frame_num
+            })
+        
+        # Update face history
+        if face_result:
+            self.track_face_history[track_id].append({
+                'name': face_result['name'],
+                'confidence': face_result['confidence'],
+                'frame': frame_num,
+                'pose': pose,
+                'pose_conf': pose_confidence
+            })
+            self.track_last_face_frame[track_id] = frame_num
+        
+        # Handle identity updates
+        if face_result and face_result['name'] != 'Unknown':
+            name = face_result['name']
+            conf = face_result['confidence']
+            
+            # Lock identity if high confidence
+            if conf > identity['lock_confidence_threshold'] and not identity['identity_locked']:
+                identity['frames_confirmed'] += 1
+                if identity['frames_confirmed'] >= 5:
+                    identity['identity_locked'] = True
+                    identity['stable'] = True
+                    print(f"  [LOCKED] Track {track_id} → {name} (conf: {conf:.2f})")
+            
+            # Update if same person or unlocked
+            if identity['name'] == name or not identity['identity_locked']:
+                identity['name'] = name
+                identity['confidence'] = conf
+                identity['body_template'] = person_crop.copy()
+        
+        else:
+            # No face detected - handle based on pose and body matching
+            frames_since_face = frame_num - self.track_last_face_frame.get(track_id, frame_num)
+            
+            # If back view and identity is locked, maintain identity using body matching
+            if pose == 'back' and identity.get('identity_locked', False):
+                if frames_since_face < self.back_view_tolerance_frames:
+                    # Try body matching
+                    if identity.get('body_template') is not None:
+                        body_sim = self.calculate_body_similarity(identity['body_template'], person_crop)
+                        
+                        if body_sim > self.body_match_threshold:
+                            # Maintain identity with decayed confidence
+                            identity['confidence'] *= self.identity_confidence_decay
+                            identity['confidence'] = max(identity['confidence'], self.min_body_match_confidence)
+                        else:
+                            # Body doesn't match - decay faster
+                            identity['confidence'] *= 0.95
+                    else:
+                        # No body template - gentle decay
+                        identity['confidence'] *= self.identity_confidence_decay
+                else:
+                    # Too long without face - mark unstable
+                    identity['stable'] = False
+                    identity['confidence'] *= 0.9
+            else:
+                # Front/side view but no face - decay confidence
+                if frames_since_face > self.face_lost_tolerance:
+                    identity['stable'] = False
+                identity['confidence'] *= self.identity_confidence_decay
+        
+        # Prevent confidence from going too low for locked identities
+        if identity['identity_locked']:
+            identity['confidence'] = max(identity['confidence'], self.min_identity_confidence)
+        
+        # Stability check - but don't mark unstable if locked
+        if not identity['identity_locked'] and identity['confidence'] < self.min_identity_confidence:
+            identity['stable'] = False
+    
+    def get_track_identity(self, track_id):
+        """Get current identity for a track"""
+        if track_id in self.track_identities:
+            identity = self.track_identities[track_id]
+            return {
+                'name': identity['name'],
+                'confidence': identity['confidence'],
+                'stable': identity.get('stable', False),
+                'locked': identity.get('identity_locked', False)
+            }
+        return {'name': 'Unknown', 'confidence': 0.0, 'stable': False, 'locked': False}
     
     def classify_behavior(self, person_crop):
         """
@@ -414,263 +788,360 @@ class IntegratedRecognitionSystem:
         
         # TODO: Send to UI/notification system
     
-    def process_video(self, video_path, display=True, save_output=None,
-                     conf_threshold=0.5, iou_threshold=0.7):
+    def save_known_face(self, frame, person_crop, face_bbox, name, frame_num):
         """
-        Process video with integrated recognition
+        Periodically save known face detections to disk.
+        Only saves if minimum time interval has passed since last save.
         
         Args:
-            video_path: Path to video or 'webcam'
-            display: Show output window
-            save_output: Path to save output video
-            conf_threshold: YOLO confidence threshold
-            iou_threshold: YOLO IOU threshold
+            frame: Full frame
+            person_crop: Cropped person image
+            face_bbox: Face bounding box (x1, y1, x2, y2) in frame coordinates
+            name: Recognized person name
+            frame_num: Current frame number
         """
-        # Open video
-        if video_path == 'webcam':
-            cap = cv2.VideoCapture(0)
-        else:
-            cap = cv2.VideoCapture(video_path)
+        if not self.save_logs or name == "Unknown":
+            return
         
-        if not cap.isOpened():
-            raise ValueError(f"Failed to open video: {video_path}")
+        from datetime import datetime, timedelta
         
-        # Video properties
-        fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Check if enough time has passed since last save
+        now = datetime.now()
+        last_saved = self.known_last_saved.get(name, datetime.min)
         
-        print(f"\nProcessing: {video_path}")
-        print(f"Resolution: {width}x{height} @ {fps} FPS")
-        print(f"Total frames: {total_frames}")
+        if (now - last_saved).total_seconds() < self.known_save_interval_minutes * 60:
+            return  # Skip - too soon
         
-        # Video writer
-        writer = None
-        if save_output:
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(save_output, fourcc, fps, (width, height))
-            print(f"Saving output to: {save_output}")
+        # Update last saved time
+        self.known_last_saved[name] = now
         
-        # Processing loop
+        # Create known faces directory
+        known_dir = os.path.join("logs", "main_system", "known_faces", name)
+        os.makedirs(known_dir, exist_ok=True)
+        
+        timestamp = now.strftime("%Y%m%d_%H%M%S_%f")
+        
+        # Save full frame with annotation
+        frame_annotated = frame.copy()
+        if face_bbox is not None:
+            x1, y1, x2, y2 = [int(c) for c in face_bbox]
+            cv2.rectangle(frame_annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(frame_annotated, name, (x1, y1 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        frame_path = os.path.join(known_dir, f"frame_{timestamp}_f{frame_num}.jpg")
+        cv2.imwrite(frame_path, frame_annotated)
+        
+        # Save person crop
+        if person_crop is not None and person_crop.size > 0:
+            crop_path = os.path.join(known_dir, f"crop_{timestamp}_f{frame_num}.jpg")
+            cv2.imwrite(crop_path, person_crop)
+    
+    def grab_frames(self, cap, frame_q, stop_event):
+        """
+        Capture frames from video source and put into queue.
+        Runs in separate thread.
+        """
         frame_num = 0
-        start_time = time.time()
-        
         try:
-            while True:
+            while not stop_event.is_set():
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                frame_num += 1
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                timestamp = time.time()
                 
-                # YOLO tracking
+                # Put frame in queue (blocks if queue is full)
+                try:
+                    frame_q.put((frame_num, timestamp, frame), timeout=1.0)
+                    frame_num += 1
+                except:
+                    # Queue full, skip frame
+                    continue
+                    
+        except Exception as e:
+            print(f"[ERROR] Frame capture error: {e}")
+        finally:
+            stop_event.set()
+    
+    def display_frames(self, display_q, stop_event):
+        """
+        Display processed frames from queue.
+        Runs in separate thread.
+        """
+        while not stop_event.is_set() or not display_q.empty():
+            try:
+                frame_data = display_q.get(timeout=0.5)
+                if frame_data is None:
+                    continue
+                
+                frame_num, annotated_frame, fps_text = frame_data
+                
+                # Add FPS text
+                cv2.putText(annotated_frame, fps_text, (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                
+                # Display
+                cv2.imshow('Integrated Recognition System', annotated_frame)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:  # q or ESC
+                    stop_event.set()
+                    break
+                    
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[ERROR] Display error: {e}")
+                break
+        
+        cv2.destroyAllWindows()
+    
+    def process_frames(self, frame_q, display_q, stop_event, display_enabled,
+                      conf_threshold, iou_threshold):
+        """
+        Process frames with face + behavior recognition.
+        Runs in separate thread (main processing logic).
+        """
+        processed = 0
+        frame_times = deque(maxlen=30)
+        
+        while not stop_event.is_set() or not frame_q.empty():
+            try:
+                # Get frame from queue
+                frame_data = frame_q.get(timeout=0.5)
+                if frame_data is None:
+                    continue
+                
+                frame_num, timestamp, frame = frame_data
+                t_start = time.time()
+                
+                # YOLO person detection with ByteTrack
                 results = self.yolo.track(
                     frame,
                     persist=True,
-                    tracker='bytetrack.yaml',
-                    classes=[0],  # Person class
                     conf=conf_threshold,
                     iou=iou_threshold,
-                    verbose=False
+                    classes=[0],  # person class
+                    verbose=False,
+                    # ByteTrack tuning (if supported by ultralytics version):
+                    # tracker='bytetrack.yaml',
+                    # track_thresh=self.bytetrack_track_thresh,
+                    # track_buffer=self.bytetrack_track_buffer,
+                    # match_thresh=self.bytetrack_match_thresh
                 )
                 
-                # Process detections
-                frame_identities = []
+                annotated_frame = frame.copy()
+                frame_identities = {}  # Track identities in current frame
                 
-                if results[0].boxes is not None and results[0].boxes.id is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                    confidences = results[0].boxes.conf.cpu().numpy()
+                # Process detections
+                if results and len(results) > 0 and results[0].boxes is not None:
+                    boxes = results[0].boxes
                     
-                    for box, track_id, conf in zip(boxes, track_ids, confidences):
-                        x1, y1, x2, y2 = map(int, box)
+                    for i, box in enumerate(boxes):
+                        # Get bounding box
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                        confidence = float(box.conf[0])
                         
-                        # Crop person
+                        # Get track ID (ByteTrack)
+                        if box.id is not None:
+                            track_id = int(box.id[0])
+                        else:
+                            continue
+                        
+                        # Extract person crop
                         person_crop = frame[y1:y2, x1:x2]
-                        
                         if person_crop.size == 0:
                             continue
                         
                         # Face recognition
                         face_result = self.recognize_face(person_crop, frame)
                         
-                        if face_result is None:
-                            name = "Unknown"
-                            face_conf = 0.0
-                        else:
-                            name = face_result['name']
-                            face_conf = face_result['confidence']
+                        # Update identity tracking with pose and body matching
+                        self.update_track_identity(track_id, face_result, person_crop, frame_num)
+                        
+                        # Get tracked identity (with persistence)
+                        name = self.get_track_identity(track_id)
+                        
+                        # Save known faces periodically
+                        if name != "Unknown" and face_result is not None:
+                            self.save_known_face(frame, person_crop, None, name, frame_num)
                         
                         # Get authorization level
                         auth_level = get_authorization_level(name)
+                        frame_identities[track_id] = {'name': name, 'auth_level': auth_level}
                         
-                        # Behavior recognition (only if required)
-                        behavior_class = "N/A"
+                        # Behavior classification
+                        behavior_class = "Neutral"
                         behavior_conf = 0.0
                         
                         if should_monitor_behavior(auth_level):
                             if self.should_reclassify_behavior(track_id, frame_num):
-                                behavior_result = self.classify_behavior(person_crop)
-                                behavior_class = behavior_result['class_name']
-                                behavior_conf = behavior_result['confidence']
-                                
-                                # Cache behavior
-                                self.behavior_cache[track_id] = {
-                                    'class': behavior_class,
-                                    'confidence': behavior_conf,
-                                    'last_frame': frame_num
-                                }
-                            else:
-                                # Use cached behavior
-                                cached = self.behavior_cache.get(track_id, {})
-                                behavior_class = cached.get('class', 'Neutral')
-                                behavior_conf = cached.get('confidence', 0.0)
+                                result = self.classify_behavior(person_crop)
+                                if result:
+                                    behavior_class = result['class']
+                                    behavior_conf = result['confidence']
                         
-                        # Store identity for frame
-                        identity_info = {
-                            'track_id': track_id,
-                            'name': name,
-                            'face_conf': face_conf,
-                            'auth_level': auth_level,
-                            'behavior': behavior_class,
-                            'behavior_conf': behavior_conf,
-                            'bbox': (x1, y1, x2, y2),
-                            'crop': person_crop
-                        }
-                        frame_identities.append(identity_info)
-                
-                # Check if authorized person present
-                authorized_present = self.check_authorized_present(frame_identities)
-                
-                # Process alerts and logging
-                for identity in frame_identities:
-                    track_id = identity['track_id']
-                    name = identity['name']
-                    auth_level = identity['auth_level']
-                    behavior_class = identity['behavior']
-                    behavior_conf = identity['behavior_conf']
-                    
-                    alert_triggered = False
-                    
-                    # UNAUTHORIZED: Always log and alert (they shouldn't be there)
-                    if auth_level == UNAUTHORIZED:
-                        if self.can_send_alert(track_id):
-                            # Send alert
-                            self.send_alert(track_id, name, auth_level, behavior_class, frame_num)
-                            alert_triggered = True
+                        # Check for alerts
+                        alert_triggered = False
+                        authorized_present = self.check_authorized_present(frame_identities)
                         
-                        # Always save frames for unauthorized persons
-                        if self.save_logs:
-                            self.save_alert_frames(
-                                frame, identity['crop'], track_id, name, 
-                                auth_level, behavior_class, frame_num
-                            )
-                    
-                    # PARTIAL: Conditional alerts, but always log suspicious behavior
-                    elif auth_level == PARTIAL and is_suspicious_behavior(behavior_class):
                         if should_trigger_alert(auth_level, behavior_class, authorized_present):
-                            # No authorized present - send alert
                             if self.can_send_alert(track_id):
                                 self.send_alert(track_id, name, auth_level, behavior_class, frame_num)
                                 alert_triggered = True
+                                
+                                if self.save_logs:
+                                    self.save_alert_frames(frame, person_crop, track_id, name, 
+                                                          auth_level, behavior_class, frame_num)
                         
-                        # Always log suspicious behavior (even if alert suppressed by authorized presence)
+                        # Log data
                         if self.save_logs:
-                            if alert_triggered:
-                                # Use alert directory
-                                self.save_alert_frames(
-                                    frame, identity['crop'], track_id, name, 
-                                    auth_level, behavior_class, frame_num
-                                )
-                            else:
-                                # Use suspicious behavior directory (authorized present, no alert)
-                                suspicious_dir = "logs/main_system/suspicious_behavior"
-                                os.makedirs(suspicious_dir, exist_ok=True)
-                                ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                                
-                                # Save BOTH full frame and cropped frame
-                                full_path = os.path.join(suspicious_dir, 
-                                                        f"suspicious_full_{ts}_t{track_id}_f{frame_num}.jpg")
-                                cv2.imwrite(full_path, frame)
-                                
-                                crop_path = os.path.join(suspicious_dir, 
-                                                        f"suspicious_crop_{ts}_t{track_id}_f{frame_num}.jpg")
-                                cv2.imwrite(crop_path, identity['crop'])
-                    
-                    # Log to CSV
-                    self.log_frame_data(
-                        timestamp, frame_num, track_id, name, auth_level,
-                        behavior_class, behavior_conf, alert_triggered
-                    )
-                    
-                    # Annotate frame
-                    x1, y1, x2, y2 = identity['bbox']
-                    color = get_level_color(auth_level)
-                    thickness = get_level_thickness(auth_level)
-                    
-                    # Draw box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                    
-                    # Draw label
-                    label = format_display_name(name, auth_level, behavior_class if should_monitor_behavior(auth_level) else None)
-                    label_with_conf = f"{label} ({identity['face_conf']:.2f})"
-                    
-                    # Background for text
-                    (text_w, text_h), _ = cv2.getTextSize(label_with_conf, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                    cv2.rectangle(frame, (x1, y1 - text_h - 10), (x1 + text_w, y1), color, -1)
-                    cv2.putText(frame, label_with_conf, (x1, y1 - 5), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    
-                    # Show behavior confidence if monitored
-                    if should_monitor_behavior(auth_level) and behavior_class != "N/A":
-                        behavior_text = f"{behavior_class}: {behavior_conf:.2f}"
-                        cv2.putText(frame, behavior_text, (x1, y2 + 20),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                            self.log_frame_data(timestamp, frame_num, track_id, name, auth_level,
+                                              behavior_class, behavior_conf, alert_triggered)
+                        
+                        # Draw annotations
+                        display_name = format_display_name(name, auth_level)
+                        color = get_level_color(auth_level)
+                        thickness = get_level_thickness(auth_level)
+                        
+                        # Bounding box
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, thickness)
+                        
+                        # Identity label
+                        label = f"{display_name} ({confidence:.2f})"
+                        label_y = y1 - 10 if y1 > 30 else y1 + 20
+                        cv2.putText(annotated_frame, label, (x1, label_y),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        
+                        # Behavior label (if monitored)
+                        if should_monitor_behavior(auth_level) and behavior_class != "Neutral":
+                            behavior_label = f"{behavior_class} ({behavior_conf:.2f})"
+                            behavior_y = y2 + 20
+                            
+                            # Color code suspicious behavior
+                            behavior_color = (0, 0, 255) if is_suspicious_behavior(behavior_class) else (255, 255, 0)
+                            cv2.putText(annotated_frame, behavior_label, (x1, behavior_y),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, behavior_color, 2)
                 
-                # Draw info overlay
-                info_text = f"Frame: {frame_num}/{total_frames} | Auth Present: {authorized_present} | Tracks: {len(frame_identities)}"
-                cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                # Calculate FPS
+                t_end = time.time()
+                frame_times.append(t_end - t_start)
+                avg_time = sum(frame_times) / len(frame_times)
+                fps = 1.0 / avg_time if avg_time > 0 else 0
+                fps_text = f"FPS: {fps:.1f}"
                 
-                # Write frame
-                if writer:
-                    writer.write(frame)
+                processed += 1
                 
-                # Display
-                if display:
-                    cv2.imshow('Integrated Recognition System', frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
+                # Put result in display queue (if display enabled)
+                if display_enabled:
+                    try:
+                        display_q.put((frame_num, annotated_frame, fps_text), timeout=0.1)
+                    except:
+                        pass  # Display queue full, skip
                 
-                # Progress
-                if frame_num % 30 == 0:
-                    elapsed = time.time() - start_time
-                    current_fps = frame_num / elapsed if elapsed > 0 else 0
-                    print(f"  Processed {frame_num}/{total_frames} frames @ {current_fps:.1f} FPS")
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"[ERROR] Frame processing error: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
         
-        finally:
-            cap.release()
-            if writer:
-                writer.release()
+        print(f"\n[INFO] Processed {processed} frames")
+    
+    def process_video(self, video_path, display=True, save_output=None,
+                     conf_threshold=0.5, iou_threshold=0.7):
+        """
+        Process video with integrated recognition using multi-threading
+        
+        Args:
+            video_path: Path to video or 'webcam'
+            display: Show output window
+            save_output: Path to save output video (Note: Not implemented in threaded version)
+            conf_threshold: YOLO confidence threshold
+            iou_threshold: YOLO IOU threshold
+        """
+        print("\n[INFO] Starting threaded processing pipeline...")
+        
+        # Open video
+        if video_path == 'webcam':
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize buffer for live camera
+        else:
+            cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
+        
+        # Get video info
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        print(f"[INFO] Video: {width}x{height} @ {fps:.1f}fps, {total_frames} frames")
+        
+        # Create queues and stop event
+        frame_q = Queue(maxsize=self.capture_queue_size)
+        display_q = Queue(maxsize=self.display_queue_size)
+        stop_event = Event()
+        
+        # Start threads
+        capture_thread = Thread(target=self.grab_frames, args=(cap, frame_q, stop_event))
+        process_thread = Thread(target=self.process_frames, 
+                               args=(frame_q, display_q, stop_event, display, 
+                                     conf_threshold, iou_threshold))
+        display_thread = Thread(target=self.display_frames, args=(display_q, stop_event))
+        
+        capture_thread.daemon = True
+        process_thread.daemon = True
+        display_thread.daemon = True
+        
+        try:
+            print("[INFO] Starting capture thread...")
+            capture_thread.start()
+            
+            print("[INFO] Starting processing thread...")
+            process_thread.start()
+            
             if display:
-                cv2.destroyAllWindows()
-        
-        # Final statistics
-        elapsed = time.time() - start_time
-        avg_fps = frame_num / elapsed if elapsed > 0 else 0
+                print("[INFO] Starting display thread...")
+                display_thread.start()
+            
+            # Wait for processing to complete
+            capture_thread.join()
+            process_thread.join()
+            
+            if display:
+                display_thread.join()
+            
+            print("[INFO] All threads completed")
+            
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted by user")
+        except Exception as e:
+            print(f"[ERROR] Processing error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            stop_event.set()
+            cap.release()
+            
+            # Wait for threads to finish
+            if capture_thread.is_alive():
+                capture_thread.join(timeout=2.0)
+            if process_thread.is_alive():
+                process_thread.join(timeout=2.0)
+            if display and display_thread.is_alive():
+                display_thread.join(timeout=2.0)
         
         print("\n" + "="*80)
         print("PROCESSING COMPLETE")
         print("="*80)
-        print(f"Total frames: {frame_num}")
-        print(f"Total time: {elapsed:.2f}s")
-        print(f"Average FPS: {avg_fps:.2f}")
         print(f"Alerts sent: {len(self.alerts_sent)}")
-        
         if self.save_logs:
             print(f"CSV log: {self.csv_path}")
-        
         print("="*80 + "\n")
 
 
