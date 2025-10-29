@@ -149,8 +149,13 @@ class IntegratedRecognitionSystem:
         centroids_path = os.path.join(models_dir, 'class_centroids.pkl')
         if os.path.exists(centroids_path):
             import pickle
-            with open(centroids_path, 'rb') as f:
-                self.centroids = pickle.load(f)
+            try:
+                with open(centroids_path, 'rb') as f:
+                    self.centroids = pickle.load(f)
+                print(f"  ✓ Loaded class centroids for {len(self.centroids)} classes")
+            except Exception as e:
+                print(f"  ⚠ Warning: Could not load centroids ({e}). Using decision function fallback.")
+                self.centroids = None
         else:
             self.centroids = None
         
