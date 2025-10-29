@@ -1,0 +1,25 @@
+============================================================
+TRAINING SUMMARY - TRANSFER LEARNING (MobileNetV3-Small)
+============================================================
+Training Mode: Transfer Learning (Full Fine-Tuning)
+Total Epochs: 30
+Best Val Acc: 84.03% (Epoch 10)
+Final Train Loss: 0.1116
+Final Val Loss: 0.5601
+Final Train Acc: 96.73%
+Final Val Acc: 81.93%
+Train-Val Gap: 14.80%
+Status: ⚠️ Moderate overfitting
+
+============================================================
+FINAL TEST EVALUATION
+============================================================
+Overall Test Accuracy: 83.05%
+Per-class test accuracy:
+  holding-object: 73.3% (22/30)
+  opening-cabinet: 79.3% (23/29)
+  opening-door: 90.0% (27/30)
+  using-computer: 89.7% (26/29)
+Saved plots: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv3-small/mobilenet_v3_small_transfer_training_curves.png
+Saved summary: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/mobilenetv3-small/mobilenet_v3_small_transfer_training_summary.txt
+Total training time: 3.95 minutes

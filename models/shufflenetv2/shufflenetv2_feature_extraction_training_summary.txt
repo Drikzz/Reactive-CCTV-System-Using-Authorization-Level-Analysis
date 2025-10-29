@@ -1,0 +1,26 @@
+============================================================
+TRAINING SUMMARY - FEATURE EXTRACTION (ShuffleNetV2)
+============================================================
+Training Mode: Feature Extraction (Frozen Backbone)
+Total Epochs: 18
+Best Val Acc: 69.33% (Epoch 8)
+Final Train Loss: 1.1488
+Final Val Loss: 1.1489
+Final Train Acc: 66.34%
+Final Val Acc: 67.65%
+Train-Val Gap: -1.30%
+Status: ✅ Excellent
+
+============================================================
+FINAL TEST EVALUATION
+============================================================
+Overall Test Accuracy: 75.42%
+Per-class test accuracy:
+  holding-object: 76.7% (23/30)
+  opening-cabinet: 58.6% (17/29)
+  opening-door: 83.3% (25/30)
+  using-computer: 82.8% (24/29)
+Trainable parameters: 4,100 / 1,257,704
+Saved plots: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/shufflenetv2/shufflenetv2_feature_extraction_training_curves.png
+Saved summary: /content/Reactive-CCTV-System-Using-Authorization-Level-Analysis/models/shufflenetv2/shufflenetv2_feature_extraction_training_summary.txt
+Total training time: 2.30 minutes
