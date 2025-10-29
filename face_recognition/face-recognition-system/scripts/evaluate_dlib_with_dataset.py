@@ -254,6 +254,13 @@ def main():
     print(f"  Processed: {stats['total']}")
     print(f"  Recognized (not 'Unknown'): {stats['recognized']} ({(stats['recognized'] / stats['total'] * 100) if stats['total'] else 0:.1f}%)")
     print(f"  Correct (predicted == ground_truth): {stats['correct']} ({(stats['correct'] / stats['total'] * 100) if stats['total'] else 0:.1f}%)")
+    # prediction-accuracy = how correct the predictions are (correct / recognized)
+    if stats["recognized"]:
+        pred_acc = stats["correct"] / stats["recognized"]
+        print(f"  Prediction accuracy (correct / recognized): {stats['correct']}/{stats['recognized']} ({pred_acc*100:.1f}%)")
+    else:
+        print("  Prediction accuracy (correct / recognized): no predictions made")
+    # accuracy over GT and F1
     if with_gt:
         print(f"  Accuracy over rows with GT: {correct_with_gt}/{with_gt} ({(correct_with_gt / with_gt * 100):.1f}%)")
     else:
@@ -262,6 +269,22 @@ def main():
         print(f"  Dataset-based agreement: {correct_vs_dataset}/{with_ds} ({(correct_vs_dataset / with_ds * 100):.1f}%)")
     else:
         print("  Dataset-based agreement: no dataset matches computed")
+    # compute precision/recall/F1 where possible
+    try:
+        precision = (stats["correct"] / stats["recognized"]) if stats["recognized"] else float("nan")
+    except Exception:
+        precision = float("nan")
+    try:
+        recall = (correct_with_gt / with_gt) if with_gt else float("nan")
+    except Exception:
+        recall = float("nan")
+    f1 = (2 * precision * recall / (precision + recall)) if (precision and recall and not (precision != precision or recall != recall)) else float("nan")
+    if not (precision != precision):
+        print(f"  Precision (correct/recognized): {precision*100:.1f}%")
+    if not (recall != recall):
+        print(f"  Recall (correct/with_GT): {recall*100:.1f}%")
+    if not (f1 != f1):
+        print(f"  F1 score: {f1:.3f}")
     print(f"  Avg time / image: {avg_time:.4f}s")
     print(f"  Avg confidence (recognized): {avg_conf:.3f}")
     print(f"  Top predicted names: {stats['names'].most_common(10)}")
