@@ -468,6 +468,11 @@ class IntegratedRecognitionSystem:
         if person_crop is None or person_crop.size == 0:
             return None
         
+        # Check minimum person crop size to avoid kernel size errors
+        h, w = person_crop.shape[:2]
+        if h < 40 or w < 40:
+            return None  # Crop too small for reliable face detection
+        
         try:
             # Apply preprocessing for better face detection
             processed_crop = person_crop.copy()
@@ -506,10 +511,18 @@ class IntegratedRecognitionSystem:
             if x2 <= x1 or y2 <= y1:
                 return None
             
+            # Check face crop size
+            face_w, face_h = x2 - x1, y2 - y1
+            if face_w < 20 or face_h < 20:
+                return None  # Face too small for embedding extraction
+            
             face_crop = crop_rgb[y1:y2, x1:x2]
             
+            # Resize face to 160x160 to avoid kernel size errors (like facenet_main.py)
+            face_resized = cv2.resize(face_crop, (160, 160))
+            
             # Get embedding
-            face_pil = Image.fromarray(face_crop)
+            face_pil = Image.fromarray(face_resized)
             face_tensor = transforms.functional.to_tensor(face_pil).unsqueeze(0).to(self.device)
             
             with torch.no_grad():
@@ -730,12 +743,12 @@ class IntegratedRecognitionSystem:
         Check if any authorized person is present in current frame
         
         Args:
-            frame_identities: List of identity dicts for current frame
+            frame_identities: Dict of {track_id: {'name': str, 'auth_level': str}}
         
         Returns:
             bool: True if at least one authorized person present
         """
-        for identity in frame_identities:
+        for identity in frame_identities.values():
             if identity.get('auth_level') == AUTHORIZED:
                 return True
         return False
@@ -914,10 +927,13 @@ class IntegratedRecognitionSystem:
         cv2.destroyAllWindows()
     
     def process_frames(self, frame_q, display_q, stop_event, display_enabled,
-                      conf_threshold, iou_threshold):
+                      conf_threshold, iou_threshold, video_writer=None):
         """
         Process frames with face + behavior recognition.
         Runs in separate thread (main processing logic).
+        
+        Args:
+            video_writer: Optional cv2.VideoWriter for saving output video
         """
         processed = 0
         frame_times = deque(maxlen=30)
@@ -977,7 +993,9 @@ class IntegratedRecognitionSystem:
                         self.update_track_identity(track_id, face_result, person_crop, frame_num)
                         
                         # Get tracked identity (with persistence)
-                        name = self.get_track_identity(track_id)
+                        identity_info = self.get_track_identity(track_id)
+                        name = identity_info['name']
+                        confidence = identity_info['confidence']
                         
                         # Save known faces periodically
                         if name != "Unknown" and face_result is not None:
@@ -1084,6 +1102,14 @@ class IntegratedRecognitionSystem:
                 
                 processed += 1
                 
+                # Save to video file if writer is available
+                if video_writer is not None:
+                    # Add FPS text to saved video
+                    output_frame = annotated_frame.copy()
+                    cv2.putText(output_frame, fps_text, (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    video_writer.write(output_frame)
+                
                 # Put result in display queue (if display enabled)
                 if display_enabled:
                     try:
@@ -1100,6 +1126,11 @@ class IntegratedRecognitionSystem:
                 continue
         
         print(f"\n[INFO] Processed {processed} frames")
+        
+        # Close video writer if it exists
+        if video_writer is not None:
+            video_writer.release()
+            print(f"[INFO] Video saved successfully")
     
     def process_video(self, video_path, display=True, save_output=None,
                      conf_threshold=0.5, iou_threshold=0.7):
@@ -1109,7 +1140,7 @@ class IntegratedRecognitionSystem:
         Args:
             video_path: Path to video or 'webcam'
             display: Show output window
-            save_output: Path to save output video (Note: Not implemented in threaded version)
+            save_output: Path to save output video (mp4 format recommended)
             conf_threshold: YOLO confidence threshold
             iou_threshold: YOLO IOU threshold
         """
@@ -1133,6 +1164,23 @@ class IntegratedRecognitionSystem:
         
         print(f"[INFO] Video: {width}x{height} @ {fps:.1f}fps, {total_frames} frames")
         
+        # Setup video writer if save_output is specified
+        video_writer = None
+        if save_output:
+            # Create output directory if needed
+            output_path = Path(save_output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Define codec and create VideoWriter
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID', 'MJPG'
+            video_writer = cv2.VideoWriter(str(save_output), fourcc, fps, (width, height))
+            
+            if not video_writer.isOpened():
+                print(f"[WARNING] Failed to create video writer for {save_output}")
+                video_writer = None
+            else:
+                print(f"[INFO] Saving output video to: {save_output}")
+        
         # Create queues and stop event
         frame_q = Queue(maxsize=self.capture_queue_size)
         display_q = Queue(maxsize=self.display_queue_size)
@@ -1142,7 +1190,7 @@ class IntegratedRecognitionSystem:
         capture_thread = Thread(target=self.grab_frames, args=(cap, frame_q, stop_event))
         process_thread = Thread(target=self.process_frames, 
                                args=(frame_q, display_q, stop_event, display, 
-                                     conf_threshold, iou_threshold))
+                                     conf_threshold, iou_threshold, video_writer))
         display_thread = Thread(target=self.display_frames, args=(display_q, stop_event))
         
         capture_thread.daemon = True
@@ -1179,6 +1227,10 @@ class IntegratedRecognitionSystem:
             stop_event.set()
             cap.release()
             
+            # Close video writer if it exists
+            if video_writer is not None:
+                video_writer.release()
+            
             # Wait for threads to finish
             if capture_thread.is_alive():
                 capture_thread.join(timeout=2.0)
@@ -1193,6 +1245,8 @@ class IntegratedRecognitionSystem:
         print(f"Alerts sent: {len(self.alerts_sent)}")
         if self.save_logs:
             print(f"CSV log: {self.csv_path}")
+        if save_output:
+            print(f"Output video: {save_output}")
         print("="*80 + "\n")
 
 
