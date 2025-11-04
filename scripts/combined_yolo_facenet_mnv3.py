@@ -23,10 +23,14 @@ class CombinedYOLOFaceBehavior:
      - YOLOv8 + ByteTrack -> detection + tracking
      - MobileNetV3-Small -> behavior classification (per-track caching + smoothing)
      - FaceNet (from facenet_main.py) -> face recognition per track
+     - Authorization logic based on recognized identity
     """
     def __init__(self, yolo_path, mobilenet_path, facenet_main_path, device=None, tracker_cfg="bytetrack.yaml",
                  reclass_interval=10, smooth_window=7, min_class_conf=0.6, recog_interval=5,
-                 iou_update_threshold=0.3, centroid_update_px=80, identity_lock_frames=30, identity_lock_conf=0.90):
+                 iou_update_threshold=0.3, centroid_update_px=80, identity_lock_frames=30, identity_lock_conf=0.90,
+                 frame_skip=1, use_half_precision=True, resize_factor=1.0,
+                 # NEW: Recognition quality parameters
+                 min_face_size=80, face_quality_threshold=0.3, consensus_window=5):
         # Load YOLO+tracker/mobilenet module (the tracker class file)
         yolo_mnv_path = Path(REPO_ROOT) / "behavior_recognition" / "mobilenetv3-small" / "yolo_mobilenet_tracker_mnv3small.py"
         if Path(yolo_path).exists():
@@ -91,6 +95,102 @@ class CombinedYOLOFaceBehavior:
         self.identity_lock_frames = int(identity_lock_frames)
         self.identity_lock_conf = float(identity_lock_conf)
 
+        # NEW: Authorization mapping
+        # Maps identity name to authorization level
+        self.authorization_map = {
+            "myke": "Authorized",
+            "dean": "Partially Authorized",
+            # Add other names with their authorization levels here
+            # Default for recognized but not in map will be "Authorized"
+        }
+
+        # NEW: Performance settings
+        self.frame_skip = int(frame_skip)  # Process every Nth frame
+        self.use_half_precision = use_half_precision and device == "cuda"
+        self.resize_factor = float(resize_factor)  # Scale input frames (0.5 = half size)
+        
+        # Convert models to half precision if enabled
+        # Note: YOLO FP16 is handled via half=True in track() call
+        # MobileNet: skip half precision conversion (tracker's _classify_crop doesn't handle it)
+        # Only YOLO will use FP16 via the half=True parameter in track()
+        if self.use_half_precision:
+            print("[INFO] Using FP16 (half precision) for YOLO (MobileNet stays FP32)")
+        else:
+            self.tracker.use_half = False
+
+        # NEW: Recognition quality settings
+        self.min_face_size = int(min_face_size)  # Minimum crop size for face recognition
+        self.face_quality_threshold = float(face_quality_threshold)  # Blur/quality threshold
+        self.consensus_window = int(consensus_window)  # Number of recent recognitions to average
+        self.track_recognition_history = defaultdict(lambda: deque(maxlen=consensus_window))
+
+    def get_authorization_level(self, identity_name):
+        """
+        Determine authorization level based on identity.
+        
+        Args:
+            identity_name: Name returned by face recognition
+            
+        Returns:
+            str: Authorization level ("Authorized", "Partially Authorized", "Unauthorized")
+        """
+        if identity_name == "Unknown":
+            return "Unauthorized"
+        
+        # Normalize name for case-insensitive lookup
+        name_lower = identity_name.lower()
+        
+        # Check if specific authorization level is defined
+        if name_lower in self.authorization_map:
+            return self.authorization_map[name_lower]
+        
+        # Default: any recognized person is Authorized unless specified otherwise
+        return "Authorized"
+
+    def get_authorization_color(self, auth_level):
+        """
+        Get color for authorization level visualization.
+        
+        Args:
+            auth_level: Authorization level string
+            
+        Returns:
+            tuple: BGR color tuple
+        """
+        color_map = {
+            "Authorized": (0, 255, 0),           # Green
+            "Partially Authorized": (0, 165, 255),  # Orange
+            "Unauthorized": (0, 0, 255)          # Red
+        }
+        return color_map.get(auth_level, (128, 128, 128))  # Gray as fallback
+
+    def _estimate_blur(self, image):
+        """Estimate image blur using Laplacian variance (higher = sharper)"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+    def _get_consensus_identity(self, track_id):
+        """Get most frequent identity from recent recognitions"""
+        history = self.track_recognition_history[track_id]
+        if not history:
+            return "Unknown", 0.0
+        
+        # Count occurrences and average confidence per identity
+        from collections import Counter
+        names = [name for name, conf in history if name != "Unknown"]
+        if not names:
+            return "Unknown", 0.0
+        
+        # Most common name
+        name_counts = Counter(names)
+        most_common_name = name_counts.most_common(1)[0][0]
+        
+        # Average confidence for that name
+        confs = [conf for name, conf in history if name == most_common_name]
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+        
+        return most_common_name, avg_conf
+
     def process_video(self, video_source, display=True, save_output=None, conf_threshold=0.5, iou_threshold=0.7):
         # Open video
         if video_source == "webcam":
@@ -119,23 +219,46 @@ class CombinedYOLOFaceBehavior:
         fps_window = []
         print(f"Processing {video_source} ({width}x{height} @ {fps}fps)")
 
+        # NEW: Resize frame dimensions if resize_factor < 1.0
+        if self.resize_factor < 1.0:
+            process_width = int(width * self.resize_factor)
+            process_height = int(height * self.resize_factor)
+            print(f"[INFO] Processing at {process_width}x{process_height} (resize_factor={self.resize_factor})")
+        else:
+            process_width, process_height = width, height
+
         try:
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 frame_idx += 1
+                
+                # NEW: Skip frames for performance
+                if frame_idx % self.frame_skip != 0:
+                    continue
+                
                 t0 = time.time()
+                
+                # NEW: Resize frame if needed
+                if self.resize_factor < 1.0:
+                    process_frame = cv2.resize(frame, (process_width, process_height))
+                    scale_x = width / process_width
+                    scale_y = height / process_height
+                else:
+                    process_frame = frame
+                    scale_x = scale_y = 1.0
 
-                # Run YOLOv8 tracking (uses tracker.yolo inside class)
+                # Run YOLOv8 tracking on (potentially resized) frame
                 results = self.tracker.yolo.track(
-                    frame,
+                    process_frame,
                     persist=True,
                     tracker=self.tracker.tracker_name,
                     classes=[0],
                     conf=conf_threshold,
                     iou=iou_threshold,
-                    verbose=False
+                    verbose=False,
+                    half=self.use_half_precision  # NEW: Use FP16 if enabled
                 )
 
                 tracks_data = []
@@ -145,12 +268,17 @@ class CombinedYOLOFaceBehavior:
                         track_ids = boxes.id.cpu().numpy().astype(int)
                         bboxes = boxes.xyxy.cpu().numpy().astype(int)
                         for bbox, track_id in zip(bboxes, track_ids):
+                            # NEW: Scale bbox back to original frame coordinates
                             x1, y1, x2, y2 = bbox
+                            x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
+                            x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
+                            
                             x1, y1 = max(0, x1), max(0, y1)
                             x2, y2 = min(width, x2), min(height, y2)
                             if x2 <= x1 or y2 <= y1:
                                 continue
 
+                            # Extract crop from ORIGINAL frame for better quality recognition
                             person_crop = frame[y1:y2, x1:x2]
 
                             # Behavior classification (reuse tracker logic: reclass interval + smoothing)
@@ -197,10 +325,20 @@ class CombinedYOLOFaceBehavior:
                                 name = face_result.get("name", "Unknown")
                                 conf = float(face_result.get("confidence", 0.0) or 0.0)
 
-                                # update cache / last run
-                                self.identity_cache[int(track_id)] = (name, conf)
+                                # NEW: Add to recognition history for consensus
+                                self.track_recognition_history[int(track_id)].append((name, conf))
+                                
+                                # NEW: Use consensus identity instead of single frame
+                                consensus_name, consensus_conf = self._get_consensus_identity(int(track_id))
+                                
+                                # update cache with consensus result
+                                self.identity_cache[int(track_id)] = (consensus_name, consensus_conf)
                                 self.track_last_recog_frame[int(track_id)] = frame_idx
 
+                                # if model is highly confident, lock identity
+                                if consensus_conf >= self.identity_lock_conf and consensus_name != "Unknown":
+                                    self.track_identity_lock[int(track_id)] = {"name": consensus_name, "frames_left": self.identity_lock_frames}
+                                
                                 # debug: dump full face_result and save crop for inspection
                                 if os.getenv("DEBUG_FACENET") == "1":
                                     print(f"[FACENET] track={track_id} frame={frame_idx} -> {face_result}")
@@ -234,13 +372,18 @@ class CombinedYOLOFaceBehavior:
                                 locked["frames_left"] -= 1
                                 # still update last bbox to keep continuity
                                 self.track_last_bbox[int(track_id)] = current_bbox
+                                
+                                # NEW: Determine authorization level
+                                auth_level = self.get_authorization_level(identity_name)
+                                
                                 tracks_data.append({
                                     "track_id": int(track_id),
                                     "bbox": current_bbox,
                                     "behavior": behavior_name,
                                     "behavior_conf": behavior_conf,
                                     "identity": identity_name,
-                                    "identity_conf": identity_conf
+                                    "identity_conf": identity_conf,
+                                    "authorization": auth_level
                                 })
                                 continue
 
@@ -286,7 +429,10 @@ class CombinedYOLOFaceBehavior:
                                     self.track_last_face_frame[int(track_id)] = frame_idx
                             except Exception:
                                 identity_name = face_result.get("name","Unknown")
-                                identity_conf = float(face_result.get("confidence",0.0) or 0.0)
+                                identity_conf = float(face_result.get("confidence",0.0))
+
+                            # NEW: Determine authorization level based on recognized identity
+                            auth_level = self.get_authorization_level(identity_name)
 
                             tracks_data.append({
                                 "track_id": int(track_id),
@@ -294,7 +440,8 @@ class CombinedYOLOFaceBehavior:
                                 "behavior": behavior_name,
                                 "behavior_conf": behavior_conf,
                                 "identity": identity_name,
-                                "identity_conf": identity_conf
+                                "identity_conf": identity_conf,
+                                "authorization": auth_level
                             })
 
                 # annotate
@@ -306,11 +453,29 @@ class CombinedYOLOFaceBehavior:
                     bconf = td["behavior_conf"]
                     ident = td["identity"]
                     iconf = td["identity_conf"]
+                    auth = td["authorization"]
 
-                    color = (0, 200, 0) if ident != "Unknown" else (0, 0, 255)
+                    # NEW: Use authorization-based color
+                    color = self.get_authorization_color(auth)
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-                    label = f"ID:{tid} {ident} ({iconf:.2f}) | {behavior} ({bconf:.2f})"
-                    cv2.putText(annotated, label, (x1+2, max(20, y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                    
+                    # NEW: Enhanced label with authorization level
+                    label = f"ID:{tid} {ident} ({iconf:.2f})"
+                    auth_label = f"{auth} | {behavior} ({bconf:.2f})"
+                    
+                    # Draw identity and confidence
+                    cv2.putText(annotated, label, (x1+2, max(20, y1-20)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                    
+                    # Draw authorization and behavior
+                    cv2.putText(annotated, auth_label, (x1+2, max(35, y1-6)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # NEW: Display FPS
+                if len(fps_window) > 0:
+                    avg_fps = len(fps_window) / sum(fps_window)
+                    cv2.putText(annotated, f"FPS: {avg_fps:.1f}", (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 # display / save
                 if display:
@@ -359,7 +524,7 @@ class CombinedYOLOFaceBehavior:
         return ((x1+x2)/2.0, (y1+y2)/2.0)
 
 def main():
-    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV3-Small + FaceNet pipeline")
+    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV3-Small + FaceNet pipeline with Authorization")
     parser.add_argument("--video", type=str, help="Path to video file (or 'webcam')", required=True)
     parser.add_argument("--yolo-model", type=str, default="models/YOLOv8/yolov8n.pt")
     parser.add_argument("--mobilenet-model", type=str, default="models/mobilenetv3-small/mobilenet_v3_small_transfer.pth")
@@ -368,6 +533,17 @@ def main():
     parser.add_argument("--save", type=str, help="Save annotated video to path")
     parser.add_argument("--device", type=str, choices=["cuda","cpu"], help="Device to use")
     parser.add_argument("--min-class-conf", type=float, default=0.6)
+    
+    # NEW: Performance parameters
+    parser.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (higher = faster, lower quality)")
+    parser.add_argument("--resize-factor", type=float, default=1.0, help="Resize input frames (0.5 = half size, faster)")
+    parser.add_argument("--no-half", action="store_true", help="Disable FP16 half precision")
+    
+    # NEW: Recognition quality parameters
+    parser.add_argument("--min-face-size", type=int, default=80, help="Minimum face crop size for recognition")
+    parser.add_argument("--recog-interval", type=int, default=5, help="Frames between face recognition runs per track")
+    parser.add_argument("--consensus-window", type=int, default=5, help="Number of frames for identity consensus")
+    
     args = parser.parse_args()
 
     video_src = "webcam" if args.video == "webcam" else args.video
@@ -377,7 +553,16 @@ def main():
         mobilenet_path=args.mobilenet_model,
         facenet_main_path=args.facenet_main,
         device=args.device,
-        min_class_conf=args.min_class_conf
+        min_class_conf=args.min_class_conf,
+        recog_interval=args.recog_interval,
+        identity_lock_conf=0.98,
+        # NEW: Performance settings
+        frame_skip=args.frame_skip,
+        use_half_precision=not args.no_half,
+        resize_factor=args.resize_factor,
+        # NEW: Quality settings
+        min_face_size=args.min_face_size,
+        consensus_window=args.consensus_window
     )
     comb.process_video(video_src, display=not args.no_display, save_output=args.save)
 
