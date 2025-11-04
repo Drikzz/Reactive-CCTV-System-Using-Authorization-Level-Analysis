@@ -20,7 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # -------------------- CONFIG --------------------
 USE_WEBCAM = False
-VIDEO_PATH = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST5.mp4"
+VIDEO_PATH = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\Mp4TESTING\ThesisMP4TEST2.mp4"
 YOLO_MODEL_PATH = "models/YOLOv8/yolov8n.pt"
 
 LOGS_BASE = os.path.join("logs", "FaceNet")
