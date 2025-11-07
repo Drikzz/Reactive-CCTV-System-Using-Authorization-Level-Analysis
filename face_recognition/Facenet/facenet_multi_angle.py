@@ -140,7 +140,7 @@ def align_face(img, landmarks, output_size=160):
     except:
         return None
 
-def capture_multi_angle_faces(source=0, name=None, out_dir="datasets/faces", device=None):
+def capture_multi_angle_faces(source=1, name=None, out_dir="datasets/faces", device=None):
     """Capture faces at multiple angles for better training"""
     
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -433,7 +433,7 @@ def capture_multi_angle_faces(source=0, name=None, out_dir="datasets/faces", dev
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-angle face capture for better recognition training")
-    parser.add_argument("--source", "-s", default=0, help="video source (0 for webcam or path)")
+    parser.add_argument("--source", "-s", default=1, type=int, help="video source (0 for webcam or path)")
     parser.add_argument("--out", "-o", default=os.path.join("datasets","faces"), help="output base directory")
     parser.add_argument("--device", "-d", default=None, help="torch device: cpu or cuda")
     args = parser.parse_args()

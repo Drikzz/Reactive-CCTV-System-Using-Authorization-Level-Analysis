@@ -51,7 +51,7 @@ sys.path.append(os.path.dirname(__file__))
 from dlib_face_recognizer import DlibCNNRecognizer
 
 # -------------------- CONFIG --------------------
-DATASETS_DIR = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\datasets\faces"
+DATASETS_DIR = r"C:\Users\Alexa\OneDrive\Documents\Thesis\Reactive-CCTV-System-Using-Authorization-Level-Analysis\datasets\LevelsAuthorization"
 MODELS_DIR = os.path.join("models", "Dlib")
 OUTPUT_DIR = MODELS_DIR
 

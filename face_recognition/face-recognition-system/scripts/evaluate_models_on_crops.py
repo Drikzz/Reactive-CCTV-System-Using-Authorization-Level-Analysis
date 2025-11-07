@@ -303,7 +303,7 @@ def main():
     print("\n=== EVALUATION SUMMARY ===")
     for model_name, stats in model_stats.items():
         total = stats["total"]
-        recognized = stats["recognized"] 
+        recognized = stats["recognized"]
         avg_time = (sum(stats["times"]) / len(stats["times"])) if stats["times"] else 0.0
         avg_conf = (sum(stats["confs"]) / len(stats["confs"])) if stats["confs"] else 0.0
         most_common = sorted(stats["names"].items(), key=lambda x: x[1], reverse=True)[:5]
@@ -313,12 +313,31 @@ def main():
         print(f"  Processed: {total}")
         print(f"  Recognized (not 'Unknown'): {recognized} ({(recognized/total*100) if total else 0:.1f}%)")
         print(f"  Correct (predicted == ground_truth): {correct} ({acc_pct:.1f}%)")
+        # prediction-accuracy: correct predictions divided by number of predictions (precision)
+        if recognized:
+            pred_acc = correct / recognized
+            print(f"  Prediction accuracy (correct / recognized): {correct}/{recognized} ({pred_acc*100:.1f}%)")
+        else:
+            print("  Prediction accuracy (correct / recognized): no predictions made")
         # accuracy over images that have ground-truth labels
-        rows_with_gt = [r for r in results if _norm(r.get("ground_truth")) and r.get("model")==model_name]
+        rows_with_gt = [r for r in results if _norm(r.get("ground_truth")) and r.get("model") == model_name]
         num_with_gt = len(rows_with_gt)
         correct_with_gt = sum(1 for r in rows_with_gt if _norm(r.get("predicted")) == _norm(r.get("ground_truth")))
         if num_with_gt:
             print(f"  Accuracy (over {num_with_gt} with GT): {correct_with_gt}/{num_with_gt} ({(correct_with_gt/num_with_gt*100):.1f}%)")
+            # compute precision/recall/f1
+            try:
+                precision = (correct / recognized) if recognized else float("nan")
+            except Exception:
+                precision = float("nan")
+            recall = (correct_with_gt / num_with_gt) if num_with_gt else float("nan")
+            f1 = (2 * precision * recall / (precision + recall)) if (precision and recall and not (precision != precision or recall != recall)) else float("nan")
+            if not (precision != precision):
+                print(f"  Precision (correct/recognized): {precision*100:.1f}%")
+            if not (recall != recall):
+                print(f"  Recall (correct/with_GT): {recall*100:.1f}%")
+            if not (f1 != f1):
+                print(f"  F1 score: {f1:.3f}")
         print(f"  Avg time / image: {avg_time:.4f}s")
         print(f"  Avg confidence (recognized): {avg_conf:.3f}")
         print(f"  Top predicted names: {most_common}")

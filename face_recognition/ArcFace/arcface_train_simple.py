@@ -59,7 +59,7 @@ except (ImportError, ModuleNotFoundError):
     print("[INFO] cuML not available - using CPU SVM (sklearn)")
 
 # --- Config ---
-DATASET_DIR = "datasets/faces"
+DATASET_DIR = "datasets/LevelsAuthorization"
 MODELS_DIR = os.path.join("models", "ArcFace")
 
 CLASSIFIER_PATH = os.path.join(MODELS_DIR, "arcface_svm.joblib")
@@ -158,7 +158,7 @@ def get_embeddings_batch(images: list, augment: bool = False) -> np.ndarray:
 def load_dataset(dataset_dir: str):
     """Load dataset images and labels.
     Supports both flat structure:
-        datasets/faces/<person>/*.jpg
+        datasets/LevelsAuthorization/<person>/*.jpg
     and multi-angle structure:
         datasets/faces/<person>/<angle>/*.jpg
     """

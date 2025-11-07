@@ -35,7 +35,7 @@ ALL_LEVELS = [AUTHORIZED, PARTIAL, UNAUTHORIZED]
 AUTHORIZATION_MAP = {
     # Authorized personnel (full access, no behavior monitoring)
     "Aldrikz": AUTHORIZED,
-    "myke": AUTHORIZED,
+    # "myke": AUTHORIZED
     
     # Partial access personnel (monitored, conditional alerts)
     "Art": PARTIAL,
