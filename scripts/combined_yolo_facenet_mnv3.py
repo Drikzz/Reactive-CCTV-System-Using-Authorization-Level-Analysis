@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from collections import defaultdict, deque
 import os
+from datetime import datetime
 
 # Resolve repo root
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +24,143 @@ def load_module_from_path(name, path):
     spec.loader.exec_module(mod)
     return mod
 
+class EventLogger:
+    """Handles logging of security events to file"""
+    def __init__(self, log_dir="logs", log_filename="log.txt"):
+        self.log_dir = Path(REPO_ROOT) / log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = self.log_dir / log_filename
+        
+        # Track person states to detect entry/exit
+        self.person_in_room = {}  # track_id: (name, auth_level, last_seen_frame)
+        self.last_logged_behavior = {}  # track_id: behavior_name
+        
+        # Create log file if it doesn't exist
+        if not self.log_file.exists():
+            with open(self.log_file, 'w') as f:
+                f.write("=== CCTV Security Log ===\n")
+                f.write(f"Log started: {self._get_timestamp()}\n")
+                f.write("=" * 50 + "\n\n")
+        
+        print(f"[INFO] Event logger initialized. Log file: {self.log_file}")
+    
+    def _get_timestamp(self):
+        """Get formatted timestamp"""
+        return datetime.now().strftime("%m-%d-%y %I:%M%p")
+    
+    def _write_log(self, message):
+        """Write message to log file"""
+        try:
+            with open(self.log_file, 'a') as f:
+                f.write(f"{message}\n")
+        except Exception as e:
+            print(f"[ERROR] Failed to write to log: {e}")
+    
+    def log_person_entry(self, track_id, name, auth_level):
+        """Log when a person enters the room"""
+        timestamp = self._get_timestamp()
+        
+        if auth_level == "Authorized":
+            message = f"{timestamp} {name} entered the room"
+        elif auth_level == "Partially Authorized":
+            message = f"{timestamp} {name} has entered the room"
+        else:  # Unauthorized
+            message = f"{timestamp} Unrecognized person has entered the room"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def log_person_exit(self, track_id, name, auth_level):
+        """Log when a person exits the room"""
+        timestamp = self._get_timestamp()
+        
+        if auth_level == "Authorized":
+            message = f"{timestamp} {name} left the room"
+        elif auth_level == "Partially Authorized":
+            message = f"{timestamp} {name} has left the room"
+        else:  # Unauthorized
+            message = f"{timestamp} Unrecognized person has left the room"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def log_behavior(self, track_id, name, behavior):
+        """Log behavior for partially authorized persons"""
+        timestamp = self._get_timestamp()
+        
+        # Map behavior names to readable actions
+        behavior_actions = {
+            "Neutral": "NEUTRAL BEHAVIOR",
+            "Suspicious": "SUSPICIOUS BEHAVIOR",
+            "holding-object": "HOLDING OBJECT",
+            "using-computer": "USING COMPUTER",
+            "opening-cabinet": "OPENING CABINET",
+            # Add more mappings as needed
+        }
+        
+        action = behavior_actions.get(behavior, behavior.upper())
+        message = f"{timestamp} {name} is {action}"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def update_tracking(self, tracks_data, frame_idx, frames_before_exit=90):
+        """
+        Update person tracking and log entries/exits
+        
+        Args:
+            tracks_data: List of detected tracks with their info
+            frame_idx: Current frame index
+            frames_before_exit: Number of frames to wait before logging exit
+        """
+        current_track_ids = set()
+        
+        # Process current tracks
+        for td in tracks_data:
+            track_id = td["track_id"]
+            name = td["identity"]
+            auth_level = td["authorization"]
+            behavior = td.get("behavior", "N/A")
+            
+            current_track_ids.add(track_id)
+            
+            # Check if this is a new person
+            if track_id not in self.person_in_room:
+                # Log entry
+                self.log_person_entry(track_id, name, auth_level)
+                self.person_in_room[track_id] = (name, auth_level, frame_idx)
+                self.last_logged_behavior[track_id] = "Neutral"
+            else:
+                # Update last seen frame
+                stored_name, stored_auth, _ = self.person_in_room[track_id]
+                self.person_in_room[track_id] = (name, auth_level, frame_idx)
+                
+                # Log behavior for Partially Authorized (only if behavior changed and not Neutral)
+                if auth_level == "Partially Authorized" and behavior != "N/A":
+                    last_behavior = self.last_logged_behavior.get(track_id, "Neutral")
+                    
+                    # Only log if behavior changed and is not Neutral
+                    if behavior != "Neutral" and behavior != last_behavior:
+                        self.log_behavior(track_id, name, behavior)
+                        self.last_logged_behavior[track_id] = behavior
+        
+        # Check for people who left (not seen recently)
+        to_remove = []
+        for track_id, (name, auth_level, last_frame) in self.person_in_room.items():
+            if track_id not in current_track_ids:
+                frames_absent = frame_idx - last_frame
+                
+                # If absent for enough frames, log exit
+                if frames_absent >= frames_before_exit:
+                    self.log_person_exit(track_id, name, auth_level)
+                    to_remove.append(track_id)
+        
+        # Remove exited people from tracking
+        for track_id in to_remove:
+            del self.person_in_room[track_id]
+            if track_id in self.last_logged_behavior:
+                del self.last_logged_behavior[track_id]
+
 class CombinedYOLOFaceBehavior:
     """
     Combine:
@@ -30,13 +168,20 @@ class CombinedYOLOFaceBehavior:
      - MobileNetV2 -> behavior classification (per-track caching + smoothing) - ONLY for Partially Authorized
      - FaceNet (from facenet_main.py) -> face recognition per track
      - Authorization logic based on recognized identity
+     - Event logging system
     """
     def __init__(self, yolo_path, mobilenet_path, facenet_main_path, device=None, tracker_cfg="bytetrack.yaml",
                  reclass_interval=10, smooth_window=7, min_class_conf=0.6, recog_interval=30,
                  iou_update_threshold=0.3, centroid_update_px=80, identity_lock_frames=120, identity_lock_conf=0.75,
                  frame_skip=2, use_half_precision=True, resize_factor=0.5,
                  min_face_size=60, face_quality_threshold=0.3, consensus_window=3,
-                 body_memory_frames=300, min_face_detections=2, identity_persistence_frames=900):
+                 body_memory_frames=300, min_face_detections=2, identity_persistence_frames=900,
+                 enable_logging=True):
+        
+        # Initialize event logger
+        self.enable_logging = enable_logging
+        if self.enable_logging:
+            self.event_logger = EventLogger()
         
         # Check if MobileNetV2 tracker exists, if not create inline
         yolo_mnv_path = Path(REPO_ROOT) / "behavior_recognition" / "MobileNetV2" / "yolo_mobilenet_tracker.py"
@@ -44,16 +189,13 @@ class CombinedYOLOFaceBehavior:
         if yolo_mnv_path.exists():
             # Load existing tracker
             tracker_mod = load_module_from_path("yolo_mnv_tracker_mod", yolo_mnv_path)
-            # FIX: Use the correct class name from your existing file
-            TrackerClass = getattr(tracker_mod, "YOLOMobileNetTracker")  # Changed from YOLOMobileNetV2Tracker
+            TrackerClass = getattr(tracker_mod, "YOLOMobileNetTracker")
             
-            # Continue with normal initialization if tracker exists...
             if Path(yolo_path).exists():
                 yolo_model_path = str(yolo_path)
             else:
                 yolo_model_path = str(yolo_path)
 
-            # Check if path exists
             if not Path(yolo_model_path).exists():
                 print(f"[INFO] YOLO model not found at '{yolo_model_path}'. Falling back to hub model 'yolov8n.pt' (will download automatically).")
                 yolo_model_path = "yolov8n.pt"
@@ -104,7 +246,7 @@ class CombinedYOLOFaceBehavior:
             self.authorization_map = {
                 "myke": "Partially Authorized",
                 "dean": "Authorized",
-                "art": "PartiallyAuthorized",
+                "art": "Authorized",
             }
 
             # Performance settings
@@ -185,8 +327,9 @@ class CombinedYOLOFaceBehavior:
 
             # Authorization mapping
             self.authorization_map = {
-                "myke": "Authorized",
-                "dean": "Partially Authorized",
+                "myke": "Partially Authorized",
+                "dean": "Authorized",
+                "art": "Authorized",
             }
 
             # Performance settings
@@ -785,6 +928,10 @@ class CombinedYOLOFaceBehavior:
                                 "authorization": auth_level
                             })
 
+                # Update event logger with current tracks
+                if self.enable_logging:
+                    self.event_logger.update_tracking(tracks_data, frame_idx)
+
                 # Annotate
                 annotated = frame.copy()
                 for td in tracks_data:
@@ -954,7 +1101,7 @@ class CombinedYOLOFaceBehavior:
         print("[INFO] Inline MobileNetV2 tracker created successfully")
 
 def main():
-    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV2 + FaceNet pipeline with Authorization")
+    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV2 + FaceNet pipeline with Authorization and Logging")
     
     # Make video argument optional if USE_WEBCAM is True
     if USE_WEBCAM:
@@ -991,6 +1138,8 @@ def main():
     # Webcam parameters
     parser.add_argument("--use-webcam", action="store_true", help="Force use of webcam (overrides USE_WEBCAM setting)")
     parser.add_argument("--webcam-index", type=int, default=None, help="Webcam index to use (0=first camera, 1=second, etc.)")
+    
+    parser.add_argument("--no-logging", action="store_true", help="Disable event logging")
     
     args = parser.parse_args()
 
@@ -1037,7 +1186,8 @@ def main():
         reclass_interval=args.recog_interval,
         smooth_window=args.smooth_window,
         identity_persistence_frames=args.identity_persistence,
-        min_face_detections=args.min_face_detections
+        min_face_detections=args.min_face_detections,
+        enable_logging=not args.no_logging
     )
     comb.process_video(video_src, display=not args.no_display, save_output=args.save)
 
