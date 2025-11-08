@@ -247,6 +247,7 @@ class CombinedYOLOFaceBehavior:
                 "myke": "Partially Authorized",
                 "dean": "Authorized",
                 "art": "Authorized",
+                "aldrikz": "Partially Authorized"
             }
 
             # Performance settings
@@ -272,7 +273,7 @@ class CombinedYOLOFaceBehavior:
             
             # Track persistent identity state
             self.track_persistent_identity = {}
-            self.track_body_features = defaultdict(lambda: deque(maxlen=30))
+            self.track_body_features = defaultdict(lambda: deque(maxlen=10))
             
             # Track spatial position history
             self.track_position_history = defaultdict(lambda: deque(maxlen=60))
@@ -287,6 +288,10 @@ class CombinedYOLOFaceBehavior:
             
             # Track pose history
             self.track_pose_history = defaultdict(lambda: deque(maxlen=self.pose_history_length))
+            
+            # Initialize stability tracking (needed by _should_run_recognition)
+            self.track_stability_count = defaultdict(int)
+            self.track_auth_stable = defaultdict(int)
             
         else:
             # Create inline tracker
@@ -353,7 +358,7 @@ class CombinedYOLOFaceBehavior:
             
             # Track persistent identity state
             self.track_persistent_identity = {}
-            self.track_body_features = defaultdict(lambda: deque(maxlen=30))
+            self.track_body_features = defaultdict(lambda: deque(maxlen=10))
             
             # Track spatial position history
             self.track_position_history = defaultdict(lambda: deque(maxlen=60))
@@ -368,6 +373,10 @@ class CombinedYOLOFaceBehavior:
             
             # Track pose history
             self.track_pose_history = defaultdict(lambda: deque(maxlen=self.pose_history_length))
+            
+            # Initialize stability tracking (needed by _should_run_recognition)
+            self.track_stability_count = defaultdict(int)
+            self.track_auth_stable = defaultdict(int)
 
     def get_authorization_level(self, identity_name):
         """Determine authorization level based on identity."""
@@ -740,10 +749,6 @@ class CombinedYOLOFaceBehavior:
             print(f"[INFO] Processing at {process_width}x{process_height} (resize_factor={self.resize_factor})")
         else:
             process_width, process_height = width, height
-
-        # Adaptive tracking
-        self.track_stability_count = defaultdict(int)
-        self.track_auth_stable = defaultdict(int)
 
         try:
             while True:
