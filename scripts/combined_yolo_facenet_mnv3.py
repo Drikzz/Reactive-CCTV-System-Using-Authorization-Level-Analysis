@@ -7,9 +7,16 @@ import cv2
 import numpy as np
 from collections import defaultdict, deque
 import os
+from datetime import datetime
 
 # Resolve repo root
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# -------------------- CONFIGURATION --------------------
+# Set this to True to use webcam, False to require --video argument
+USE_WEBCAM = True  # Change this to True to use webcam by default
+WEBCAM_INDEX = 0   # Default webcam index (0 = first camera, 1 = second, etc.)
+# -------------------------------------------------------
 
 def load_module_from_path(name, path):
     spec = importlib.util.spec_from_file_location(name, str(path))
@@ -17,123 +24,350 @@ def load_module_from_path(name, path):
     spec.loader.exec_module(mod)
     return mod
 
+class EventLogger:
+    """Handles logging of security events to file"""
+    def __init__(self, log_dir="logs", log_filename="log.txt"):
+        self.log_dir = Path(REPO_ROOT) / log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = self.log_dir / log_filename
+        
+        # Track person states to detect entry/exit
+        self.person_in_room = {}  # track_id: (name, auth_level, last_seen_frame)
+        self.last_logged_behavior = {}  # track_id: behavior_name
+        
+        # Create log file if it doesn't exist
+        if not self.log_file.exists():
+            with open(self.log_file, 'w') as f:
+                f.write("=== CCTV Security Log ===\n")
+                f.write(f"Log started: {self._get_timestamp()}\n")
+                f.write("=" * 50 + "\n\n")
+        
+        print(f"[INFO] Event logger initialized. Log file: {self.log_file}")
+    
+    def _get_timestamp(self):
+        """Get formatted timestamp"""
+        return datetime.now().strftime("%m-%d-%y %I:%M%p")
+    
+    def _write_log(self, message):
+        """Write message to log file"""
+        try:
+            with open(self.log_file, 'a') as f:
+                f.write(f"{message}\n")
+        except Exception as e:
+            print(f"[ERROR] Failed to write to log: {e}")
+    
+    def log_person_entry(self, track_id, name, auth_level):
+        """Log when a person enters the room"""
+        timestamp = self._get_timestamp()
+        
+        if auth_level == "Authorized":
+            message = f"{timestamp} {name} entered the room"
+        elif auth_level == "Partially Authorized":
+            message = f"{timestamp} {name} has entered the room"
+        else:  # Unauthorized
+            message = f"{timestamp} Unrecognized person has entered the room"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def log_person_exit(self, track_id, name, auth_level):
+        """Log when a person exits the room"""
+        timestamp = self._get_timestamp()
+        
+        if auth_level == "Authorized":
+            message = f"{timestamp} {name} left the room"
+        elif auth_level == "Partially Authorized":
+            message = f"{timestamp} {name} has left the room"
+        else:  # Unauthorized
+            message = f"{timestamp} Unrecognized person has left the room"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def log_behavior(self, track_id, name, behavior):
+        """Log behavior for partially authorized persons"""
+        timestamp = self._get_timestamp()
+        
+        # Map behavior names to readable actions
+        behavior_actions = {
+            "Neutral": "NEUTRAL BEHAVIOR",
+            "Suspicious": "SUSPICIOUS BEHAVIOR",
+            "holding-object": "HOLDING OBJECT",
+            "using-computer": "USING COMPUTER",
+            "opening-cabinet": "OPENING CABINET",
+            # Add more mappings as needed
+        }
+        
+        action = behavior_actions.get(behavior, behavior.upper())
+        message = f"{timestamp} {name} is {action}"
+        
+        self._write_log(message)
+        print(f"[LOG] {message}")
+    
+    def update_tracking(self, tracks_data, frame_idx, frames_before_exit=90):
+        """
+        Update person tracking and log entries/exits
+        
+        Args:
+            tracks_data: List of detected tracks with their info
+            frame_idx: Current frame index
+            frames_before_exit: Number of frames to wait before logging exit
+        """
+        current_track_ids = set()
+        
+        # Process current tracks
+        for td in tracks_data:
+            track_id = td["track_id"]
+            name = td["identity"]
+            auth_level = td["authorization"]
+            behavior = td.get("behavior", "N/A")
+            
+            current_track_ids.add(track_id)
+            
+            # Check if this is a new person
+            if track_id not in self.person_in_room:
+                # Log entry
+                self.log_person_entry(track_id, name, auth_level)
+                self.person_in_room[track_id] = (name, auth_level, frame_idx)
+                self.last_logged_behavior[track_id] = "Neutral"
+            else:
+                # Update last seen frame
+                stored_name, stored_auth, _ = self.person_in_room[track_id]
+                self.person_in_room[track_id] = (name, auth_level, frame_idx)
+                
+                # Log behavior for Partially Authorized (only if behavior changed and not Neutral)
+                if auth_level == "Partially Authorized" and behavior != "N/A":
+                    last_behavior = self.last_logged_behavior.get(track_id, "Neutral")
+                    
+                    # Only log if behavior changed and is not Neutral
+                    if behavior != "Neutral" and behavior != last_behavior:
+                        self.log_behavior(track_id, name, behavior)
+                        self.last_logged_behavior[track_id] = behavior
+        
+        # Check for people who left (not seen recently)
+        to_remove = []
+        for track_id, (name, auth_level, last_frame) in self.person_in_room.items():
+            if track_id not in current_track_ids:
+                frames_absent = frame_idx - last_frame
+                
+                # If absent for enough frames, log exit
+                if frames_absent >= frames_before_exit:
+                    self.log_person_exit(track_id, name, auth_level)
+                    to_remove.append(track_id)
+        
+        # Remove exited people from tracking
+        for track_id in to_remove:
+            del self.person_in_room[track_id]
+            if track_id in self.last_logged_behavior:
+                del self.last_logged_behavior[track_id]
+
 class CombinedYOLOFaceBehavior:
     """
     Combine:
      - YOLOv8 + ByteTrack -> detection + tracking
-     - MobileNetV3-Small -> behavior classification (per-track caching + smoothing) - ONLY for Partially Authorized
+     - MobileNetV2 -> behavior classification (per-track caching + smoothing) - ONLY for Partially Authorized
      - FaceNet (from facenet_main.py) -> face recognition per track
      - Authorization logic based on recognized identity
+     - Event logging system
     """
     def __init__(self, yolo_path, mobilenet_path, facenet_main_path, device=None, tracker_cfg="bytetrack.yaml",
                  reclass_interval=10, smooth_window=7, min_class_conf=0.6, recog_interval=30,
                  iou_update_threshold=0.3, centroid_update_px=80, identity_lock_frames=120, identity_lock_conf=0.75,
                  frame_skip=2, use_half_precision=True, resize_factor=0.5,
                  min_face_size=60, face_quality_threshold=0.3, consensus_window=3,
-                 body_memory_frames=300, min_face_detections=2, identity_persistence_frames=900):
+                 body_memory_frames=300, min_face_detections=2, identity_persistence_frames=900,
+                 enable_logging=True):
         
-        # Load YOLO+tracker/mobilenet module (the tracker class file)
-        yolo_mnv_path = Path(REPO_ROOT) / "behavior_recognition" / "mobilenetv3-small" / "yolo_mobilenet_tracker_mnv3small.py"
-        if Path(yolo_path).exists():
-            yolo_model_path = str(yolo_path)
+        # Initialize event logger
+        self.enable_logging = enable_logging
+        if self.enable_logging:
+            self.event_logger = EventLogger()
+        
+        # Check if MobileNetV2 tracker exists, if not create inline
+        yolo_mnv_path = Path(REPO_ROOT) / "behavior_recognition" / "MobileNetV2" / "yolo_mobilenet_tracker.py"
+        
+        if yolo_mnv_path.exists():
+            # Load existing tracker
+            tracker_mod = load_module_from_path("yolo_mnv_tracker_mod", yolo_mnv_path)
+            TrackerClass = getattr(tracker_mod, "YOLOMobileNetTracker")
+            
+            if Path(yolo_path).exists():
+                yolo_model_path = str(yolo_path)
+            else:
+                yolo_model_path = str(yolo_path)
+
+            if not Path(yolo_model_path).exists():
+                print(f"[INFO] YOLO model not found at '{yolo_model_path}'. Falling back to hub model 'yolov8n.pt' (will download automatically).")
+                yolo_model_path = "yolov8n.pt"
+     
+            self.tracker = TrackerClass(
+                yolo_model_path=yolo_model_path,
+                mobilenet_model_path=str(mobilenet_path),
+                class_names=None,
+                tracker=tracker_cfg,
+                device=device,
+                reclass_interval=reclass_interval,
+                smoothing_window=smooth_window
+            )
+            self.tracker.min_class_conf = float(min_class_conf)
+
+            # Load facenet_main module (for recognize_face_in_crop)
+            facenet_path = Path(facenet_main_path)
+            facenet_mod = load_module_from_path("facenet_main_mod", facenet_path)
+            self.recognize_face_fn = getattr(facenet_mod, "recognize_face_in_crop", None)
+            if self.recognize_face_fn is None:
+                raise RuntimeError("facenet_main module does not expose recognize_face_in_crop()")
+
+            self.display_title = "YOLO + MobileNetV2 + FaceNet (Combined)"
+
+            # add facenet track state
+            self.track_identities = {}
+            self.track_face_history = defaultdict(lambda: deque(maxlen=300))
+            self.track_body_history = defaultdict(lambda: deque(maxlen=60))
+            self.track_last_face_frame = {}
+
+            # load facenet module object
+            self.facenet_mod = facenet_mod
+
+            # Face recognition control
+            self.recog_interval = int(recog_interval)
+            self.track_last_recog_frame = {}
+            self.identity_cache = {}
+
+            # Continuity tracking
+            self.track_last_bbox = {}
+            self.track_identity_lock = {}
+            self.iou_update_threshold = float(iou_update_threshold)
+            self.centroid_update_px = float(centroid_update_px)
+            self.identity_lock_frames = int(identity_lock_frames)
+            self.identity_lock_conf = float(identity_lock_conf)
+
+            # Authorization mapping
+            self.authorization_map = {
+                "myke": "Partially Authorized",
+                "dean": "Authorized",
+                "art": "Authorized",
+            }
+
+            # Performance settings
+            self.frame_skip = int(frame_skip)
+            self.use_half_precision = use_half_precision and device == "cuda"
+            self.resize_factor = float(resize_factor)
+            
+            if self.use_half_precision:
+                print("[INFO] Using FP16 (half precision) for YOLO (MobileNet stays FP32)")
+            else:
+                self.tracker.use_half = False
+
+            # Recognition quality settings
+            self.min_face_size = int(min_face_size)
+            self.face_quality_threshold = float(face_quality_threshold)
+            self.consensus_window = int(consensus_window)
+            self.track_recognition_history = defaultdict(lambda: deque(maxlen=consensus_window))
+
+            # Persistent tracking parameters
+            self.body_memory_frames = int(body_memory_frames)
+            self.min_face_detections = int(min_face_detections)
+            self.identity_persistence_frames = int(identity_persistence_frames)
+            
+            # Track persistent identity state
+            self.track_persistent_identity = {}
+            self.track_body_features = defaultdict(lambda: deque(maxlen=30))
+            
+            # Track spatial position history
+            self.track_position_history = defaultdict(lambda: deque(maxlen=60))
+            self.track_size_history = defaultdict(lambda: deque(maxlen=30))
+
+            # Enhanced back view tracking
+            self.back_view_tolerance_frames = 600
+            self.body_match_threshold = 0.5
+            self.extended_memory_frames = 300
+            self.min_body_match_confidence = 0.4
+            self.pose_history_length = 30
+            
+            # Track pose history
+            self.track_pose_history = defaultdict(lambda: deque(maxlen=self.pose_history_length))
+            
         else:
-            yolo_model_path = str(yolo_path)
+            # Create inline tracker
+            print("[INFO] MobileNetV2 tracker not found, creating inline implementation...")
+            self._create_inline_tracker(yolo_path, mobilenet_path, device, tracker_cfg, reclass_interval, smooth_window)
+            
+            # Initialize other components after inline tracker
+            # Load facenet_main module (for recognize_face_in_crop)
+            facenet_path = Path(facenet_main_path)
+            facenet_mod = load_module_from_path("facenet_main_mod", facenet_path)
+            self.recognize_face_fn = getattr(facenet_mod, "recognize_face_in_crop", None)
+            if self.recognize_face_fn is None:
+                raise RuntimeError("facenet_main module does not expose recognize_face_in_crop()")
 
-        # Load the tracker module to reuse its MobileNet loader and transforms
-        tracker_mod = load_module_from_path("yolo_mnv_tracker_mod", yolo_mnv_path)
-        TrackerClass = getattr(tracker_mod, "YOLOMobileNetV3SmallTracker")
+            self.display_title = "YOLO + MobileNetV2 + FaceNet (Combined)"
 
-        # Check if path exists
-        if not Path(yolo_model_path).exists():
-            print(f"[INFO] YOLO model not found at '{yolo_model_path}'. Falling back to hub model 'yolov8n.pt' (will download automatically).")
-            yolo_model_path = "yolov8n.pt"
- 
-        self.tracker = TrackerClass(
-            yolo_model_path=yolo_model_path,
-            mobilenet_model_path=str(mobilenet_path),
-            class_names=None,
-            tracker=tracker_cfg,
-            device=device,
-            reclass_interval=reclass_interval,
-            smoothing_window=smooth_window
-        )
-        self.tracker.min_class_conf = float(min_class_conf)
+            # add facenet track state
+            self.track_identities = {}
+            self.track_face_history = defaultdict(lambda: deque(maxlen=300))
+            self.track_body_history = defaultdict(lambda: deque(maxlen=60))
+            self.track_last_face_frame = {}
 
-        # Load facenet_main module (for recognize_face_in_crop)
-        facenet_path = Path(facenet_main_path)
-        facenet_mod = load_module_from_path("facenet_main_mod", facenet_path)
-        self.recognize_face_fn = getattr(facenet_mod, "recognize_face_in_crop", None)
-        if self.recognize_face_fn is None:
-            raise RuntimeError("facenet_main module does not expose recognize_face_in_crop()")
+            # load facenet module object
+            self.facenet_mod = facenet_mod
 
-        self.display_title = "YOLO + MobileNetV3-Small + FaceNet (Combined)"
+            # Face recognition control
+            self.recog_interval = int(recog_interval)
+            self.track_last_recog_frame = {}
+            self.identity_cache = {}
 
-        # add facenet track state
-        self.track_identities = {}
-        self.track_face_history = defaultdict(lambda: deque(maxlen=300))
-        self.track_body_history = defaultdict(lambda: deque(maxlen=60))
-        self.track_last_face_frame = {}
+            # Continuity tracking
+            self.track_last_bbox = {}
+            self.track_identity_lock = {}
+            self.iou_update_threshold = float(iou_update_threshold)
+            self.centroid_update_px = float(centroid_update_px)
+            self.identity_lock_frames = int(identity_lock_frames)
+            self.identity_lock_conf = float(identity_lock_conf)
 
-        # load facenet module object
-        self.facenet_mod = facenet_mod
+            # Authorization mapping
+            self.authorization_map = {
+                "myke": "Partially Authorized",
+                "dean": "Authorized",
+                "art": "Authorized",
+            }
 
-        # Face recognition control
-        self.recog_interval = int(recog_interval)
-        self.track_last_recog_frame = {}
-        self.identity_cache = {}
+            # Performance settings
+            self.frame_skip = int(frame_skip)
+            self.use_half_precision = use_half_precision and device == "cuda"
+            self.resize_factor = float(resize_factor)
+            
+            if self.use_half_precision:
+                print("[INFO] Using FP16 (half precision) for YOLO (MobileNet stays FP32)")
 
-        # Continuity tracking
-        self.track_last_bbox = {}
-        self.track_identity_lock = {}
-        self.iou_update_threshold = float(iou_update_threshold)
-        self.centroid_update_px = float(centroid_update_px)
-        self.identity_lock_frames = int(identity_lock_frames)
-        self.identity_lock_conf = float(identity_lock_conf)
+            # Recognition quality settings
+            self.min_face_size = int(min_face_size)
+            self.face_quality_threshold = float(face_quality_threshold)
+            self.consensus_window = int(consensus_window)
+            self.track_recognition_history = defaultdict(lambda: deque(maxlen=consensus_window))
 
-        # Authorization mapping
-        self.authorization_map = {
-            "myke": "Authorized",
-            "dean": "Partially Authorized",
-        }
+            # Persistent tracking parameters
+            self.body_memory_frames = int(body_memory_frames)
+            self.min_face_detections = int(min_face_detections)
+            self.identity_persistence_frames = int(identity_persistence_frames)
+            
+            # Track persistent identity state
+            self.track_persistent_identity = {}
+            self.track_body_features = defaultdict(lambda: deque(maxlen=30))
+            
+            # Track spatial position history
+            self.track_position_history = defaultdict(lambda: deque(maxlen=60))
+            self.track_size_history = defaultdict(lambda: deque(maxlen=30))
 
-        # Performance settings
-        self.frame_skip = int(frame_skip)
-        self.use_half_precision = use_half_precision and device == "cuda"
-        self.resize_factor = float(resize_factor)
-        
-        if self.use_half_precision:
-            print("[INFO] Using FP16 (half precision) for YOLO (MobileNet stays FP32)")
-        else:
-            self.tracker.use_half = False
-
-        # Recognition quality settings
-        self.min_face_size = int(min_face_size)
-        self.face_quality_threshold = float(face_quality_threshold)
-        self.consensus_window = int(consensus_window)
-        self.track_recognition_history = defaultdict(lambda: deque(maxlen=consensus_window))
-
-        # Persistent tracking parameters
-        self.body_memory_frames = int(body_memory_frames)
-        self.min_face_detections = int(min_face_detections)
-        self.identity_persistence_frames = int(identity_persistence_frames)
-        
-        # Track persistent identity state
-        self.track_persistent_identity = {}
-        self.track_body_features = defaultdict(lambda: deque(maxlen=30))
-        
-        # Track spatial position history
-        self.track_position_history = defaultdict(lambda: deque(maxlen=60))
-        self.track_size_history = defaultdict(lambda: deque(maxlen=30))
-
-        # Enhanced back view tracking
-        self.back_view_tolerance_frames = 600
-        self.body_match_threshold = 0.5
-        self.extended_memory_frames = 300
-        self.min_body_match_confidence = 0.4
-        self.pose_history_length = 30
-        
-        # Track pose history
-        self.track_pose_history = defaultdict(lambda: deque(maxlen=self.pose_history_length))
+            # Enhanced back view tracking
+            self.back_view_tolerance_frames = 600
+            self.body_match_threshold = 0.5
+            self.extended_memory_frames = 300
+            self.min_body_match_confidence = 0.4
+            self.pose_history_length = 30
+            
+            # Track pose history
+            self.track_pose_history = defaultdict(lambda: deque(maxlen=self.pose_history_length))
 
     def get_authorization_level(self, identity_name):
         """Determine authorization level based on identity."""
@@ -144,8 +378,8 @@ class CombinedYOLOFaceBehavior:
         
         if name_lower in self.authorization_map:
             return self.authorization_map[name_lower]
-        
-        return "Authorized"
+        else:
+            return "Unauthorized"
 
     def get_authorization_color(self, auth_level):
         """Get color for authorization level visualization."""
@@ -447,7 +681,35 @@ class CombinedYOLOFaceBehavior:
     def process_video(self, video_source, display=True, save_output=None, conf_threshold=0.5, iou_threshold=0.7):
         # Open video
         if video_source == "webcam":
-            cap = cv2.VideoCapture(0)
+            # Try to open the default webcam index first
+            cap = cv2.VideoCapture(WEBCAM_INDEX)
+            
+            # If default fails, try to find any available camera
+            if not cap.isOpened():
+                print(f"[WARNING] Could not open webcam at index {WEBCAM_INDEX}")
+                print("[INFO] Searching for available cameras...")
+                
+                # Try indices 0-10
+                for idx in range(11):
+                    if idx == WEBCAM_INDEX:
+                        continue  # Already tried this one
+                    print(f"[INFO] Trying camera index {idx}...")
+                    test_cap = cv2.VideoCapture(idx)
+                    if test_cap.isOpened():
+                        # Test if we can actually read a frame
+                        ret, _ = test_cap.read()
+                        if ret:
+                            cap = test_cap
+                            print(f"[INFO] Successfully opened camera at index {idx}")
+                            break
+                        else:
+                            test_cap.release()
+                    else:
+                        test_cap.release()
+            is_webcam = True
+        elif isinstance(video_source, int):
+            # Direct camera index specified
+            cap = cv2.VideoCapture(video_source)
             is_webcam = True
         else:
             cap = cv2.VideoCapture(str(video_source))
@@ -546,7 +808,7 @@ class CombinedYOLOFaceBehavior:
                             body_features = self._extract_body_features(person_crop)
                             if body_features is not None:
                                 self.track_body_features[int(track_id)].append(body_features)
-                            
+                        
                             centroid = self._centroid((x1, y1, x2, y2))
                             self.track_position_history[int(track_id)].append(centroid)
                             self.track_size_history[int(track_id)].append((x2 - x1, y2 - y1))
@@ -560,7 +822,7 @@ class CombinedYOLOFaceBehavior:
                                     self.track_stability_count[int(track_id)] += 1
                                 else:
                                     self.track_stability_count[int(track_id)] = 0
-                            
+                        
                             persistent = self.track_persistent_identity.get(int(track_id))
                             if persistent:
                                 cached_name = persistent["name"]
@@ -628,7 +890,7 @@ class CombinedYOLOFaceBehavior:
                                         smoothed_probs = hist[0]
                                     else:
                                         smoothed_probs = np.mean(np.stack(hist, axis=0), axis=0)
-                                    
+                                
                                     smoothed_class_id = int(np.argmax(smoothed_probs))
                                     smoothed_confidence = float(smoothed_probs[smoothed_class_id])
                                     
@@ -639,7 +901,7 @@ class CombinedYOLOFaceBehavior:
                                     else:
                                         behavior_name = self.tracker.class_names[smoothed_class_id]
                                         behavior_conf = smoothed_confidence
-                                    
+                                
                                     # Update cache
                                     self.tracker.classification_cache[track_id] = {
                                         "class_name": behavior_name,
@@ -665,6 +927,10 @@ class CombinedYOLOFaceBehavior:
                                 "identity_conf": identity_conf,
                                 "authorization": auth_level
                             })
+
+                # Update event logger with current tracks
+                if self.enable_logging:
+                    self.event_logger.update_tracking(tracks_data, frame_idx)
 
                 # Annotate
                 annotated = frame.copy()
@@ -759,14 +1025,95 @@ class CombinedYOLOFaceBehavior:
         x1,y1,x2,y2 = box
         return ((x1+x2)/2.0, (y1+y2)/2.0)
 
+    def _create_inline_tracker(self, yolo_path, mobilenet_path, device, tracker_cfg, reclass_interval, smooth_window):
+        """Create inline MobileNetV2 tracker when separate file doesn't exist"""
+        import torch
+        import torchvision.transforms as transforms
+        from torchvision.models import mobilenet_v2
+        from ultralytics import YOLO
+        
+        # Initialize device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        
+        # Create a simple tracker object
+        class InlineTracker:
+            def __init__(self, yolo_path, mobilenet_path, device):
+                self.device = device
+                self.yolo = YOLO(yolo_path if Path(yolo_path).exists() else "yolov8n.pt")
+                self.tracker_name = tracker_cfg
+                self.reclass_interval = reclass_interval
+                self.smoothing_window = smooth_window
+                self.min_class_conf = 0.6
+                
+                # Load MobileNetV2
+                self.mobilenet = mobilenet_v2(pretrained=True)
+                self.mobilenet.classifier = torch.nn.Sequential(
+                    torch.nn.Dropout(0.2),
+                    torch.nn.Linear(self.mobilenet.classifier[1].in_features, 4)
+                )
+                self.mobilenet.to(device)
+                self.mobilenet.eval()
+                
+                self.num_classes = 4
+                self.class_names = ["Normal", "Suspicious", "Aggressive", "Neutral"]
+                
+                # Tracking state
+                self.classification_cache = {}
+                self.prob_history = defaultdict(lambda: deque(maxlen=smooth_window))
+                self.last_classification_frame = {}
+                
+                # Transforms
+                self.transform = transforms.Compose([
+                    transforms.ToPILImage(),
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+            
+            def _should_reclassify(self, track_id, frame_idx):
+                last_frame = self.last_classification_frame.get(track_id, -999)
+                return (frame_idx - last_frame) >= self.reclass_interval
+            
+            def _classify_crop(self, person_crop):
+                try:
+                    if person_crop is None or person_crop.size == 0:
+                        return {"class_name": "Neutral", "confidence": 0.0, "probs": np.ones(self.num_classes) / self.num_classes}
+                    
+                    crop_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+                    input_tensor = self.transform(crop_rgb).unsqueeze(0).to(self.device)
+                    
+                    with torch.no_grad():
+                        outputs = self.mobilenet(input_tensor)
+                        probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+                    
+                    class_id = int(np.argmax(probs))
+                    confidence = float(probs[class_id])
+                    class_name = self.class_names[class_id]
+                    
+                    return {"class_name": class_name, "confidence": confidence, "probs": probs}
+                except Exception as e:
+                    print(f"[ERROR] Classification failed: {e}")
+                    return {"class_name": "Neutral", "confidence": 0.0, "probs": np.ones(self.num_classes) / self.num_classes}
+        
+        self.tracker = InlineTracker(yolo_path, mobilenet_path, device)
+        print("[INFO] Inline MobileNetV2 tracker created successfully")
+
 def main():
-    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV3-Small + FaceNet pipeline with Authorization")
-    parser.add_argument("--video", type=str, help="Path to video file (or 'webcam')", required=True)
+    parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV2 + FaceNet pipeline with Authorization and Logging")
+    
+    # Make video argument optional if USE_WEBCAM is True
+    if USE_WEBCAM:
+        parser.add_argument("--video", type=str, help="Path to video file (optional, webcam will be used if not provided)", default=None)
+    else:
+        parser.add_argument("--video", type=str, help="Path to video file (or 'webcam')", required=True)
+    
     parser.add_argument("--yolo-model", type=str, default="models/YOLOv8/yolov8n.pt")
-    parser.add_argument("--mobilenet-model", type=str, default="models/mobilenetv3-small/mobilenet_v3_small_transfer.pth")
+    parser.add_argument("--mobilenet-model", type=str, default="models/mobilenetv2/mobilenet_feature_extraction.pth")
     parser.add_argument("--facenet-main", type=str, default=str(REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py"))
     parser.add_argument("--no-display", action="store_true")
-    parser.add_argument("--save", type=str, help="Save annotated video to path")
+    parser.add_argument("--save", type=str, help="Save annotated video to path")    
     parser.add_argument("--device", type=str, choices=["cuda","cpu"], help="Device to use")
     parser.add_argument("--min-class-conf", type=float, default=0.6, help="Minimum behavior classification confidence")
     
@@ -788,9 +1135,40 @@ def main():
     parser.add_argument("--identity-persistence", type=int, default=900, help="Frames to persist identity without face")
     parser.add_argument("--min-face-detections", type=int, default=2, help="Minimum face detections before locking")
     
+    # Webcam parameters
+    parser.add_argument("--use-webcam", action="store_true", help="Force use of webcam (overrides USE_WEBCAM setting)")
+    parser.add_argument("--webcam-index", type=int, default=None, help="Webcam index to use (0=first camera, 1=second, etc.)")
+    
+    parser.add_argument("--no-logging", action="store_true", help="Disable event logging")
+    
     args = parser.parse_args()
 
-    video_src = "webcam" if args.video == "webcam" else args.video
+    # Override global webcam index if specified in arguments
+    if args.webcam_index is not None:
+        global WEBCAM_INDEX
+        WEBCAM_INDEX = args.webcam_index
+        print(f"[INFO] Using webcam index: {WEBCAM_INDEX}")
+
+    # Determine video source with priority: command line > USE_WEBCAM config
+    if args.use_webcam:
+        video_src = "webcam"
+        print("[INFO] Using webcam (forced by --use-webcam argument)")
+    elif USE_WEBCAM and args.video is None:
+        video_src = "webcam"
+        print("[INFO] Using webcam (set by USE_WEBCAM configuration)")
+    elif args.video == "webcam":
+        video_src = "webcam"
+        print("[INFO] Using webcam (specified in --video argument)")
+    elif args.video and args.video.isdigit():
+        # Support direct camera index as video argument
+        video_src = int(args.video)
+        print(f"[INFO] Using camera index: {video_src}")
+    elif args.video:
+        video_src = args.video
+        print(f"[INFO] Using video file: {video_src}")
+    else:
+        print("[ERROR] No video source specified. Set USE_WEBCAM=True or provide --video argument")
+        return
 
     comb = CombinedYOLOFaceBehavior(
         yolo_path=args.yolo_model,
@@ -805,10 +1183,11 @@ def main():
         resize_factor=args.resize_factor,
         min_face_size=args.min_face_size,
         consensus_window=args.consensus_window,
-        reclass_interval=args.reclass_interval,
+        reclass_interval=args.recog_interval,
         smooth_window=args.smooth_window,
         identity_persistence_frames=args.identity_persistence,
-        min_face_detections=args.min_face_detections
+        min_face_detections=args.min_face_detections,
+        enable_logging=not args.no_logging
     )
     comb.process_video(video_src, display=not args.no_display, save_output=args.save)
 
