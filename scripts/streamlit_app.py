@@ -324,8 +324,8 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         # Add to tracks data
                         tracks_data.append({
                             "track_id": int(track_id),
-                            "name": identity_name,
-                            "auth": auth_level,
+                            "identity": identity_name,
+                            "authorization": auth_level,  # Changed from "auth" to "authorization"
                             "behavior": behavior_name,
                             "behavior_conf": behavior_conf,
                             "identity_conf": identity_conf
@@ -530,15 +530,15 @@ def main():
                 with detections_placeholder.container():
                     if st.session_state.current_detections:
                         for detection in st.session_state.current_detections:
-                            auth_class = "authorized" if detection['auth'] == "Authorized" else \
-                                        "partial" if detection['auth'] == "Partially Authorized" else "unauthorized"
+                            auth_class = "authorized" if detection['authorization'] == "Authorized" else \
+                                        "partial" if detection['authorization'] == "Partially Authorized" else "unauthorized"
                             
-                            behavior_text = f" | {detection['behavior']}" if detection['auth'] == "Partially Authorized" and detection['behavior'] != "N/A" else ""
+                            behavior_text = f" | {detection['behavior']}" if detection['authorization'] == "Partially Authorized" and detection['behavior'] != "N/A" else ""
                             
                             st.markdown(f"""
                             <div class="status-box {auth_class}">
-                                <strong>{detection['name']}</strong><br>
-                                {detection['auth']}{behavior_text}
+                                <strong>{detection['identity']}</strong><br>
+                                {detection['authorization']}{behavior_text}
                             </div>
                             """, unsafe_allow_html=True)
                     else:
@@ -549,8 +549,8 @@ def main():
             # Update stats
             try:
                 total = len(st.session_state.current_detections)
-                auth = sum(1 for d in st.session_state.current_detections if d['auth'] == "Authorized")
-                unauth = sum(1 for d in st.session_state.current_detections if d['auth'] == "Unauthorized")
+                auth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Authorized")
+                unauth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Unauthorized")
                 
                 total_placeholder.metric("Total", total)
                 auth_placeholder.metric("Auth", auth)
