@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from combined_yolo_facenet_mnv3 import CombinedYOLOFaceBehavior
+import camera_config_streamlit as cam_config
 
 # Page configuration
 st.set_page_config(
@@ -43,28 +44,115 @@ st.markdown("""
         border-radius: 0.5rem;
         margin: 0.3rem 0;
         font-size: 0.9rem;
+        font-weight: 500;
     }
-    .authorized { background-color: #d4edda; border: 2px solid #28a745; }
-    .partial { background-color: #fff3cd; border: 2px solid #ffc107; }
-    .unauthorized { background-color: #f8d7da; border: 2px solid #dc3545; }
+    .status-box strong {
+        font-size: 1.1rem;
+    }
+    .authorized { 
+        background-color: #d4edda; 
+        border: 2px solid #28a745;
+        color: #155724 !important;
+    }
+    .authorized strong {
+        color: #0d4017 !important;
+    }
+    .partial { 
+        background-color: #fff3cd; 
+        border: 2px solid #ffc107;
+        color: #856404 !important;
+    }
+    .partial strong {
+        color: #533f03 !important;
+    }
+    .unauthorized { 
+        background-color: #f8d7da; 
+        border: 2px solid #dc3545;
+        color: #721c24 !important;
+    }
+    .unauthorized strong {
+        color: #491217 !important;
+    }
     .log-entry {
         padding: 0.5rem;
         margin: 0.3rem 0;
         border-left: 3px solid #007bff;
         background-color: #f8f9fa;
     }
-    /* Minimize stats display */
+    
+    /* FIXED: Stats display with high contrast */
     div[data-testid="stMetric"] {
-        background-color: #f8f9fa;
-        padding: 0.3rem;
-        border-radius: 0.3rem;
-        margin: 0.1rem 0;
+        background-color: #ffffff !important;
+        padding: 1rem !important;
+        border-radius: 0.5rem !important;
+        margin: 0.5rem 0 !important;
+        border: 2px solid #1f77b4 !important;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
     }
-    div[data-testid="stMetric"] > label {
-        font-size: 0.75rem !important;
+    div[data-testid="stMetric"] label {
+        font-size: 0.9rem !important;
+        font-weight: 700 !important;
+        color: #1f77b4 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.5px !important;
     }
-    div[data-testid="stMetric"] > div {
-        font-size: 1.1rem !important;
+    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
+        font-size: 2rem !important;
+        font-weight: 800 !important;
+        color: #000000 !important;
+    }
+    div[data-testid="stMetric"] [data-testid="stMetricDelta"] {
+        font-size: 0.85rem !important;
+        font-weight: 600 !important;
+    }
+    
+    /* Alert/Notification styles */
+    .alert-container {
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        max-width: 400px;
+        pointer-events: none;
+    }
+    .alert-notification {
+        position: relative;
+        padding: 1rem 1.5rem;
+        border-radius: 0.5rem;
+        font-weight: 600;
+        font-size: 0.95rem;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        animation: slideIn 0.3s ease-out;
+        width: 100%;
+        pointer-events: auto;
+    }
+    .alert-unauthorized {
+        background-color: #dc3545;
+        color: white;
+        border: 2px solid #a71d2a;
+    }
+    .alert-partial {
+        background-color: #ffc107;
+        color: #000;
+        border: 2px solid #d39e00;
+    }
+    .alert-info {
+        background-color: #17a2b8;
+        color: white;
+        border: 2px solid #117a8b;
+    }
+    @keyframes slideIn {
+        from {
+            transform: translateX(400px);
+            opacity: 0;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -82,6 +170,162 @@ if 'processing_thread' not in st.session_state:
     st.session_state.processing_thread = None
 if 'stop_flag' not in st.session_state:
     st.session_state.stop_flag = threading.Event()
+if 'last_alert' not in st.session_state:
+    st.session_state.last_alert = {}
+if 'alert_cooldown' not in st.session_state:
+    st.session_state.alert_cooldown = 5  # seconds between alerts for same person
+if 'active_alerts' not in st.session_state:
+    st.session_state.active_alerts = {}  # Store active alerts with timestamps
+if 'alert_duration' not in st.session_state:
+    st.session_state.alert_duration = 10  # seconds to show each alert
+if 'alert_sounds_enabled' not in st.session_state:
+    st.session_state.alert_sounds_enabled = True
+if 'last_sound_played' not in st.session_state:
+    st.session_state.last_sound_played = {}
+if 'sound_cooldown' not in st.session_state:
+    st.session_state.sound_cooldown = 3  # seconds between same sound
+
+def play_alert_sound(sound_type="unauthorized"):
+    """Generate JavaScript to play alert sound"""
+    current_time = time.time()
+    
+    # Check sound cooldown
+    if sound_type in st.session_state.last_sound_played:
+        if current_time - st.session_state.last_sound_played[sound_type] < st.session_state.sound_cooldown:
+            return ""
+    
+    st.session_state.last_sound_played[sound_type] = current_time
+    
+    if sound_type == "unauthorized":
+        # High-pitched urgent beeps (frequency: 1000Hz, 3 beeps)
+        return """
+        <script>
+        (function() {
+            if (!window.audioContext) {
+                window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            var ctx = window.audioContext;
+            var beepCount = 0;
+            function beep() {
+                if (beepCount >= 3) return;
+                var oscillator = ctx.createOscillator();
+                var gainNode = ctx.createGain();
+                oscillator.connect(gainNode);
+                gainNode.connect(ctx.destination);
+                gainNode.gain.value = 0.3;
+                oscillator.frequency.value = 1000;
+                oscillator.type = 'sine';
+                oscillator.start(ctx.currentTime);
+                oscillator.stop(ctx.currentTime + 0.15);
+                beepCount++;
+                if (beepCount < 3) {
+                    setTimeout(beep, 200);
+                }
+            }
+            beep();
+        })();
+        </script>
+        """
+    else:  # partial
+        # Medium-pitched warning beeps (frequency: 600Hz, 2 beeps)
+        return """
+        <script>
+        (function() {
+            if (!window.audioContext) {
+                window.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            var ctx = window.audioContext;
+            var beepCount = 0;
+            function beep() {
+                if (beepCount >= 2) return;
+                var oscillator = ctx.createOscillator();
+                var gainNode = ctx.createGain();
+                oscillator.connect(gainNode);
+                gainNode.connect(ctx.destination);
+                gainNode.gain.value = 0.3;
+                oscillator.frequency.value = 600;
+                oscillator.type = 'sine';
+                oscillator.start(ctx.currentTime);
+                oscillator.stop(ctx.currentTime + 0.2);
+                beepCount++;
+                if (beepCount < 2) {
+                    setTimeout(beep, 300);
+                }
+            }
+            beep();
+        })();
+        </script>
+        """
+
+def show_alert(auth_level, identity, behavior=None):
+    """Show alert notification for unauthorized/partial authorized persons"""
+    current_time = time.time()
+    alert_key = f"{identity}_{auth_level}"
+    
+    # Check cooldown for NEW alerts
+    if alert_key in st.session_state.last_alert:
+        if current_time - st.session_state.last_alert[alert_key] < st.session_state.alert_cooldown:
+            return
+    
+    # Create new alert
+    st.session_state.last_alert[alert_key] = current_time
+    
+    if auth_level == "Unauthorized":
+        alert_class = "alert-unauthorized"
+        icon = "🚨"
+        message = f"UNAUTHORIZED ACCESS: {identity}"
+        sound_type = "unauthorized"
+    elif auth_level == "Partially Authorized":
+        alert_class = "alert-partial"
+        icon = "⚠️"
+        behavior_text = f" - {behavior}" if behavior and behavior != "N/A" else ""
+        message = f"RESTRICTED ACCESS: {identity}{behavior_text}"
+        sound_type = "partial"
+    else:
+        return
+    
+    # Add to active alerts
+    st.session_state.active_alerts[alert_key] = {
+        'html': f"""
+        <div class="alert-notification {alert_class}">
+            <strong>{icon} ALERT</strong><br>
+            {message}
+        </div>
+        """,
+        'timestamp': current_time,
+        'sound_type': sound_type
+    }
+
+def get_active_alerts():
+    """Get currently active alerts (not expired) wrapped in container"""
+    current_time = time.time()
+    active = []
+    expired_keys = []
+    sound_html = ""
+    
+    for key, alert_data in st.session_state.active_alerts.items():
+        age = current_time - alert_data['timestamp']
+        if age < st.session_state.alert_duration:
+            active.append(alert_data['html'])
+            # Play sound for new alerts (within first 0.5 seconds)
+            if age < 0.5 and st.session_state.alert_sounds_enabled:
+                sound_html = play_alert_sound(alert_data.get('sound_type', 'unauthorized'))
+        else:
+            expired_keys.append(key)
+    
+    # Remove expired alerts
+    for key in expired_keys:
+        del st.session_state.active_alerts[key]
+    
+    # Wrap all alerts in a container for proper stacking
+    if active:
+        return f"""
+        {sound_html}
+        <div class="alert-container">
+            {''.join(active)}
+        </div>
+        """
+    return ""
 
 def video_processing_thread(video_source, config, frame_queue, log_queue, stop_flag):
     """Background thread for video processing with full detection pipeline"""
@@ -107,8 +351,13 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         # Open video source
         log_queue.put({"type": "info", "message": f"Opening video source..."})
 
-        if video_source == "webcam":
-            cap = cv2.VideoCapture(config.get('webcam_index', 0), cv2.CAP_DSHOW)
+        if config['source_mode'] == "webcam":
+            cap = cv2.VideoCapture(video_source, cv2.CAP_DSHOW)
+        elif config['source_mode'] == "rtsp":
+            cap = cv2.VideoCapture(video_source)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            for _ in range(10):
+                cap.grab()
         else:
             cap = cv2.VideoCapture(str(video_source))
         
@@ -116,8 +365,7 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             log_queue.put({"type": "error", "message": "Failed to open video source"})
             return
         
-        # Set camera properties
-        if video_source == "webcam":
+        if config['source_mode'] == "webcam":
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS, 30)
@@ -132,7 +380,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         consecutive_failures = 0
         max_failures = 10
         
-        # Processing dimensions
         if config['resize_factor'] < 1.0:
             process_width = int(width * config['resize_factor'])
             process_height = int(height * config['resize_factor'])
@@ -143,7 +390,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             scale_x = scale_y = 1.0
         
         while not stop_flag.is_set():
-            ret, frame = cap.read()
+            if config['source_mode'] == "rtsp":
+                cap.grab()
+                cap.grab()
+                ret, frame = cap.read()
+            else:
+                ret, frame = cap.read()
             
             if not ret:
                 consecutive_failures += 1
@@ -156,22 +408,19 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             consecutive_failures = 0
             frame_idx += 1
             
-            # Skip frames for performance
             if frame_idx % config['frame_skip'] != 0:
                 continue
             
-            # Resize for processing
             if config['resize_factor'] < 1.0:
                 process_frame = cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_LINEAR)
             else:
                 process_frame = frame
             
-            # Run YOLO detection + tracking
             results = comb.tracker.yolo.track(
                 process_frame,
                 persist=True,
                 tracker=comb.tracker.tracker_name,
-                classes=[0],  # Person class only
+                classes=[0],
                 conf=config.get('conf_threshold', 0.5),
                 iou=config.get('iou_threshold', 0.7),
                 verbose=False,
@@ -191,7 +440,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                     for bbox, track_id in zip(bboxes, track_ids):
                         x1, y1, x2, y2 = bbox
                         
-                        # Scale back to original frame size
                         x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
                         x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
                         x1, y1 = max(0, x1), max(0, y1)
@@ -200,15 +448,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         if x2 <= x1 or y2 <= y1:
                             continue
                         
-                        # Extract person crop
                         person_crop = frame[y1:y2, x1:x2]
                         
-                        # Update body features
                         body_features = comb._extract_body_features(person_crop)
                         if body_features is not None:
                             comb.track_body_features[int(track_id)].append(body_features)
                         
-                        # Get cached identity
                         persistent = comb.track_persistent_identity.get(int(track_id))
                         if persistent:
                             cached_name = persistent["name"]
@@ -217,8 +462,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             cached_name, cached_conf = comb.identity_cache.get(int(track_id), ("Unknown", 0.0))
                         
                         current_auth = comb.get_authorization_level(cached_name)
-                        
-                        # Determine if we should run face recognition
                         do_recog = comb._should_run_recognition(int(track_id), frame_idx, current_auth)
                         
                         has_face_detection = False
@@ -227,14 +470,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         
                         if do_recog:
                             try:
-                                # Run face recognition
                                 face_result = comb.recognize_face_fn(person_crop, frame, (x1, y1, x2, y2))
                                 name = face_result.get("name", "Unknown")
                                 conf = float(face_result.get("confidence", 0.0) or 0.0)
                                 
                                 has_face_detection = (name != "Unknown" and conf > 0.0)
                                 
-                                # Update recognition history
                                 comb.track_recognition_history[int(track_id)].append((name, conf))
                                 consensus_name, consensus_conf = comb._get_consensus_identity(int(track_id))
                                 
@@ -247,15 +488,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             except Exception as e:
                                 log_queue.put({"type": "warning", "message": f"Face recognition error: {str(e)}"})
                         else:
-                            # Update persistent identity without new recognition
                             identity_name, identity_conf = comb._update_persistent_identity(
                                 int(track_id), cached_name, cached_conf, False, frame_idx, person_crop
                             )
                         
-                        # Get authorization level
                         auth_level = comb.get_authorization_level(identity_name)
                         
-                        # Behavior classification - ONLY for Partially Authorized
                         behavior_name = "N/A"
                         behavior_conf = 0.0
                         
@@ -263,10 +501,7 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             do_classify = comb.tracker._should_reclassify(track_id, frame_idx)
                             if do_classify:
                                 try:
-                                    # Classify behavior
                                     class_res = comb.tracker._classify_crop(person_crop)
-                                    
-                                    # Temporal smoothing
                                     comb.tracker.prob_history[track_id].append(class_res['probs'])
                                     hist = comb.tracker.prob_history[track_id]
                                     
@@ -278,7 +513,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                                     smoothed_class_id = int(np.argmax(smoothed_probs))
                                     smoothed_confidence = float(smoothed_probs[smoothed_class_id])
                                     
-                                    # Apply confidence threshold
                                     if smoothed_confidence < comb.tracker.min_class_conf:
                                         behavior_name = "Neutral"
                                         behavior_conf = smoothed_confidence
@@ -286,7 +520,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                                         behavior_name = comb.tracker.class_names[smoothed_class_id]
                                         behavior_conf = smoothed_confidence
                                     
-                                    # Update cache
                                     comb.tracker.classification_cache[track_id] = {
                                         "class_name": behavior_name,
                                         "confidence": behavior_conf,
@@ -295,16 +528,13 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                                 except Exception as e:
                                     log_queue.put({"type": "warning", "message": f"Behavior classification error: {str(e)}"})
                             else:
-                                # Use cached classification
                                 cached_beh = comb.tracker.classification_cache.get(track_id, {"class_name": "Neutral", "confidence": 0.0})
                                 behavior_name = cached_beh["class_name"]
                                 behavior_conf = cached_beh["confidence"]
                         
-                        # Draw bounding box and labels
                         color = comb.get_authorization_color(auth_level)
                         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
                         
-                        # Identity label
                         persistent = comb.track_persistent_identity.get(int(track_id))
                         lock_indicator = " [LOCKED]" if persistent and persistent.get("locked", False) else ""
                         label = f"ID:{track_id} {identity_name}{lock_indicator}"
@@ -312,7 +542,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         cv2.putText(annotated_frame, label, (x1+2, max(20, y1-20)), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                         
-                        # Authorization + Behavior label
                         if auth_level == "Partially Authorized":
                             auth_label = f"{auth_level} | {behavior_name}"
                         else:
@@ -321,11 +550,10 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         cv2.putText(annotated_frame, auth_label, (x1+2, max(35, y1-6)), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         
-                        # Add to tracks data
                         tracks_data.append({
                             "track_id": int(track_id),
                             "identity": identity_name,
-                            "authorization": auth_level,  # Changed from "auth" to "authorization"
+                            "authorization": auth_level,
                             "behavior": behavior_name,
                             "behavior_conf": behavior_conf,
                             "identity_conf": identity_conf
@@ -375,12 +603,20 @@ def main():
         
         # Video Source
         st.subheader("Video Source")
-        source_type = st.radio("Select Source", ["Webcam", "Video File"], key="source_type")
+        source_type = st.radio("Select Source", ["Webcam", "Video File", "RTSP Camera"], key="source_type")
+        
+        # Initialize variables
+        video_source = None
+        source_mode = "webcam"
+        webcam_index = 0  # Default value
         
         if source_type == "Webcam":
-            webcam_index = st.number_input("Webcam Index", min_value=0, max_value=5, value=0)
-            video_source = "webcam"
-        else:
+            webcam_index = st.number_input("Webcam Index", min_value=0, max_value=5, value=cam_config.WEBCAM_ID)
+            video_source = int(webcam_index)  # Ensure it's an integer
+            source_mode = "webcam"
+        
+        elif source_type == "Video File":
+            # Option 1: Upload file
             video_file = st.file_uploader("Upload Video File", type=['mp4', 'avi', 'mov'])
             if video_file:
                 temp_path = REPO_ROOT / "temp" / video_file.name
@@ -389,7 +625,46 @@ def main():
                     f.write(video_file.read())
                 video_source = str(temp_path)
             else:
+                # Option 2: Use path from config
+                if Path(cam_config.VIDEO_FILE_PATH).exists():
+                    video_source = cam_config.VIDEO_FILE_PATH
+                    st.info(f"Using: {Path(video_source).name}")
+                else:
+                    st.warning("No video file selected or configured")
+            source_mode = "video"
+        
+        else:  # RTSP Camera
+            # Get available cameras
+            rtsp_cameras = cam_config.get_all_rtsp_cameras()
+            camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
+            
+            if camera_options:
+                selected_camera = st.selectbox(
+                    "Select RTSP Camera",
+                    options=list(camera_options.keys()),
+                    format_func=lambda x: camera_options[x],
+                    index=list(camera_options.keys()).index(cam_config.ACTIVE_RTSP_CAMERA) if cam_config.ACTIVE_RTSP_CAMERA in camera_options else 0
+                )
+                
+                # Show camera details
+                camera_info = cam_config.RTSP_CAMERAS[selected_camera]
+                st.text(f"IP: {camera_info['ip']}")
+                st.text(f"Stream: {camera_info['stream']}")
+                
+                # Get RTSP URL
+                video_source = cam_config.get_rtsp_url(selected_camera)
+                
+                # Show connection settings
+                with st.expander("RTSP Settings"):
+                    st.text(f"Protocol: {cam_config.RTSP_PROTOCOL}")
+                    st.text(f"Timeout: {cam_config.RTSP_TIMEOUT}s")
+                    st.text(f"Auto-reconnect: {cam_config.RTSP_AUTO_RECONNECT}")
+                    st.text(f"Buffer size: {cam_config.RTSP_BUFFER_SIZE}")
+            else:
+                st.error("No RTSP cameras configured or enabled")
                 video_source = None
+            
+            source_mode = "rtsp"
         
         st.divider()
         
@@ -414,6 +689,7 @@ def main():
         st.divider()
         
         enable_logging = st.checkbox("Enable Logging", value=True)
+        st.session_state.alert_sounds_enabled = st.checkbox("Enable Alert Sounds", value=True)
         
         st.divider()
         
@@ -431,6 +707,7 @@ def main():
         st.subheader("📹 Live Feed")
         video_placeholder = st.empty()
         status_placeholder = st.empty()
+        alert_placeholder = st.empty()  # Add this line
     
     with col2:
         st.subheader("👥 Detections")
@@ -450,7 +727,7 @@ def main():
     
     # Handle start/stop
     if start_button and not st.session_state.running:
-        if video_source:
+        if video_source is not None:
             st.session_state.running = True
             st.session_state.stop_flag.clear()
             
@@ -464,9 +741,10 @@ def main():
                 'frame_skip': frame_skip,
                 'resize_factor': resize_factor,
                 'enable_logging': enable_logging,
-                'webcam_index': int(webcam_index) if source_type == "Webcam" else 0,
+                'webcam_index': int(webcam_index),
                 'conf_threshold': 0.5,
-                'iou_threshold': 0.7
+                'iou_threshold': 0.7,
+                'source_mode': source_mode
             }
             
             # Clear queues
@@ -541,8 +819,24 @@ def main():
                                 {detection['authorization']}{behavior_text}
                             </div>
                             """, unsafe_allow_html=True)
+                            
+                            # Generate alerts for unauthorized/partial
+                            if detection['authorization'] in ["Unauthorized", "Partially Authorized"]:
+                                show_alert(
+                                    detection['authorization'], 
+                                    detection['identity'], 
+                                    detection.get('behavior')
+                                )
                     else:
                         st.info("No detections")
+                
+                # Display all active alerts (with expiration)
+                active_alerts_html = get_active_alerts()
+                if active_alerts_html:
+                    alert_placeholder.markdown(active_alerts_html, unsafe_allow_html=True)
+                else:
+                    alert_placeholder.empty()
+                    
             except:
                 pass
             

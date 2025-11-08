@@ -247,6 +247,7 @@ class CombinedYOLOFaceBehavior:
                 "myke": "Partially Authorized",
                 "dean": "Authorized",
                 "art": "Authorized",
+                "aldrikz": "Partially Authorized"
             }
 
             # Performance settings
