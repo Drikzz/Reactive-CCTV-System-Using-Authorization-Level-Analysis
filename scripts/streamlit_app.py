@@ -173,17 +173,24 @@ if 'stop_flag' not in st.session_state:
 if 'last_alert' not in st.session_state:
     st.session_state.last_alert = {}
 if 'alert_cooldown' not in st.session_state:
-    st.session_state.alert_cooldown = 5  # seconds between alerts for same person
+    st.session_state.alert_cooldown = 5
 if 'active_alerts' not in st.session_state:
-    st.session_state.active_alerts = {}  # Store active alerts with timestamps
+    st.session_state.active_alerts = {}
 if 'alert_duration' not in st.session_state:
-    st.session_state.alert_duration = 10  # seconds to show each alert
+    st.session_state.alert_duration = 10
 if 'alert_sounds_enabled' not in st.session_state:
     st.session_state.alert_sounds_enabled = True
 if 'last_sound_played' not in st.session_state:
     st.session_state.last_sound_played = {}
 if 'sound_cooldown' not in st.session_state:
-    st.session_state.sound_cooldown = 3  # seconds between same sound
+    st.session_state.sound_cooldown = 3
+# ✅ NEW: Recording state
+if 'recording_enabled' not in st.session_state:
+    st.session_state.recording_enabled = False
+if 'recording_path' not in st.session_state:
+    st.session_state.recording_path = None
+if 'video_writer' not in st.session_state:
+    st.session_state.video_writer = None
 
 def play_alert_sound(sound_type="unauthorized"):
     """Generate JavaScript to play alert sound"""
@@ -330,6 +337,8 @@ def get_active_alerts():
 def video_processing_thread(video_source, config, frame_queue, log_queue, stop_flag):
     """Background thread for video processing with full detection pipeline"""
     cap = None
+    out_writer = None  # ✅ Add video writer
+    
     try:
         log_queue.put({"type": "info", "message": "Initializing system..."})
         
@@ -343,7 +352,8 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             recog_interval=config['recog_interval'],
             frame_skip=config['frame_skip'],
             resize_factor=config['resize_factor'],
-            enable_logging=config['enable_logging']
+            enable_logging=config['enable_logging'],
+            smooth_window=config['smooth_window']
         )
         
         log_queue.put({"type": "success", "message": "Models loaded successfully"})
@@ -373,6 +383,27 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+        
+        # ✅ SETUP VIDEO RECORDING
+        if config.get('recording_enabled', False):
+            recordings_dir = REPO_ROOT / "recordings"
+            recordings_dir.mkdir(exist_ok=True)
+            
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            source_name = config['source_mode']
+            output_filename = f"recording_{source_name}_{timestamp}.mp4"
+            output_path = recordings_dir / output_filename
+            
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+            
+            if out_writer.isOpened():
+                log_queue.put({"type": "success", "message": f"Recording started: {output_filename}"})
+                log_queue.put({"type": "recording_path", "path": str(output_path)})
+            else:
+                log_queue.put({"type": "error", "message": "Failed to start recording"})
+                out_writer = None
         
         log_queue.put({"type": "success", "message": "Video source opened"})
         
@@ -559,12 +590,27 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             "identity_conf": identity_conf
                         })
             
+            # ✅ ADD TIMESTAMP TO RECORDING
+            if out_writer is not None:
+                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(annotated_frame, timestamp_text, (10, height - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Add recording indicator (red dot)
+                cv2.circle(annotated_frame, (width - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(annotated_frame, "REC", (width - 70, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
             # Update event logger
             if comb.enable_logging:
                 comb.event_logger.update_tracking(tracks_data, frame_idx)
             
             # Send detections to UI
             log_queue.put({"type": "detections", "data": tracks_data})
+            
+            # ✅ WRITE TO RECORDING
+            if out_writer is not None and out_writer.isOpened():
+                out_writer.write(annotated_frame)
             
             # Send annotated frame to display queue
             try:
@@ -592,6 +638,11 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         if cap is not None:
             cap.release()
             log_queue.put({"type": "info", "message": "Camera released"})
+        
+        # ✅ CLOSE VIDEO WRITER
+        if out_writer is not None:
+            out_writer.release()
+            log_queue.put({"type": "success", "message": "Recording saved successfully"})
 
 def main():
     # Header
@@ -616,21 +667,97 @@ def main():
             source_mode = "webcam"
         
         elif source_type == "Video File":
-            # Option 1: Upload file
-            video_file = st.file_uploader("Upload Video File", type=['mp4', 'avi', 'mov'])
-            if video_file:
-                temp_path = REPO_ROOT / "temp" / video_file.name
-                temp_path.parent.mkdir(exist_ok=True)
-                with open(temp_path, 'wb') as f:
-                    f.write(video_file.read())
-                video_source = str(temp_path)
-            else:
-                # Option 2: Use path from config
-                if Path(cam_config.VIDEO_FILE_PATH).exists():
-                    video_source = cam_config.VIDEO_FILE_PATH
-                    st.info(f"Using: {Path(video_source).name}")
+            st.info("💡 For videos > 200MB, use 'File Path' method")
+            
+            # Get available videos from Mp4TESTING folder
+            test_videos_dir = REPO_ROOT / "Mp4TESTING"
+            available_videos = []
+            if test_videos_dir.exists():
+                available_videos = sorted([
+                    f for f in test_videos_dir.glob("*") 
+                    if f.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']
+                ])
+            
+            # Method selection
+            upload_method = st.radio(
+                "Select Method", 
+                ["Browse Test Videos", "Upload File", "Custom Path"], 
+                horizontal=True
+            )
+            
+            if upload_method == "Browse Test Videos":
+                # Option 1: Select from Mp4TESTING folder
+                if available_videos:
+                    video_options = {str(v): v.name for v in available_videos}
+                    selected_video = st.selectbox(
+                        "Select Test Video",
+                        options=list(video_options.keys()),
+                        format_func=lambda x: video_options[x]
+                    )
+                    
+                    if selected_video:
+                        video_source = selected_video
+                        file_size_mb = Path(selected_video).stat().st_size / (1024 * 1024)
+                        st.success(f"✅ {Path(selected_video).name} ({file_size_mb:.1f} MB)")
+                    else:
+                        video_source = None
                 else:
-                    st.warning("No video file selected or configured")
+                    st.warning(f"⚠️ No videos found in `{test_videos_dir.relative_to(REPO_ROOT)}`")
+                    st.info("Add .mp4/.avi/.mov files to the Mp4TESTING folder")
+                    video_source = None
+            
+            elif upload_method == "Upload File":
+                # Option 2: Upload file (limited to 200MB)
+                video_file = st.file_uploader(
+                    "Upload Video (Max 200MB)", 
+                    type=['mp4', 'avi', 'mov'],
+                    help="Streamlit limits uploads to 200MB. Use 'Browse Test Videos' or 'Custom Path' for larger files."
+                )
+                
+                if video_file:
+                    # Show file size warning
+                    file_size_mb = len(video_file.getvalue()) / (1024 * 1024)
+                    if file_size_mb > 190:
+                        st.warning(f"⚠️ File is {file_size_mb:.1f} MB (close to 200MB limit)")
+                    
+                    # Save to temp folder
+                    temp_path = REPO_ROOT / "temp" / video_file.name
+                    temp_path.parent.mkdir(exist_ok=True)
+                    with open(temp_path, 'wb') as f:
+                        f.write(video_file.read())
+                    video_source = str(temp_path)
+                    st.success(f"✅ Uploaded: {video_file.name} ({file_size_mb:.1f} MB)")
+                else:
+                    video_source = None
+            
+            else:  # Custom Path
+                # Option 3: Manual file path entry
+                default_path = cam_config.VIDEO_FILE_PATH if Path(cam_config.VIDEO_FILE_PATH).exists() else ""
+                file_path_input = st.text_input(
+                    "Video File Path",
+                    value=default_path,
+                    placeholder="e.g., C:/Videos/recording.mp4 or Mp4TESTING/video.mp4",
+                    help="Enter full path or relative path from project root"
+                )
+                
+                if file_path_input:
+                    # Try absolute path first
+                    file_path = Path(file_path_input)
+                    
+                    # If not absolute, try relative to REPO_ROOT
+                    if not file_path.is_absolute():
+                        file_path = REPO_ROOT / file_path_input
+                    
+                    if file_path.exists():
+                        video_source = str(file_path)
+                        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+                        st.success(f"✅ {file_path.name} ({file_size_mb:.1f} MB)")
+                    else:
+                        st.error(f"❌ File not found: {file_path}")
+                        video_source = None
+                else:
+                    video_source = None
+            
             source_mode = "video"
         
         else:  # RTSP Camera
@@ -681,10 +808,24 @@ def main():
         
         # Performance Settings
         st.subheader("Performance")
-        frame_skip = st.slider("Frame Skip", 1, 10, 3)
-        resize_factor = st.slider("Resize", 0.1, 1.0, 0.5)
-        min_class_conf = st.slider("Min Confidence", 0.0, 1.0, 0.6)
+        frame_skip = st.slider("Frame Skip", 1, 10, 1)
+        resize_factor = st.slider("Resize", 0.1, 1.0, 1.0)
+        min_class_conf = st.slider("Min Confidence", 0.0, 1.0, 0.7)
         recog_interval = st.slider("Recognition Interval", 10, 60, 30)
+        smooth_window = st.slider("Smoothing Window", 1, 15, 7, 
+                                  help="Temporal smoothing for behavior predictions")
+        
+        st.divider()
+        
+        # ✅ RECORDING SETTINGS
+        st.subheader("📹 Recording")
+        enable_recording = st.checkbox("Enable Recording", value=True, 
+                                       help="Save annotated video with all detections")
+        
+        if enable_recording:
+            st.info("📁 Recordings saved to: `recordings/`")
+            if st.session_state.recording_path:
+                st.success(f"Current: {Path(st.session_state.recording_path).name}")
         
         st.divider()
         
@@ -730,6 +871,7 @@ def main():
         if video_source is not None:
             st.session_state.running = True
             st.session_state.stop_flag.clear()
+            st.session_state.recording_enabled = enable_recording  # ✅ Store recording state
             
             config = {
                 'yolo_model': yolo_model,
@@ -741,10 +883,12 @@ def main():
                 'frame_skip': frame_skip,
                 'resize_factor': resize_factor,
                 'enable_logging': enable_logging,
-                'webcam_index': int(webcam_index),
+                'webcam_index': int(webcam_index) if 'webcam_index' in locals() else 0,
                 'conf_threshold': 0.5,
                 'iou_threshold': 0.7,
-                'source_mode': source_mode
+                'source_mode': source_mode,
+                'smooth_window': smooth_window,
+                'recording_enabled': enable_recording,  # ✅ Pass to thread
             }
             
             # Clear queues
@@ -783,6 +927,10 @@ def main():
     # Display loop
     if st.session_state.running:
         status_placeholder.success("🟢 Running")
+        
+        # ✅ SHOW RECORDING STATUS
+        if st.session_state.recording_enabled:
+            status_placeholder.success("🟢 Running | 🔴 Recording")
         
         while st.session_state.running:
             # Get frame
@@ -859,6 +1007,8 @@ def main():
                     msg = st.session_state.log_queue.get_nowait()
                     if msg.get('type') == 'detections':
                         st.session_state.current_detections = msg.get('data', [])
+                    elif msg.get('type') == 'recording_path':
+                        st.session_state.recording_path = msg.get('path')
                     else:
                         log_messages.append(msg)
                 except queue.Empty:
@@ -889,6 +1039,25 @@ def main():
     else:
         status_placeholder.warning("🔴 Stopped")
         video_placeholder.empty()
+        
+        # ✅ SHOW DOWNLOAD BUTTON FOR LAST RECORDING
+        if st.session_state.recording_path and Path(st.session_state.recording_path).exists():
+            st.divider()
+            st.subheader("📥 Last Recording")
+            
+            recording_file = Path(st.session_state.recording_path)
+            file_size_mb = recording_file.stat().st_size / (1024 * 1024)
+            
+            st.info(f"**{recording_file.name}** ({file_size_mb:.1f} MB)")
+            
+            with open(recording_file, 'rb') as f:
+                st.download_button(
+                    label="⬇️ Download Recording",
+                    data=f.read(),
+                    file_name=recording_file.name,
+                    mime="video/mp4",
+                    use_container_width=True
+                )
 
 if __name__ == "__main__":
     main()
