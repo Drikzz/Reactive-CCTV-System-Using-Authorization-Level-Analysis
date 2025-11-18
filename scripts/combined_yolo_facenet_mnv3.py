@@ -25,84 +25,155 @@ def load_module_from_path(name, path):
     return mod
 
 class EventLogger:
-    """Handles logging of security events to file"""
-    def __init__(self, log_dir="logs", log_filename="log.txt"):
+    """Handles logging of security events to file with timestamps and video source tracking"""
+    def __init__(self, log_dir="logs", video_source=None):
         self.log_dir = Path(REPO_ROOT) / log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # ✅ CREATE UNIQUE LOG FILE FOR EACH SESSION
+        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # ✅ EXTRACT VIDEO SOURCE NAME
+        if video_source == "webcam" or isinstance(video_source, int):
+            source_name = f"webcam_{video_source if isinstance(video_source, int) else WEBCAM_INDEX}"
+        elif video_source is not None:
+            source_name = Path(video_source).stem  # Get filename without extension
+        else:
+            source_name = "unknown"
+        
+        # ✅ CREATE SESSION-SPECIFIC LOG FILE
+        log_filename = f"log_{source_name}_{session_timestamp}.txt"
         self.log_file = self.log_dir / log_filename
+        
+        # ✅ STORE SESSION INFO
+        self.video_source = video_source
+        self.session_start = datetime.now()
+        self.session_id = session_timestamp
         
         # Track person states to detect entry/exit
         self.person_in_room = {}  # track_id: (name, auth_level, last_seen_frame)
         self.last_logged_behavior = {}  # track_id: behavior_name
         
-        # Create log file if it doesn't exist
-        if not self.log_file.exists():
-            with open(self.log_file, 'w') as f:
-                f.write("=== CCTV Security Log ===\n")
-                f.write(f"Log started: {self._get_timestamp()}\n")
-                f.write("=" * 50 + "\n\n")
+        # ✅ CREATE LOG FILE WITH SESSION HEADER
+        with open(self.log_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("CCTV SECURITY MONITORING LOG\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Session ID:      {self.session_id}\n")
+            f.write(f"Video Source:    {video_source}\n")
+            f.write(f"Session Started: {self.session_start.strftime('%Y-%m-%d %I:%M:%S %p')}\n")
+            f.write(f"Log File:        {self.log_file.name}\n")
+            f.write("=" * 80 + "\n\n")
         
-        print(f"[INFO] Event logger initialized. Log file: {self.log_file}")
+        print(f"[INFO] Event logger initialized")
+        print(f"[INFO] Session ID: {self.session_id}")
+        print(f"[INFO] Log file: {self.log_file}")
     
     def _get_timestamp(self):
-        """Get formatted timestamp"""
-        return datetime.now().strftime("%m-%d-%y %I:%M%p")
+        """Get formatted timestamp with date and time"""
+        return datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
     
-    def _write_log(self, message):
-        """Write message to log file"""
+    def _get_elapsed_time(self):
+        """Get elapsed time since session start"""
+        elapsed = datetime.now() - self.session_start
+        total_seconds = int(elapsed.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    
+    def _write_log(self, message, event_type="INFO"):
+        """Write message to log file with timestamp and elapsed time"""
         try:
+            timestamp = self._get_timestamp()
+            elapsed = self._get_elapsed_time()
+            
+            # ✅ FORMAT: [TIMESTAMP] [ELAPSED] [TYPE] MESSAGE
+            log_entry = f"[{timestamp}] [+{elapsed}] [{event_type}] {message}"
+            
             with open(self.log_file, 'a') as f:
-                f.write(f"{message}\n")
+                f.write(f"{log_entry}\n")
+            
+            # Also print to console with color coding
+            color_codes = {
+                "ENTRY": "\033[92m",   # Green
+                "EXIT": "\033[94m",    # Blue
+                "BEHAVIOR": "\033[93m", # Yellow
+                "ALERT": "\033[91m",   # Red
+                "INFO": "\033[0m"      # Default
+            }
+            color = color_codes.get(event_type, "\033[0m")
+            print(f"{color}[LOG] {log_entry}\033[0m")
+            
         except Exception as e:
             print(f"[ERROR] Failed to write to log: {e}")
     
     def log_person_entry(self, track_id, name, auth_level):
         """Log when a person enters the room"""
-        timestamp = self._get_timestamp()
-        
         if auth_level == "Authorized":
-            message = f"{timestamp} {name} entered the room"
+            message = f"{name} entered the room"
+            event_type = "ENTRY"
         elif auth_level == "Partially Authorized":
-            message = f"{timestamp} {name} has entered the room"
+            message = f"{name} entered the room (Restricted Access)"
+            event_type = "ENTRY"
         else:  # Unauthorized
-            message = f"{timestamp} Unrecognized person has entered the room"
+            message = f"UNRECOGNIZED PERSON entered the room (ID: {track_id})"
+            event_type = "ALERT"
         
-        self._write_log(message)
-        print(f"[LOG] {message}")
+        self._write_log(message, event_type)
     
     def log_person_exit(self, track_id, name, auth_level):
         """Log when a person exits the room"""
-        timestamp = self._get_timestamp()
-        
         if auth_level == "Authorized":
-            message = f"{timestamp} {name} left the room"
+            message = f"{name} left the room"
+            event_type = "EXIT"
         elif auth_level == "Partially Authorized":
-            message = f"{timestamp} {name} has left the room"
+            message = f"{name} left the room"
+            event_type = "EXIT"
         else:  # Unauthorized
-            message = f"{timestamp} Unrecognized person has left the room"
+            message = f"UNRECOGNIZED PERSON left the room (ID: {track_id})"
+            event_type = "EXIT"
         
-        self._write_log(message)
-        print(f"[LOG] {message}")
+        self._write_log(message, event_type)
     
     def log_behavior(self, track_id, name, behavior):
         """Log behavior for partially authorized persons"""
-        timestamp = self._get_timestamp()
-        
         # Map behavior names to readable actions
         behavior_actions = {
             "Neutral": "NEUTRAL BEHAVIOR",
-            "Suspicious": "SUSPICIOUS BEHAVIOR",
+            "Suspicious": "SUSPICIOUS BEHAVIOR - REQUIRES ATTENTION",
             "holding-object": "HOLDING OBJECT",
             "using-computer": "USING COMPUTER",
             "opening-cabinet": "OPENING CABINET",
-            # Add more mappings as needed
         }
         
         action = behavior_actions.get(behavior, behavior.upper())
-        message = f"{timestamp} {name} is {action}"
+        message = f"{name} is {action} (ID: {track_id})"
         
-        self._write_log(message)
-        print(f"[LOG] {message}")
+        # Use ALERT type for suspicious behavior
+        event_type = "ALERT" if behavior == "Suspicious" else "BEHAVIOR"
+        
+        self._write_log(message, event_type)
+    
+    def log_session_end(self):
+        """Log session end information"""
+        try:
+            session_end = datetime.now()
+            duration = session_end - self.session_start
+            
+            with open(self.log_file, 'a') as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("SESSION ENDED\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"Session Ended:   {session_end.strftime('%Y-%m-%d %I:%M:%S %p')}\n")
+                f.write(f"Total Duration:  {self._get_elapsed_time()}\n")
+                f.write(f"Total Persons:   {len(self.person_in_room)}\n")
+                f.write("=" * 80 + "\n")
+            
+            print(f"\n[INFO] Session log saved: {self.log_file}")
+            print(f"[INFO] Total duration: {self._get_elapsed_time()}")
+        except Exception as e:
+            print(f"[ERROR] Failed to write session end: {e}")
     
     def update_tracking(self, tracks_data, frame_idx, frames_before_exit=90):
         """
@@ -168,7 +239,7 @@ class CombinedYOLOFaceBehavior:
      - MobileNetV2 -> behavior classification (per-track caching + smoothing) - ONLY for Partially Authorized
      - FaceNet (from facenet_main.py) -> face recognition per track
      - Authorization logic based on recognized identity
-     - Event logging system
+     - Event logging system with timestamps
     """
     def __init__(self, yolo_path, mobilenet_path, facenet_main_path, device=None, tracker_cfg="bytetrack.yaml",
                  reclass_interval=10, smooth_window=7, min_class_conf=0.6, recog_interval=30,
@@ -176,12 +247,16 @@ class CombinedYOLOFaceBehavior:
                  frame_skip=2, use_half_precision=True, resize_factor=0.5,
                  min_face_size=60, face_quality_threshold=0.3, consensus_window=3,
                  body_memory_frames=300, min_face_detections=2, identity_persistence_frames=900,
-                 enable_logging=True):
+                 enable_logging=True, video_source=None):  # ✅ Add video_source parameter
         
-        # Initialize event logger
+        # ✅ INITIALIZE EVENT LOGGER WITH VIDEO SOURCE
         self.enable_logging = enable_logging
+        self.video_source = video_source  # ✅ Store video source
         if self.enable_logging:
-            self.event_logger = EventLogger()
+            self.event_logger = EventLogger(video_source=video_source)  # ✅ Pass video source
+        
+        # ✅ STORE SMOOTHING WINDOW
+        self.smoothing_window = int(smooth_window)
         
         # Check if MobileNetV2 tracker exists, if not create inline
         yolo_mnv_path = Path(REPO_ROOT) / "behavior_recognition" / "MobileNetV2" / "yolo_mobilenet_tracker.py"
@@ -200,6 +275,7 @@ class CombinedYOLOFaceBehavior:
                 print(f"[INFO] YOLO model not found at '{yolo_model_path}'. Falling back to hub model 'yolov8n.pt' (will download automatically).")
                 yolo_model_path = "yolov8n.pt"
      
+            # ✅ PASS SMOOTHING WINDOW TO TRACKER
             self.tracker = TrackerClass(
                 yolo_model_path=yolo_model_path,
                 mobilenet_model_path=str(mobilenet_path),
@@ -207,7 +283,7 @@ class CombinedYOLOFaceBehavior:
                 tracker=tracker_cfg,
                 device=device,
                 reclass_interval=reclass_interval,
-                smoothing_window=smooth_window
+                smoothing_window=self.smoothing_window  # ✅ Pass smoothing_window
             )
             self.tracker.min_class_conf = float(min_class_conf)
 
@@ -688,6 +764,10 @@ class CombinedYOLOFaceBehavior:
         return frames_since >= self.recog_interval
 
     def process_video(self, video_source, display=True, save_output=None, conf_threshold=0.5, iou_threshold=0.7):
+        # ✅ UPDATE EVENT LOGGER WITH VIDEO SOURCE IF NOT SET
+        if self.enable_logging and self.event_logger.video_source is None:
+            self.event_logger.video_source = video_source
+        
         # Open video
         if video_source == "webcam":
             # Try to open the default webcam index first
@@ -1007,6 +1087,10 @@ class CombinedYOLOFaceBehavior:
                 out_writer.release()
             if display:
                 cv2.destroyAllWindows()
+            
+            # ✅ LOG SESSION END
+            if self.enable_logging:
+                self.event_logger.log_session_end()
 
     # Helper utils
     @staticmethod
@@ -1044,12 +1128,12 @@ class CombinedYOLOFaceBehavior:
         
         # Create a simple tracker object
         class InlineTracker:
-            def __init__(self, yolo_path, mobilenet_path, device):
+            def __init__(self, yolo_path, mobilenet_path, device, smoothing_window):  # ✅ Add smoothing_window param
                 self.device = device
                 self.yolo = YOLO(yolo_path if Path(yolo_path).exists() else "yolov8n.pt")
                 self.tracker_name = tracker_cfg
                 self.reclass_interval = reclass_interval
-                self.smoothing_window = smooth_window
+                self.smoothing_window = smoothing_window  # ✅ Store smoothing_window
                 self.min_class_conf = 0.6
                 
                 # Load MobileNetV2
@@ -1066,7 +1150,7 @@ class CombinedYOLOFaceBehavior:
                 
                 # Tracking state
                 self.classification_cache = {}
-                self.prob_history = defaultdict(lambda: deque(maxlen=smooth_window))
+                self.prob_history = defaultdict(lambda: deque(maxlen=smoothing_window))  # ✅ Use smoothing_window
                 self.last_classification_frame = {}
                 
                 # Transforms
@@ -1102,8 +1186,12 @@ class CombinedYOLOFaceBehavior:
                     print(f"[ERROR] Classification failed: {e}")
                     return {"class_name": "Neutral", "confidence": 0.0, "probs": np.ones(self.num_classes) / self.num_classes}
         
-        self.tracker = InlineTracker(yolo_path, mobilenet_path, device)
+        # ✅ PASS SMOOTHING WINDOW TO INLINE TRACKER
+        self.tracker = InlineTracker(yolo_path, mobilenet_path, device, smooth_window)
         print("[INFO] Inline MobileNetV2 tracker created successfully")
+        print(f"[INFO] Smoothing window: {smooth_window} frames")  # ✅ Log smoothing window
+
+    # ...rest of the class methods remain the same...
 
 def main():
     parser = argparse.ArgumentParser(description="Combined YOLOv8 + MobileNetV2 + FaceNet pipeline with Authorization and Logging")
@@ -1134,7 +1222,7 @@ def main():
     
     # Behavior classification parameters
     parser.add_argument("--reclass-interval", type=int, default=10, help="Re-classification interval in frames")
-    parser.add_argument("--smooth-window", type=int, default=7, help="Temporal smoothing window for behavior")
+    parser.add_argument("--smooth-window", type=int, default=7, help="Temporal smoothing window for behavior")  # ✅ Already exists
     
     # Persistence parameters
     parser.add_argument("--identity-persistence", type=int, default=900, help="Frames to persist identity without face")
@@ -1188,11 +1276,12 @@ def main():
         resize_factor=args.resize_factor,
         min_face_size=args.min_face_size,
         consensus_window=args.consensus_window,
-        reclass_interval=args.recog_interval,
+        reclass_interval=args.reclass_interval,
         smooth_window=args.smooth_window,
         identity_persistence_frames=args.identity_persistence,
         min_face_detections=args.min_face_detections,
-        enable_logging=not args.no_logging
+        enable_logging=not args.no_logging,
+        video_source=video_src  # ✅ Pass video source to logger
     )
     comb.process_video(video_src, display=not args.no_display, save_output=args.save)
 
