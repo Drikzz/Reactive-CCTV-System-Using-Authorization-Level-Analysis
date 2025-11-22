@@ -1,0 +1,32 @@
+================================================================================
+CCTV SECURITY MONITORING LOG
+================================================================================
+Session ID:      20251121_170202
+Camera Source:   webcam0
+Video Source:    webcam0
+Session Started: 2025-11-21 05:02:03 PM
+Log File:        C:\Codes\github-clones-v2\Reactive-CCTV-System-Using-Authorization-Level-Analysis\logs\webcam0\log_20251121_170202.txt
+================================================================================
+
+[2025-11-21 05:02:08 PM] [+00:00:04] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 3)
+[2025-11-21 05:02:08 PM] [+00:00:04] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 4)
+[2025-11-21 05:02:28 PM] [+00:00:25] [EXIT] UNRECOGNIZED PERSON left the room (ID: 4)
+[2025-11-21 05:02:38 PM] [+00:00:35] [EXIT] UNRECOGNIZED PERSON left the room (ID: 3)
+[2025-11-21 05:02:41 PM] [+00:00:38] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 6)
+[2025-11-21 05:03:16 PM] [+00:01:13] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 9)
+[2025-11-21 05:03:28 PM] [+00:01:24] [EXIT] Aldrikz left the room
+[2025-11-21 05:03:44 PM] [+00:01:41] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 12)
+[2025-11-21 05:03:55 PM] [+00:01:51] [EXIT] myke left the room
+[2025-11-21 05:04:00 PM] [+00:01:57] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 15)
+[2025-11-21 05:04:02 PM] [+00:01:58] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 16)
+[2025-11-21 05:04:12 PM] [+00:02:09] [EXIT] UNRECOGNIZED PERSON left the room (ID: 12)
+[2025-11-21 05:04:21 PM] [+00:02:17] [ALERT] UNRECOGNIZED PERSON entered the room (ID: 20)
+[2025-11-21 05:04:21 PM] [+00:02:18] [EXIT] dean left the room
+
+================================================================================
+SESSION ENDED
+================================================================================
+Session Ended:   2025-11-21 05:04:22 PM
+Total Duration:  00:02:19
+Total Persons:   2
+================================================================================
