@@ -337,8 +337,7 @@ def get_active_alerts():
 def video_processing_thread(video_source, config, frame_queue, log_queue, stop_flag):
     """Background thread for video processing with full detection pipeline"""
     cap = None
-    cap2 = None
-    out_writer = None
+    out_writer = None  # ✅ Add video writer
     out_writer2 = None
     comb_secondary_logger = None
     
@@ -419,40 +418,52 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                 cap.grab()
         else:
             cap = cv2.VideoCapture(str(video_source))
-            
-        # Initialize Secondary Camera
-        cap2 = None
-        if config.get('secondary_source') is not None:
-            log_queue.put({"type": "info", "message": f"Opening secondary source..."})
-            sec_source = config['secondary_source']
-            sec_mode = config.get('secondary_mode', 'webcam')
-            
-            if sec_mode == "webcam":
-                cap2 = cv2.VideoCapture(sec_source, cv2.CAP_DSHOW)
-                cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                cap2.set(cv2.CAP_PROP_FPS, 30)
-                cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            elif sec_mode == "rtsp":
-                cap2 = cv2.VideoCapture(sec_source)
-                cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                for _ in range(10):
-                    cap2.grab()
-            
-            if not cap2 or not cap2.isOpened():
-                log_queue.put({"type": "error", "message": "Failed to open secondary source"})
-                cap2 = None
-            else:
-                log_queue.put({"type": "success", "message": "Secondary camera opened"})
         
         if not cap.isOpened():
             log_queue.put({"type": "error", "message": "Failed to open video source"})
             return
         
-        # Get dimensions
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        if config['source_mode'] == "webcam":
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
         fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+
+        if width == 0 or height == 0:
+             ret_temp, frame_temp = cap.read()
+             if ret_temp:
+                 height, width = frame_temp.shape[:2]
+             else:
+                 width, height = 640, 480 # Fallback
+        
+        # Adjust width for dual camera
+        w1 = width # Store primary width
+        w2_final = 0 # Initialize secondary width
+        
+        if cap2 is not None:
+            w2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            
+            # ✅ FIX: Robust dimension check for Secondary (Crucial for RTSP)
+            if w2 == 0 or h2 == 0:
+                if config.get('secondary_mode') == "rtsp":
+                    cap2.grab() # Flush buffer
+                ret_temp, frame_temp = cap2.read()
+                if ret_temp:
+                    h2, w2 = frame_temp.shape[:2]
+                else:
+                    w2, h2 = 640, 480 # Fallback
+            
+            # We will resize h2 to match height
+            if h2 > 0:
+                scale = height / h2
+                new_w2 = int(w2 * scale)
+                width = width + new_w2
+                w2_final = new_w2 # Store expected secondary width
         
         # ✅ CRITICAL FIX: Use SOURCE FPS (we record every frame read from camera)
         recording_fps = fps  # Don't divide by frame_skip!
@@ -524,38 +535,14 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             output_path = primary_rec_dir / output_filename
             
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
             
-            # ✅ Use SOURCE FPS for recording
-            recording_fps = fps
-            
-            out_writer = cv2.VideoWriter(str(output_path), fourcc, recording_fps, (w1, height))
-            
-            if cap2 is not None and w2_original > 0 and h2_original > 0:
-                # ✅ Create SECONDARY camera folder
-                secondary_rec_dir = REPO_ROOT / "recordings" / secondary_cam_id
-                secondary_rec_dir.mkdir(parents=True, exist_ok=True)
-                
-                # ✅ SAME FILENAME AS LOG: recording_{timestamp}.mp4
-                output_filename2 = f"recording_{session_timestamp}.mp4"
-                output_path2 = secondary_rec_dir / output_filename2
-                out_writer2 = cv2.VideoWriter(str(output_path2), fourcc, recording_fps, (w2_original, h2_original))
-                
-                if out_writer.isOpened() and out_writer2.isOpened():
-                    log_queue.put({"type": "success", "message": f"Dual Recording @ {recording_fps}fps"})
-                    log_queue.put({"type": "recording_path", "path": str(output_path)})
-                    log_queue.put({"type": "recording_path", "path": str(output_path2)})
-                else:
-                    log_queue.put({"type": "error", "message": "Failed to start dual recording"})
-                    out_writer = None
-                    out_writer2 = None
+            if out_writer.isOpened():
+                log_queue.put({"type": "success", "message": f"Recording started: {output_filename}"})
+                log_queue.put({"type": "recording_path", "path": str(output_path)})
             else:
-                out_writer2 = None
-                if out_writer.isOpened():
-                    log_queue.put({"type": "success", "message": f"Recording started @ {recording_fps}fps"})
-                    log_queue.put({"type": "recording_path", "path": str(output_path)})
-                else:
-                    log_queue.put({"type": "error", "message": "Failed to start recording"})
-                    out_writer = None
+                log_queue.put({"type": "error", "message": "Failed to start recording"})
+                out_writer = None
         
         log_queue.put({"type": "success", "message": "Video source opened"})
         
@@ -572,16 +559,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             else:
                 ret, frame = cap.read()
             
-            ret2 = False
-            frame2 = None
-            if cap2 is not None:
-                if config.get('secondary_mode') == "rtsp":
-                    cap2.grab()
-                    cap2.grab()
-                    ret2, frame2 = cap2.read()
-                else:
-                    ret2, frame2 = cap2.read()
-
             if not ret:
                 consecutive_failures += 1
                 if consecutive_failures >= max_failures:
@@ -830,83 +807,38 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         cv2.putText(annotated_stitched, auth_label, (x1+2, max(35, y1-6)), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                         
-                        # ✅ Draw on individual camera frames for NEXT recording cycle
-                        if target_frame_record is not None:
-                            x1r, y1r, x2r, y2r = record_coords
-                            if cam_source == "Secondary":
-                                if x1r >= 0 and x2r <= w2_original and y1r >= 0 and y2r <= h2_original:
-                                    cv2.rectangle(target_frame_record, (x1r, y1r), (x2r, y2r), color, 2)
-                                    cv2.putText(target_frame_record, label, (x1r+2, max(20, y1r-20)), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-                                    cv2.putText(target_frame_record, auth_label, (x1r+2, max(35, y1r-6)), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                            else:
-                                if x1r >= 0 and x2r <= w1 and y1r >= 0 and y2r <= height:
-                                    cv2.rectangle(target_frame_record, (x1r, y1r), (x2r, y2r), color, 2)
-                                    cv2.putText(target_frame_record, label, (x1r+2, max(20, y1r-20)), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
-                                    cv2.putText(target_frame_record, auth_label, (x1r+2, max(35, y1r-6)), 
-                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        
-                        track_info = {
+                        tracks_data.append({
                             "track_id": int(track_id),
                             "identity": identity_name,
                             "authorization": auth_level,
                             "behavior": behavior_name,
                             "behavior_conf": behavior_conf,
-                            "identity_conf": identity_conf,
-                            "camera": cam_source
-                        }
-                        
-                        tracks_data.append(track_info)
-                        
-                        # ✅ Add to camera-specific lists for SEPARATE logging
-                        if cam_source == "Primary":
-                            tracks_data_primary.append(track_info)
-                        else:
-                            tracks_data_secondary.append(track_info)
+                            "identity_conf": identity_conf
+                        })
             
-            # ✅ Write ANNOTATED frames to separate recordings (with detections)
-            # This happens AFTER processing, so recordings will have bounding boxes
-            if out_writer is not None and out_writer.isOpened() and annotated_frame1_for_record is not None:
+            # ✅ ADD TIMESTAMP TO RECORDING
+            if out_writer is not None:
                 timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                h_ann, w_ann = annotated_frame1_for_record.shape[:2]
-                cv2.putText(annotated_frame1_for_record, timestamp_text, (10, h_ann - 20),
+                cv2.putText(annotated_frame, timestamp_text, (10, height - 20),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.circle(annotated_frame1_for_record, (w_ann - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(annotated_frame1_for_record, "REC", (w_ann - 70, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 
-                if annotated_frame1_for_record.shape[1] == w1 and annotated_frame1_for_record.shape[0] == height:
-                    out_writer.write(annotated_frame1_for_record)
-                else:
-                    out_writer.write(cv2.resize(annotated_frame1_for_record, (w1, height)))
-            
-            if out_writer2 is not None and out_writer2.isOpened() and annotated_frame2_for_record is not None:
-                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                h_ann2, w_ann2 = annotated_frame2_for_record.shape[:2]
-                cv2.putText(annotated_frame2_for_record, timestamp_text, (10, h_ann2 - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.circle(annotated_frame2_for_record, (w_ann2 - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(annotated_frame2_for_record, "REC", (w_ann2 - 70, 35),
+                # Add recording indicator (red dot)
+                cv2.circle(annotated_frame, (width - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(annotated_frame, "REC", (width - 70, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                
-                if annotated_frame2_for_record.shape[1] == w2_original and annotated_frame2_for_record.shape[0] == h2_original:
-                    out_writer2.write(annotated_frame2_for_record)
-                else:
-                    out_writer2.write(cv2.resize(annotated_frame2_for_record, (w2_original, h2_original)))
             
-            # ✅ Update SEPARATE loggers for each camera
-            if config['enable_logging']:
-                if primary_logger is not None:
-                    primary_logger.update_tracking(tracks_data_primary, frame_idx)
-                if comb_secondary_logger is not None:
-                    comb_secondary_logger.update_tracking(tracks_data_secondary, frame_idx)
+            # Update event logger
+            if comb.enable_logging:
+                comb.event_logger.update_tracking(tracks_data, frame_idx)
             
             # ✅ Send detections to UI
             log_queue.put({"type": "detections", "data": tracks_data})
             
-            # ✅ Send annotated STITCHED frame to display
+            # ✅ WRITE TO RECORDING
+            if out_writer is not None and out_writer.isOpened():
+                out_writer.write(annotated_frame)
+            
+            # Send annotated frame to display queue
             try:
                 while not frame_queue.empty():
                     try:
@@ -932,20 +864,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         # Cleanup resources
         if cap is not None:
             cap.release()
-        if cap2 is not None:
-            cap2.release()
+            log_queue.put({"type": "info", "message": "Camera released"})
+        
+        # ✅ CLOSE VIDEO WRITER
         if out_writer is not None:
             out_writer.release()
-        if out_writer2 is not None:
-            out_writer2.release()
-        
-        # ✅ Close event loggers
-        if 'primary_logger' in locals() and primary_logger is not None:
-            primary_logger.log_session_end()
-        if comb_secondary_logger is not None:
-            comb_secondary_logger.log_session_end()
-            
-        log_queue.put({"type": "success", "message": "Recordings saved successfully"})
+            log_queue.put({"type": "success", "message": "Recording saved successfully"})
 
 def main():
     # Header
