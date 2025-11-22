@@ -337,14 +337,35 @@ def get_active_alerts():
 def video_processing_thread(video_source, config, frame_queue, log_queue, stop_flag):
     """Background thread for video processing with full detection pipeline"""
     cap = None
-    cap2 = None
     out_writer = None  # ✅ Add video writer
-    out_writer2 = None # ✅ Add secondary video writer
+    out_writer2 = None
+    comb_secondary_logger = None
     
     try:
         log_queue.put({"type": "info", "message": "Initializing system..."})
         
-        # Initialize the combined system
+        # ✅ CREATE SINGLE SESSION TIMESTAMP FOR BOTH LOGS AND RECORDINGS
+        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # ✅ Determine camera identifiers
+        primary_cam_id = "primary"
+        secondary_cam_id = "secondary"
+        
+        if config['source_mode'] == "webcam":
+            primary_cam_id = f"webcam{config.get('webcam_index', 0)}"
+        elif config['source_mode'] == "rtsp":
+            primary_cam_id = "rtsp_primary"
+        elif config['source_mode'] == "video":
+            video_name = Path(video_source).stem if isinstance(video_source, (str, Path)) else "video"
+            primary_cam_id = f"video_{video_name}"
+        
+        if config.get('secondary_source') is not None:
+            if config.get('secondary_mode') == "webcam":
+                secondary_cam_id = f"webcam{config.get('secondary_source', 1)}"
+            elif config.get('secondary_mode') == "rtsp":
+                secondary_cam_id = "rtsp_secondary"
+        
+        # ✅ Initialize PRIMARY logger with session timestamp
         comb = CombinedYOLOFaceBehavior(
             yolo_path=config['yolo_model'],
             mobilenet_path=config['mobilenet_model'],
@@ -354,17 +375,42 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             recog_interval=config['recog_interval'],
             frame_skip=config['frame_skip'],
             resize_factor=config['resize_factor'],
-            enable_logging=config['enable_logging'],
-            smooth_window=config['smooth_window']
+            enable_logging=False,  # ✅ Disable built-in logging, we'll create custom
+            smooth_window=config['smooth_window'],
+            video_source=primary_cam_id
         )
+        
+        # ✅ Create PRIMARY logger manually with session timestamp
+        primary_logger = None
+        if config['enable_logging']:
+            from combined_yolo_facenet_mnv3 import EventLogger
+            primary_logger = EventLogger(
+                video_source=primary_cam_id,
+                session_timestamp=session_timestamp  # ✅ Pass same timestamp
+            )
+            log_queue.put({"type": "success", "message": f"Primary logger: {primary_cam_id}"})
+        
+        # ✅ Create SECONDARY logger with SAME session timestamp
+        if config.get('secondary_source') is not None and config['enable_logging']:
+            from combined_yolo_facenet_mnv3 import EventLogger
+            comb_secondary_logger = EventLogger(
+                video_source=secondary_cam_id,
+                session_timestamp=session_timestamp  # ✅ SAME timestamp as primary
+            )
+            log_queue.put({"type": "success", "message": f"Secondary logger: {secondary_cam_id}"})
         
         log_queue.put({"type": "success", "message": "Models loaded successfully"})
         
-        # Open video source
+        # Open video sources
         log_queue.put({"type": "info", "message": f"Opening video source..."})
 
+        # Initialize primary camera
         if config['source_mode'] == "webcam":
             cap = cv2.VideoCapture(video_source, cv2.CAP_DSHOW)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         elif config['source_mode'] == "rtsp":
             cap = cv2.VideoCapture(video_source)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -372,25 +418,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                 cap.grab()
         else:
             cap = cv2.VideoCapture(str(video_source))
-            
-        # Initialize Secondary Camera
-        cap2 = None
-        if config.get('secondary_source') is not None:
-            log_queue.put({"type": "info", "message": f"Opening secondary source..."})
-            sec_source = config['secondary_source']
-            sec_mode = config.get('secondary_mode', 'webcam')
-            
-            if sec_mode == "webcam":
-                cap2 = cv2.VideoCapture(sec_source, cv2.CAP_DSHOW)
-                cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            elif sec_mode == "rtsp":
-                cap2 = cv2.VideoCapture(sec_source)
-                cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
-            if not cap2 or not cap2.isOpened():
-                log_queue.put({"type": "error", "message": "Failed to open secondary source"})
-                cap2 = None
         
         if not cap.isOpened():
             log_queue.put({"type": "error", "message": "Failed to open video source"})
@@ -402,9 +429,8 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             cap.set(cv2.CAP_PROP_FPS, 30)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
-        # ✅ FIX: Robust dimension check for Primary
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
         fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
 
         if width == 0 or height == 0:
@@ -439,49 +465,84 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                 width = width + new_w2
                 w2_final = new_w2 # Store expected secondary width
         
-        # ✅ SETUP VIDEO RECORDING
-        if config.get('recording_enabled', False):
-            recordings_dir = REPO_ROOT / "recordings"
-            recordings_dir.mkdir(exist_ok=True)
+        # ✅ CRITICAL FIX: Use SOURCE FPS (we record every frame read from camera)
+        recording_fps = fps  # Don't divide by frame_skip!
+        
+        log_queue.put({"type": "info", "message": f"Source FPS: {fps}, Recording FPS: {recording_fps}"})
+
+        if width == 0 or height == 0:
+             ret_temp, frame_temp = cap.read()
+             if ret_temp:
+                 height, width = frame_temp.shape[:2]
+             else:
+                 width, height = 640, 480
+        
+        w1 = width
+        w2_final = 0
+        w2_original = 0
+        h2_original = 0
+        
+        if cap2 is not None:
+            w2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            h2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            source_name = config['source_mode']
-            output_filename = f"recording_{source_name}_{timestamp}.mp4"
-            output_path = recordings_dir / output_filename
+            if w2 == 0 or h2 == 0:
+                if config.get('secondary_mode') == "rtsp":
+                    for _ in range(5):
+                        cap2.grab()
+                
+                ret_temp, frame_temp = cap2.read()
+                if ret_temp:
+                    h2, w2 = frame_temp.shape[:2]
+                    log_queue.put({"type": "info", "message": f"Secondary dimensions: {w2}x{h2}"})
+                else:
+                    log_queue.put({"type": "error", "message": "Failed to read secondary frame"})
+                    cap2.release()
+                    cap2 = None
+                    w2, h2 = 0, 0
+            
+            w2_original = w2
+            h2_original = h2
+            
+            if cap2 is not None and h2 > 0 and w2 > 0 and height > 0:
+                scale = height / h2
+                w2_final = int(w2 * scale)
+                
+                if w2_final <= 0:
+                    log_queue.put({"type": "error", "message": f"Invalid width: {w2_final}"})
+                    cap2.release()
+                    cap2 = None
+                    w2_final = 0
+                else:
+                    log_queue.put({"type": "info", "message": f"Primary: {w1}x{height}, Secondary: {w2_original}x{h2_original}"})
+            else:
+                log_queue.put({"type": "error", "message": f"Invalid secondary dimensions"})
+                if cap2 is not None:
+                    cap2.release()
+                    cap2 = None
+                w2_final = 0
+
+        # ✅ Setup recording in camera-specific folders
+        if config.get('recording_enabled', False):
+            # ✅ USE SAME session_timestamp variable created above
+            
+            # ✅ Create PRIMARY camera folder
+            primary_rec_dir = REPO_ROOT / "recordings" / primary_cam_id
+            primary_rec_dir.mkdir(parents=True, exist_ok=True)
+            
+            # ✅ SAME FILENAME AS LOG: recording_{timestamp}.mp4
+            output_filename = f"recording_{session_timestamp}.mp4"
+            output_path = primary_rec_dir / output_filename
             
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            # If dual camera, we record separate files
-            if cap2 is not None:
-                # Primary
-                out_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w1, height))
-                
-                # Secondary
-                output_filename2 = f"recording_secondary_{timestamp}.mp4"
-                output_path2 = recordings_dir / output_filename2
-                
-                # ✅ FIX: Only create writer if dimensions are valid
-                if w2_final > 0:
-                    out_writer2 = cv2.VideoWriter(str(output_path2), fourcc, fps, (w2_final, height))
-                else:
-                    out_writer2 = None
-                
-                if out_writer.isOpened() and (out_writer2 is None or out_writer2.isOpened()):
-                    log_queue.put({"type": "success", "message": f"Dual Recording started"})
-                    log_queue.put({"type": "recording_path", "path": str(output_path)})
-                else:
-                    log_queue.put({"type": "error", "message": "Failed to start dual recording"})
-                    out_writer = None
-                    out_writer2 = None
+            out_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+            
+            if out_writer.isOpened():
+                log_queue.put({"type": "success", "message": f"Recording started: {output_filename}"})
+                log_queue.put({"type": "recording_path", "path": str(output_path)})
             else:
-                # Single camera
-                out_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-                
-                if out_writer.isOpened():
-                    log_queue.put({"type": "success", "message": f"Recording started: {output_filename}"})
-                    log_queue.put({"type": "recording_path", "path": str(output_path)})
-                else:
-                    log_queue.put({"type": "error", "message": "Failed to start recording"})
-                    out_writer = None
+                log_queue.put({"type": "error", "message": "Failed to start recording"})
+                out_writer = None
         
         log_queue.put({"type": "success", "message": "Video source opened"})
         
@@ -489,47 +550,14 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         consecutive_failures = 0
         max_failures = 10
         
-        if config['resize_factor'] < 1.0:
-            process_width = int(width * config['resize_factor'])
-            process_height = int(height * config['resize_factor'])
-            scale_x = width / process_width
-            scale_y = height / process_height
-        else:
-            process_width, process_height = width, height
-            scale_x = scale_y = 1.0
-        
         while not stop_flag.is_set():
+            # Read frames
             if config['source_mode'] == "rtsp":
                 cap.grab()
                 cap.grab()
                 ret, frame = cap.read()
             else:
                 ret, frame = cap.read()
-            
-            # ✅ Store primary width and init stitch flag
-            primary_width = frame.shape[1] if ret else 0
-            is_stitched = False
-            
-            # Read secondary camera
-            if cap2 is not None:
-                if config.get('secondary_mode') == "rtsp":
-                    cap2.grab()
-                    cap2.grab()
-                ret2, frame2 = cap2.read()
-                
-                if ret and ret2:
-                    # Resize frame2 to match frame1 height
-                    h1, current_w1 = frame.shape[:2] # CHANGED: Renamed to current_w1
-                    h2, w2 = frame2.shape[:2]
-                    
-                    if h1 != h2 and h2 > 0:
-                        scale = h1 / h2
-                        new_w = int(w2 * scale)
-                        frame2 = cv2.resize(frame2, (new_w, h1))
-                    
-                    # Stitch horizontally
-                    frame = np.hstack((frame, frame2))
-                    is_stitched = True # ✅ Mark as stitched
             
             if not ret:
                 consecutive_failures += 1
@@ -541,15 +569,89 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             
             consecutive_failures = 0
             frame_idx += 1
+
+            # ✅ CRITICAL FIX: Record ALL frames at source FPS (before skipping)
+            # This ensures recordings play at normal speed
+            if out_writer is not None and out_writer.isOpened():
+                rec_frame1 = frame.copy()
+                h_rec, w_rec = rec_frame1.shape[:2]
+                
+                # Add timestamp and REC indicator
+                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(rec_frame1, timestamp_text, (10, h_rec - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.circle(rec_frame1, (w_rec - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(rec_frame1, "REC", (w_rec - 70, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # Write at correct dimensions
+                if rec_frame1.shape[1] == w1 and rec_frame1.shape[0] == height:
+                    out_writer.write(rec_frame1)
+                else:
+                    out_writer.write(cv2.resize(rec_frame1, (w1, height)))
             
+            if out_writer2 is not None and out_writer2.isOpened() and frame2 is not None:
+                rec_frame2 = frame2.copy()
+                h_rec2, w_rec2 = rec_frame2.shape[:2]
+                
+                # Add timestamp and REC indicator
+                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(rec_frame2, timestamp_text, (10, h_rec2 - 20),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.circle(rec_frame2, (w_rec2 - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(rec_frame2, "REC", (w_rec2 - 70, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # Write at original dimensions
+                if rec_frame2.shape[1] == w2_original and rec_frame2.shape[0] == h2_original:
+                    out_writer2.write(rec_frame2)
+                else:
+                    out_writer2.write(cv2.resize(rec_frame2, (w2_original, h2_original)))
+
+            # ✅ NOW skip frames for processing (recordings already done above)
             if frame_idx % config['frame_skip'] != 0:
                 continue
             
-            if config['resize_factor'] < 1.0:
-                process_frame = cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_LINEAR)
-            else:
-                process_frame = frame
+            # Create separate annotated frames for recording WITH detections
+            annotated_frame1_for_record = frame.copy()
+            annotated_frame2_for_record = frame2.copy() if frame2 is not None else None
             
+            # Stitch for processing
+            if ret2 and frame2 is not None:
+                h1, w1_actual = frame.shape[:2]
+                h2_orig, w2_orig = frame2.shape[:2]
+                
+                if h1 != h2_orig and h2_orig > 0:
+                    scale = h1 / h2_orig
+                    new_w = int(w2_orig * scale)
+                    frame2_resized = cv2.resize(frame2, (new_w, h1))
+                    w2_resized = new_w
+                else:
+                    frame2_resized = frame2
+                    w2_resized = w2_orig
+                
+                stitched_frame = np.hstack((frame, frame2_resized))
+                is_stitched = True
+            else:
+                stitched_frame = frame
+                is_stitched = False
+                w1_actual = frame.shape[1]
+                h2_orig = 0
+                w2_orig = 0
+                w2_resized = 0
+            
+            # Resize for processing
+            if config['resize_factor'] < 1.0:
+                process_width = int(stitched_frame.shape[1] * config['resize_factor'])
+                process_height = int(stitched_frame.shape[0] * config['resize_factor'])
+                process_frame = cv2.resize(stitched_frame, (process_width, process_height), interpolation=cv2.INTER_LINEAR)
+                scale_x = stitched_frame.shape[1] / process_width
+                scale_y = stitched_frame.shape[0] / process_height
+            else:
+                process_frame = stitched_frame
+                scale_x = scale_y = 1.0
+            
+            # Run YOLO tracking
             results = comb.tracker.yolo.track(
                 process_frame,
                 persist=True,
@@ -563,7 +665,10 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             )
             
             tracks_data = []
-            annotated_frame = frame.copy()
+            tracks_data_primary = []
+            tracks_data_secondary = []
+            
+            annotated_stitched = stitched_frame.copy()
             
             if results and results[0].boxes is not None:
                 boxes = results[0].boxes
@@ -573,21 +678,49 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                     
                     for bbox, track_id in zip(bboxes, track_ids):
                         x1, y1, x2, y2 = bbox
-                        
                         x1, y1 = int(x1 * scale_x), int(y1 * scale_y)
                         x2, y2 = int(x2 * scale_x), int(y2 * scale_y)
                         x1, y1 = max(0, x1), max(0, y1)
-                        x2, y2 = min(width, x2), min(height, y2)
+                        x2, y2 = min(stitched_frame.shape[1], x2), min(stitched_frame.shape[0], y2)
                         
                         if x2 <= x1 or y2 <= y1:
                             continue
                         
-                        person_crop = frame[y1:y2, x1:x2]
+                        person_crop = stitched_frame[y1:y2, x1:x2]
                         
+                        # Determine camera and calculate coordinates
+                        center_x = (x1 + x2) / 2
+                        cam_source = "Primary"
+                        
+                        if is_stitched and center_x >= w1_actual:
+                            cam_source = "Secondary"
+                            # Coordinates for secondary camera
+                            scale_to_original = h2_orig / h1 if h1 > 0 else 1.0
+                            x1_record = int((x1 - w1_actual) * scale_to_original)
+                            x2_record = int((x2 - w1_actual) * scale_to_original)
+                            y1_record = int(y1 * scale_to_original)
+                            y2_record = int(y2 * scale_to_original)
+                            x1_record = max(0, min(x1_record, w2_original - 1))
+                            x2_record = max(x1_record + 1, min(x2_record, w2_original))
+                            y1_record = max(0, min(y1_record, h2_original - 1))
+                            y2_record = max(y1_record + 1, min(y2_record, h2_original))
+                            record_coords = (x1_record, y1_record, x2_record, y2_record)
+                            target_frame_record = annotated_frame2_for_record
+                        else:
+                            # Primary camera coordinates
+                            x1_cam = x1
+                            x2_cam = x2
+                            y1_cam = y1
+                            y2_cam = y2
+                            record_coords = (x1_cam, y1_cam, x2_cam, y2_cam)
+                            target_frame_record = annotated_frame1_for_record
+                        
+                        # Body features
                         body_features = comb._extract_body_features(person_crop)
                         if body_features is not None:
                             comb.track_body_features[int(track_id)].append(body_features)
                         
+                        # Face recognition
                         persistent = comb.track_persistent_identity.get(int(track_id))
                         if persistent:
                             cached_name = persistent["name"]
@@ -604,18 +737,14 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         
                         if do_recog:
                             try:
-                                face_result = comb.recognize_face_fn(person_crop, frame, (x1, y1, x2, y2))
+                                face_result = comb.recognize_face_fn(person_crop, stitched_frame, (x1, y1, x2, y2))
                                 name = face_result.get("name", "Unknown")
                                 conf = float(face_result.get("confidence", 0.0) or 0.0)
-                                
                                 has_face_detection = (name != "Unknown" and conf > 0.0)
-                                
                                 comb.track_recognition_history[int(track_id)].append((name, conf))
                                 consensus_name, consensus_conf = comb._get_consensus_identity(int(track_id))
-                                
                                 comb.identity_cache[int(track_id)] = (consensus_name, consensus_conf)
                                 comb.track_last_recog_frame[int(track_id)] = frame_idx
-                                
                                 identity_name, identity_conf = comb._update_persistent_identity(
                                     int(track_id), consensus_name, consensus_conf, has_face_detection, frame_idx, person_crop
                                 )
@@ -627,7 +756,6 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             )
                         
                         auth_level = comb.get_authorization_level(identity_name)
-                        
                         behavior_name = "N/A"
                         behavior_conf = 0.0
                         
@@ -638,59 +766,46 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                                     class_res = comb.tracker._classify_crop(person_crop)
                                     comb.tracker.prob_history[track_id].append(class_res['probs'])
                                     hist = comb.tracker.prob_history[track_id]
-                                    
                                     if len(hist) == 1:
                                         smoothed_probs = hist[0]
                                     else:
                                         smoothed_probs = np.mean(np.stack(hist, axis=0), axis=0)
-                                    
                                     smoothed_class_id = int(np.argmax(smoothed_probs))
                                     smoothed_confidence = float(smoothed_probs[smoothed_class_id])
-                                    
                                     if smoothed_confidence < comb.tracker.min_class_conf:
                                         behavior_name = "Neutral"
                                         behavior_conf = smoothed_confidence
                                     else:
                                         behavior_name = comb.tracker.class_names[smoothed_class_id]
                                         behavior_conf = smoothed_confidence
-                                    
                                     comb.tracker.classification_cache[track_id] = {
                                         "class_name": behavior_name,
                                         "confidence": behavior_conf,
                                         "last_frame": frame_idx
                                     }
                                 except Exception as e:
-                                    log_queue.put({"type": "warning", "message": f"Behavior classification error: {str(e)}"})
+                                    log_queue.put({"type": "warning", "message": f"Behavior error: {str(e)}"})
                             else:
                                 cached_beh = comb.tracker.classification_cache.get(track_id, {"class_name": "Neutral", "confidence": 0.0})
                                 behavior_name = cached_beh["class_name"]
                                 behavior_conf = cached_beh["confidence"]
                         
                         color = comb.get_authorization_color(auth_level)
-                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                        
                         persistent = comb.track_persistent_identity.get(int(track_id))
                         lock_indicator = " [LOCKED]" if persistent and persistent.get("locked", False) else ""
                         label = f"ID:{track_id} {identity_name}{lock_indicator}"
-                        
-                        cv2.putText(annotated_frame, label, (x1+2, max(20, y1-20)), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
                         
                         if auth_level == "Partially Authorized":
                             auth_label = f"{auth_level} | {behavior_name}"
                         else:
                             auth_label = f"{auth_level}"
                         
-                        cv2.putText(annotated_frame, auth_label, (x1+2, max(35, y1-6)), 
+                        # Draw on stitched (for UI display)
+                        cv2.rectangle(annotated_stitched, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated_stitched, label, (x1+2, max(20, y1-20)), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                        cv2.putText(annotated_stitched, auth_label, (x1+2, max(35, y1-6)), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        
-                        # Determine camera source
-                        cam_source = "Primary"
-                        if cap2 is not None:
-                            # Check if center of box is in second half
-                            center_x = (x1 + x2) / 2
-                            if center_x >= w1:
-                                cam_source = "Secondary"
                         
                         tracks_data.append({
                             "track_id": int(track_id),
@@ -698,68 +813,30 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             "authorization": auth_level,
                             "behavior": behavior_name,
                             "behavior_conf": behavior_conf,
-                            "identity_conf": identity_conf,
-                            "camera": cam_source
+                            "identity_conf": identity_conf
                         })
             
             # ✅ ADD TIMESTAMP TO RECORDING
             if out_writer is not None:
                 timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Add to primary
                 cv2.putText(annotated_frame, timestamp_text, (10, height - 20),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # Add recording indicator (red dot)
-                cv2.circle(annotated_frame, (w1 - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(annotated_frame, "REC", (w1 - 70, 35),
+                cv2.circle(annotated_frame, (width - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(annotated_frame, "REC", (width - 70, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                
-                if cap2 is not None:
-                     # Add to secondary
-                    cv2.putText(annotated_frame, timestamp_text, (w1 + 10, height - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    cv2.circle(annotated_frame, (width - 30, 30), 10, (0, 0, 255), -1)
-                    cv2.putText(annotated_frame, "REC", (width - 70, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
+            
             # Update event logger
             if comb.enable_logging:
                 comb.event_logger.update_tracking(tracks_data, frame_idx)
             
-            # Send detections to UI
+            # ✅ Send detections to UI
             log_queue.put({"type": "detections", "data": tracks_data})
             
             # ✅ WRITE TO RECORDING
             if out_writer is not None and out_writer.isOpened():
-                if cap2 is not None and out_writer2 is not None:
-                    if is_stitched:
-                        # Split and write
-                        frame1 = annotated_frame[:, :primary_width]
-                        frame2_out = annotated_frame[:, primary_width:]
-                        
-                        # Force resize to match VideoWriter dimensions to prevent crashes
-                        if frame1.shape[0] > 0 and frame1.shape[1] > 0:
-                            if frame1.shape[:2] != (height, w1):
-                                frame1 = cv2.resize(frame1, (w1, height))
-                            out_writer.write(frame1)
-                        
-                        # ✅ FIX: Check w2_final > 0 and out_writer2 exists
-                        if frame2_out.shape[0] > 0 and frame2_out.shape[1] > 0 and w2_final > 0 and out_writer2 is not None:
-                            if frame2_out.shape[:2] != (height, w2_final):
-                                frame2_out = cv2.resize(frame2_out, (w2_final, height))
-                            out_writer2.write(frame2_out)
-                    else:
-                        # Secondary camera failed or not stitched, write primary only
-                        if annotated_frame.shape[:2] != (height, w1):
-                             annotated_frame = cv2.resize(annotated_frame, (w1, height))
-                        out_writer.write(annotated_frame)
-                        
-                        # Write black frame for secondary to keep sync
-                        if w2_final > 0 and out_writer2 is not None:
-                            black_frame = np.zeros((height, w2_final, 3), dtype=np.uint8)
-                            out_writer2.write(black_frame)
-                else:
-                    out_writer.write(annotated_frame)
+                out_writer.write(annotated_frame)
             
             # Send annotated frame to display queue
             try:
@@ -769,10 +846,10 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                     except queue.Empty:
                         break
                 
-                frame_queue.put(annotated_frame.copy())
+                frame_queue.put(annotated_stitched.copy())
             except Exception as e:
                 log_queue.put({"type": "error", "message": f"Queue error: {str(e)}"})
-            
+
             time.sleep(0.001)
         
         log_queue.put({"type": "info", "message": "Processing stopped"})
@@ -784,22 +861,15 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         print(error_msg)
     
     finally:
+        # Cleanup resources
         if cap is not None:
             cap.release()
-        
-        if cap2 is not None:
-            cap2.release()
-            log_queue.put({"type": "info", "message": "Cameras released"})
-        else:
             log_queue.put({"type": "info", "message": "Camera released"})
         
         # ✅ CLOSE VIDEO WRITER
         if out_writer is not None:
             out_writer.release()
-        if out_writer2 is not None:
-            out_writer2.release()
-            
-        log_queue.put({"type": "success", "message": "Recordings saved successfully"})
+            log_queue.put({"type": "success", "message": "Recording saved successfully"})
 
 def main():
     # Header

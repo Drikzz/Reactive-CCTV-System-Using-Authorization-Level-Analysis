@@ -9,8 +9,8 @@ Supports webcam, video files, and RTSP IP cameras (Tapo C200)
 CAMERA_MODE = "webcam"  # Default to webcam for Streamlit
 
 # Webcam Settings
-WEBCAM_ID = 0 # Usually 0 for default webcam
-WEBCAM_ID_SECONDARY = 1 # Secondary webcam
+WEBCAM_ID = 0  # Usually 0 for default webcam
+WEBCAM_ID_SECONDARY = 1  # Secondary webcam ID
 
 # Video File Settings
 VIDEO_FILE_PATH = r"C:\Users\rikzs\Desktop\Aldrikz\Code\thesis_system\videos\sample.mp4"
@@ -18,7 +18,7 @@ VIDEO_FILE_PATH = r"C:\Users\rikzs\Desktop\Aldrikz\Code\thesis_system\videos\sam
 # RTSP Camera Settings (Tapo C200)
 RTSP_CAMERAS = {
     "tapo_c200_main": {
-        "ip": "192.168.1.254",
+        "ip": "192.168.1.246",
         "port": "554",
         "username": "reactivecctv101",
         "password": "reactivecctv101",
@@ -57,7 +57,7 @@ RTSP_BUFFER_SIZE = 1
 # ==================== VIDEO PROCESSING SETTINGS ====================
 
 # Frame skip for processing (process every Nth frame)
-FRAME_SKIP = 3
+FRAME_SKIP = 1
 
 # Resize factor for processing (0.5 = half size, 1.0 = original)
 RESIZE_FACTOR = 0.4

@@ -26,24 +26,29 @@ def load_module_from_path(name, path):
 
 class EventLogger:
     """Handles logging of security events to file with timestamps and video source tracking"""
-    def __init__(self, log_dir="logs", video_source=None):
+    def __init__(self, log_dir="logs", video_source=None, session_timestamp=None):  # ✅ Add session_timestamp param
         self.log_dir = Path(REPO_ROOT) / log_dir
-        self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        # ✅ CREATE UNIQUE LOG FILE FOR EACH SESSION
-        session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # ✅ EXTRACT VIDEO SOURCE NAME
+        # ✅ CREATE CAMERA-SPECIFIC SUBFOLDER (same structure as recordings)
         if video_source == "webcam" or isinstance(video_source, int):
-            source_name = f"webcam_{video_source if isinstance(video_source, int) else WEBCAM_INDEX}"
+            source_name = f"webcam{video_source if isinstance(video_source, int) else WEBCAM_INDEX}"
         elif video_source is not None:
-            source_name = Path(video_source).stem  # Get filename without extension
+            # Extract camera ID (e.g., "rtsp_secondary", "webcam0")
+            source_name = video_source if isinstance(video_source, str) else Path(video_source).stem
         else:
             source_name = "unknown"
         
-        # ✅ CREATE SESSION-SPECIFIC LOG FILE
-        log_filename = f"log_{source_name}_{session_timestamp}.txt"
-        self.log_file = self.log_dir / log_filename
+        # ✅ Create camera-specific folder: logs/webcam0/, logs/rtsp_secondary/, etc.
+        camera_log_dir = self.log_dir / source_name
+        camera_log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # ✅ Use provided session_timestamp or create new one
+        if session_timestamp is None:
+            session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # ✅ CREATE LOG FILE WITH SAME NAMING AS RECORDING
+        log_filename = f"log_{session_timestamp}.txt"
+        self.log_file = camera_log_dir / log_filename
         
         # ✅ STORE SESSION INFO
         self.video_source = video_source
@@ -51,8 +56,8 @@ class EventLogger:
         self.session_id = session_timestamp
         
         # Track person states to detect entry/exit
-        self.person_in_room = {}  # track_id: (name, auth_level, last_seen_frame)
-        self.last_logged_behavior = {}  # track_id: behavior_name
+        self.person_in_room = {}
+        self.last_logged_behavior = {}
         
         # ✅ CREATE LOG FILE WITH SESSION HEADER
         with open(self.log_file, 'w') as f:
@@ -60,12 +65,13 @@ class EventLogger:
             f.write("CCTV SECURITY MONITORING LOG\n")
             f.write("=" * 80 + "\n")
             f.write(f"Session ID:      {self.session_id}\n")
+            f.write(f"Camera Source:   {source_name}\n")
             f.write(f"Video Source:    {video_source}\n")
             f.write(f"Session Started: {self.session_start.strftime('%Y-%m-%d %I:%M:%S %p')}\n")
-            f.write(f"Log File:        {self.log_file.name}\n")
+            f.write(f"Log File:        {self.log_file}\n")
             f.write("=" * 80 + "\n\n")
         
-        print(f"[INFO] Event logger initialized")
+        print(f"[INFO] Event logger initialized: {source_name}")
         print(f"[INFO] Session ID: {self.session_id}")
         print(f"[INFO] Log file: {self.log_file}")
     
@@ -322,7 +328,7 @@ class CombinedYOLOFaceBehavior:
             self.authorization_map = {
                 "myke": "Partially Authorized",
                 "dean": "Authorized",
-                "art": "Authorized",
+                "art": "Partially Authorized",
                 "aldrikz": "Partially Authorized"
             }
 
@@ -410,7 +416,8 @@ class CombinedYOLOFaceBehavior:
             self.authorization_map = {
                 "myke": "Partially Authorized",
                 "dean": "Authorized",
-                "art": "Authorized",
+                "art": "Partially Authorized",
+                "aldrikz": "Partially Authorized"
             }
 
             # Performance settings
