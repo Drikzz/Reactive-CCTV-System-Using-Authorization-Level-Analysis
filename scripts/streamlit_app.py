@@ -440,6 +440,27 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
              else:
                  width, height = 640, 480 # Fallback
         
+        # Initialize secondary camera
+        cap2 = None
+        if config.get('secondary_source') is not None:
+            try:
+                sec_source = config['secondary_source']
+                if config.get('secondary_mode') == "webcam":
+                    cap2 = cv2.VideoCapture(sec_source, cv2.CAP_DSHOW)
+                    cap2.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    cap2.set(cv2.CAP_PROP_FPS, 30)
+                else: # RTSP
+                    cap2 = cv2.VideoCapture(sec_source)
+                    cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                if not cap2.isOpened():
+                    log_queue.put({"type": "error", "message": "Failed to open secondary camera"})
+                    cap2 = None
+            except Exception as e:
+                log_queue.put({"type": "error", "message": f"Error opening secondary camera: {e}"})
+                cap2 = None
+
         # Adjust width for dual camera
         w1 = width # Store primary width
         w2_final = 0 # Initialize secondary width
@@ -543,6 +564,19 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             else:
                 log_queue.put({"type": "error", "message": "Failed to start recording"})
                 out_writer = None
+            
+            # ✅ Create SECONDARY camera recording
+            if cap2 is not None:
+                secondary_rec_dir = REPO_ROOT / "recordings" / secondary_cam_id
+                secondary_rec_dir.mkdir(parents=True, exist_ok=True)
+                
+                output_filename2 = f"recording_{session_timestamp}.mp4"
+                output_path2 = secondary_rec_dir / output_filename2
+                
+                rec_w2 = w2_original if w2_original > 0 else 640
+                rec_h2 = h2_original if h2_original > 0 else 480
+                
+                out_writer2 = cv2.VideoWriter(str(output_path2), fourcc, fps, (rec_w2, rec_h2))
         
         log_queue.put({"type": "success", "message": "Video source opened"})
         
@@ -570,43 +604,18 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             consecutive_failures = 0
             frame_idx += 1
 
-            # ✅ CRITICAL FIX: Record ALL frames at source FPS (before skipping)
-            # This ensures recordings play at normal speed
-            if out_writer is not None and out_writer.isOpened():
-                rec_frame1 = frame.copy()
-                h_rec, w_rec = rec_frame1.shape[:2]
-                
-                # Add timestamp and REC indicator
-                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cv2.putText(rec_frame1, timestamp_text, (10, h_rec - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.circle(rec_frame1, (w_rec - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(rec_frame1, "REC", (w_rec - 70, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                
-                # Write at correct dimensions
-                if rec_frame1.shape[1] == w1 and rec_frame1.shape[0] == height:
-                    out_writer.write(rec_frame1)
+            # Read secondary frame
+            ret2 = False
+            frame2 = None
+            if cap2 is not None:
+                if config.get('secondary_mode') == "rtsp":
+                    cap2.grab()
+                    ret2, frame2 = cap2.read()
                 else:
-                    out_writer.write(cv2.resize(rec_frame1, (w1, height)))
-            
-            if out_writer2 is not None and out_writer2.isOpened() and frame2 is not None:
-                rec_frame2 = frame2.copy()
-                h_rec2, w_rec2 = rec_frame2.shape[:2]
-                
-                # Add timestamp and REC indicator
-                timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cv2.putText(rec_frame2, timestamp_text, (10, h_rec2 - 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.circle(rec_frame2, (w_rec2 - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(rec_frame2, "REC", (w_rec2 - 70, 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                
-                # Write at original dimensions
-                if rec_frame2.shape[1] == w2_original and rec_frame2.shape[0] == h2_original:
-                    out_writer2.write(rec_frame2)
-                else:
-                    out_writer2.write(cv2.resize(rec_frame2, (w2_original, h2_original)))
+                    ret2, frame2 = cap2.read()
+
+            # ✅ REMOVED RAW RECORDING BLOCK to avoid conflict with annotated recording below
+            # The recording will happen after processing to include bounding boxes.
 
             # ✅ NOW skip frames for processing (recordings already done above)
             if frame_idx % config['frame_skip'] != 0:
@@ -817,14 +826,17 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         })
             
             # ✅ ADD TIMESTAMP TO RECORDING
+            # Fix: Use annotated_stitched as the source for recording
+            annotated_frame = annotated_stitched
+
             if out_writer is not None:
                 timestamp_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cv2.putText(annotated_frame, timestamp_text, (10, height - 20),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
                 # Add recording indicator (red dot)
-                cv2.circle(annotated_frame, (width - 30, 30), 10, (0, 0, 255), -1)
-                cv2.putText(annotated_frame, "REC", (width - 70, 35),
+                cv2.circle(annotated_frame, (annotated_frame.shape[1] - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(annotated_frame, "REC", (annotated_frame.shape[1] - 70, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
             
             # Update event logger
@@ -836,7 +848,11 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             
             # ✅ WRITE TO RECORDING
             if out_writer is not None and out_writer.isOpened():
-                out_writer.write(annotated_frame)
+                # Ensure dimensions match the writer
+                if annotated_frame.shape[1] == width and annotated_frame.shape[0] == height:
+                    out_writer.write(annotated_frame)
+                else:
+                    out_writer.write(cv2.resize(annotated_frame, (width, height)))
             
             # Send annotated frame to display queue
             try:
