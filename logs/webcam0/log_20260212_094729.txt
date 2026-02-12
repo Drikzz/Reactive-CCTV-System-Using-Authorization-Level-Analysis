@@ -1,0 +1,10 @@
+================================================================================
+CCTV SECURITY MONITORING LOG
+================================================================================
+Session ID:      20260212_094729
+Camera Source:   webcam0
+Video Source:    webcam0
+Session Started: 2026-02-12 09:47:30 AM
+Log File:        F:\Codes\github-clones-v2\Reactive-CCTV-System-Using-Authorization-Level-Analysis\logs\webcam0\log_20260212_094729.txt
+================================================================================
+
