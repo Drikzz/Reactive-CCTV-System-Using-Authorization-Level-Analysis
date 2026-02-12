@@ -142,6 +142,7 @@ _init_state("enable_logging", False)
 _init_state("all_logs", [])  # Store all logs for viewing
 _init_state("logged_people", set())  # Track logged person entries to avoid spam
 _init_state("logged_behaviors", set())  # Track logged behaviors to avoid spam
+_init_state("session_log_file", None)  # Store current session log file path
 
 # Alerts
 _init_state("alert_cooldown", 5)
@@ -464,6 +465,33 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     evidence_dir = REPO_ROOT / "office_evidence" / f"{source_label}_{session_timestamp}"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     
+    # Create date-based log folder structure: logs/MM-DD-YYYY/
+    current_date = datetime.now().strftime("%m-%d-%Y")
+    logs_date_dir = REPO_ROOT / "logs" / current_date
+    logs_date_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create log file for this session in the date folder
+    log_file_path = logs_date_dir / f"session_log_{session_timestamp}.txt"
+    
+    def write_to_log_file(message: str):
+        """Write a log entry to the session log file"""
+        try:
+            timestamp = datetime.now().strftime("%B %d, %Y at %I:%M:%S %p")
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] {message}\n")
+        except Exception:
+            pass
+    
+    # Write session header
+    write_to_log_file("="*60)
+    write_to_log_file(f"CCTV Monitoring Session Started")
+    write_to_log_file(f"Source: {source_label}")
+    write_to_log_file(f"Evidence Folder: {evidence_dir.name}")
+    write_to_log_file("="*60)
+    
+    # Send log file path to UI
+    _safe_put(log_queue, {"type": "log_file_path", "path": str(log_file_path)})
+    
     # Check if logging is enabled
     enable_logging = config.get("enable_logging", False)
 
@@ -556,16 +584,25 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             annotated, detections = pipeline.process_frame(frame)
             _safe_put(log_queue, {"type": "detections", "data": detections})
             
+            # Track current status for each person
+            current_people = {}  # track_id -> {name, auth, behavior}
+            
             # Log meaningful events - person detection and activities
             if enable_logging and detections:
                 for detection in detections:
                     identity = detection.get("identity", "Unknown")
                     authorization = detection.get("authorization", "Unauthorized")
                     behavior = detection.get("behavior_status", "STATUS: NO INTERACTION")
-                    timestamp_display = datetime.now().strftime("%B %d, %Y at %I:%M:%S %p")
+                    track_id = detection.get("track_id", -1)
+                    
+                    # Store current status
+                    current_people[track_id] = {
+                        'name': identity,
+                        'auth': authorization,
+                        'behavior': behavior
+                    }
                     
                     # Track which people we've already logged to avoid spam
-                    track_id = detection.get("track_id", -1)
                     log_key = f"person_{track_id}_{identity}"
                     
                     # First detection of this person
@@ -577,15 +614,19 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         # Entry log
                         if identity != "Unknown":
                             auth_emoji = "✅" if authorization == "Authorized" else "⚠️" if authorization == "Partially Authorized" else "🚨"
+                            msg = f"{auth_emoji} {identity} entered the room - {authorization}"
                             _safe_put(log_queue, {
                                 "type": "success" if authorization == "Authorized" else "warning" if authorization == "Partially Authorized" else "error",
-                                "message": f"{auth_emoji} {identity} entered the room - {authorization}"
+                                "message": msg
                             })
+                            write_to_log_file(msg)
                         else:
+                            msg = f"🚨 Unidentified person detected - Unauthorized"
                             _safe_put(log_queue, {
                                 "type": "warning",
-                                "message": f"🚨 Unidentified person detected - Unauthorized"
+                                "message": msg
                             })
+                            write_to_log_file(msg)
                     
                     # Log behavior changes (only significant ones)
                     if behavior != "STATUS: NO INTERACTION":
@@ -598,16 +639,50 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             # Clean behavior text
                             if "CARRYING" in behavior:
                                 item = behavior.replace("STATUS: CARRYING ", "")
+                                msg = f"👜 {identity} is carrying {item.lower()}"
                                 _safe_put(log_queue, {
                                     "type": "info",
-                                    "message": f"👜 {identity} is carrying {item.lower()}"
+                                    "message": msg
                                 })
+                                write_to_log_file(msg)
                             elif "INTERACTING WITH" in behavior:
                                 item = behavior.replace("STATUS: INTERACTING WITH ", "")
+                                msg = f"💻 {identity} is interacting with {item.lower()}"
                                 _safe_put(log_queue, {
                                     "type": "info",
-                                    "message": f"💻 {identity} is using {item.lower()}"
+                                    "message": msg
                                 })
+                                write_to_log_file(msg)
+                
+                # Generate status summary every few seconds
+                if not hasattr(video_processing_thread, 'last_status_log'):
+                    video_processing_thread.last_status_log = time.time()
+                
+                current_time = time.time()
+                if current_time - video_processing_thread.last_status_log >= 10.0:  # Every 10 seconds
+                    video_processing_thread.last_status_log = current_time
+                    
+                    if current_people:
+                        status_lines = ["� Current Status:"]
+                        for tid, info in current_people.items():
+                            name = info['name']
+                            behavior = info['behavior']
+                            
+                            if behavior == "STATUS: NO INTERACTION":
+                                status_lines.append(f"  • {name} is present in the room")
+                            elif "CARRYING" in behavior:
+                                item = behavior.replace("STATUS: CARRYING ", "").lower()
+                                status_lines.append(f"  • {name} is carrying {item}")
+                            elif "INTERACTING WITH" in behavior:
+                                item = behavior.replace("STATUS: INTERACTING WITH ", "").lower()
+                                status_lines.append(f"  • {name} is interacting with {item}")
+                        
+                        status_msg = "\n".join(status_lines)
+                        _safe_put(log_queue, {
+                            "type": "info",
+                            "message": status_msg
+                        })
+                        write_to_log_file(status_msg.replace("\n", " | "))
             
             # Save evidence for interactions (similar to main.py)
             if config.get("enable_behavior", False):
@@ -658,11 +733,16 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
 
             time.sleep(0.001)
 
-        # No stop logging - system operations
+        # Write session end to log file
+        write_to_log_file("="*60)
+        write_to_log_file("CCTV Monitoring Session Ended")
+        write_to_log_file("="*60)
 
     except Exception as e:
         # Only log critical user-facing errors
-        _safe_put(log_queue, {"type": "error", "message": "⚠️ System encountered an error. Please restart."})
+        error_msg = "⚠️ System encountered an error. Please restart."
+        _safe_put(log_queue, {"type": "error", "message": error_msg})
+        write_to_log_file(f"ERROR: {error_msg}")
 
     finally:
         if cap is not None:
@@ -936,11 +1016,34 @@ def main():
     # Always show log section in UI
     st.subheader("📋 System Log")
     
-    # Add "View All Logs" button
-    col_log1, col_log2 = st.columns([3, 1])
+    # Add "View All Logs" and "Open Logs Folder" buttons
+    col_log1, col_log2, col_log3 = st.columns([2, 1, 1])
     with col_log2:
         if st.button("📜 View All Logs", use_container_width=True):
             st.session_state.show_all_logs = not st.session_state.get("show_all_logs", False)
+    with col_log3:
+        if st.button("📂 Open Logs Folder", use_container_width=True):
+            # Open the date-based logs folder
+            current_date = datetime.now().strftime("%m-%d-%Y")
+            logs_date_dir = REPO_ROOT / "logs" / current_date
+            
+            # Create folder if it doesn't exist
+            if not logs_date_dir.exists():
+                logs_date_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Open folder in file explorer
+            import subprocess
+            import platform
+            
+            try:
+                if platform.system() == "Windows":
+                    subprocess.run(['explorer', str(logs_date_dir)])
+                elif platform.system() == "Darwin":  # macOS
+                    subprocess.run(['open', str(logs_date_dir)])
+                else:  # Linux
+                    subprocess.run(['xdg-open', str(logs_date_dir)])
+            except Exception:
+                pass
     
     log_placeholder = st.empty()
     
@@ -948,6 +1051,27 @@ def main():
     if st.session_state.get("show_all_logs", False):
         with st.expander("📋 Complete Log History", expanded=True):
             if st.session_state.all_logs:
+                # Show log file info if available
+                if st.session_state.session_log_file and Path(st.session_state.session_log_file).exists():
+                    log_file = Path(st.session_state.session_log_file)
+                    st.info(f"📄 Session log file: `{log_file.name}`")
+                    
+                    # Download button for log file
+                    try:
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            log_content = f.read()
+                        st.download_button(
+                            label="💾 Download Log File",
+                            data=log_content,
+                            file_name=log_file.name,
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+                    except Exception:
+                        pass
+                
+                st.divider()
+                
                 # Show all logs with timestamps
                 for log_entry in st.session_state.all_logs[-100:]:  # Show last 100 logs
                     msg_type = log_entry.get('type', 'info')
@@ -1049,6 +1173,8 @@ def main():
                         st.session_state.current_detections = msg.get('data', [])
                     elif msg.get('type') == 'recording_path':
                         st.session_state.recording_path = msg.get('path')
+                    elif msg.get('type') == 'log_file_path':
+                        st.session_state.session_log_file = msg.get('path')
                     else:
                         # Add timestamp if not present
                         if 'timestamp' not in msg:
