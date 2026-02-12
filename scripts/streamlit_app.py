@@ -138,6 +138,10 @@ _init_state("processing_thread", None)
 _init_state("stop_flag", threading.Event())
 _init_state("recording_enabled", False)
 _init_state("recording_path", None)
+_init_state("enable_logging", False)
+_init_state("all_logs", [])  # Store all logs for viewing
+_init_state("logged_people", set())  # Track logged person entries to avoid spam
+_init_state("logged_behaviors", set())  # Track logged behaviors to avoid spam
 
 # Alerts
 _init_state("alert_cooldown", 5)
@@ -177,6 +181,9 @@ def get_authorization_color(auth_level: str):
 # -----------------------------
 def _safe_put(q: queue.Queue, payload):
     try:
+        # Add timestamp if it's a log message
+        if isinstance(payload, dict) and 'message' in payload and 'timestamp' not in payload:
+            payload['timestamp'] = datetime.now().strftime("%H:%M:%S")
         q.put(payload)
     except Exception:
         pass
@@ -267,11 +274,42 @@ def display_loop(
                         auth_class = "authorized" if detection["authorization"] == "Authorized" else (
                             "partial" if detection["authorization"] == "Partially Authorized" else "unauthorized"
                         )
+                        
+                        # Build detection HTML with enhanced interaction display
+                        behavior_info = ""
+                        behavior_emoji = ""
+                        if "behavior_status" in detection and detection["behavior_status"] != "STATUS: NO INTERACTION":
+                            behavior_status = detection["behavior_status"].replace("STATUS: ", "")
+                            
+                            # Add emoji based on interaction type
+                            if "CARRYING" in behavior_status:
+                                behavior_emoji = "🎒"  # Backpack emoji
+                                if "LAPTOP" in behavior_status:
+                                    behavior_emoji = "💻"
+                                elif "HANDBAG" in behavior_status:
+                                    behavior_emoji = "👜"
+                                elif "CELL PHONE" in behavior_status:
+                                    behavior_emoji = "📱"
+                            elif "INTERACTING WITH" in behavior_status:
+                                behavior_emoji = "🖐️"  # Hand emoji
+                                if "LAPTOP" in behavior_status:
+                                    behavior_emoji = "💻"
+                                elif "KEYBOARD" in behavior_status:
+                                    behavior_emoji = "⌨️"
+                                elif "MOUSE" in behavior_status:
+                                    behavior_emoji = "🖱️"
+                            
+                            behavior_info = f"<br><span style='font-size: 0.95em; font-weight: 600; color: #ff6b35;'>{behavior_emoji} {behavior_status}</span>"
+                        
+                        # Track ID info
+                        tid = detection.get("track_id", -1)
+                        tid_info = f" [ID: {tid}]" if tid != -1 else ""
+                        
                         st.markdown(
                             f"""
                         <div class=\"status-box {auth_class}\">
-                            <strong>[{detection.get('camera', 'Primary')}] {detection['identity']}</strong><br>
-                            {detection['authorization']}
+                            <strong>[{detection.get('camera', 'Primary')}] {detection['identity']}{tid_info}</strong><br>
+                            {detection['authorization']}{behavior_info}
                         </div>
                         """,
                             unsafe_allow_html=True,
@@ -294,9 +332,18 @@ def display_loop(
             total = len(st.session_state.current_detections)
             auth_count = sum(1 for d in st.session_state.current_detections if d["authorization"] == "Authorized")
             unauth_count = sum(1 for d in st.session_state.current_detections if d["authorization"] == "Unauthorized")
-            total_placeholder.metric("Total", total)
-            auth_placeholder.metric("Auth", auth_count)
-            unauth_placeholder.metric("Unauth", unauth_count)
+            
+            # Count active interactions
+            interact_count = sum(1 for d in st.session_state.current_detections 
+                                if d.get("behavior_status", "STATUS: NO INTERACTION") != "STATUS: NO INTERACTION")
+            
+            total_placeholder.metric("Total Persons", total)
+            auth_placeholder.metric("Authorized", auth_count)
+            unauth_placeholder.metric("Unauthorized", unauth_count)
+            
+            # Show interaction count if behavior detection enabled
+            if interact_count > 0:
+                status_placeholder.metric("🎯 Active Interactions", interact_count)
         except Exception:
             pass
 
@@ -400,22 +447,41 @@ def open_video_capture(source_mode: str, video_source):
 
 
 def video_processing_thread(video_source, config, frame_queue, log_queue, stop_flag):
-    """YOLO + ByteTrack tracking + FaceNet recognition (no behavior recognition)."""
+    """YOLO + ByteTrack tracking + FaceNet recognition + optional behavior detection."""
 
     cap = None
     recorder = None
     pipeline = None
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Evidence saving for interactions - organized by session
+    last_saved = {}  # track_id -> last save timestamp
+    SAVE_COOLDOWN = 3.0  # seconds between saves per track ID
+    
+    # Create session-specific evidence folder
+    source_mode = config.get("source_mode", "webcam")
+    source_label = format_source_label(video_source, source_mode)
+    evidence_dir = REPO_ROOT / "office_evidence" / f"{source_label}_{session_timestamp}"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Check if logging is enabled
+    enable_logging = config.get("enable_logging", False)
 
     try:
-        _safe_put(log_queue, {"type": "info", "message": "Initializing face recognition pipeline..."})
-
+        # Simplified startup - no technical logs
+        # Only log critical errors or user-facing events
+        
         # Import heavy dependencies inside thread
         if config.get("force_cpu"):
             import os
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-        from combined_yolo_facenet_only import CombinedYOLOFaceOnly
+        # Choose pipeline based on behavior detection setting
+        enable_behavior = config.get("enable_behavior", False)
+        if enable_behavior:
+            from combined_yolo_facenet_behavior import CombinedYOLOFaceNetBehavior as PipelineClass
+        else:
+            from combined_yolo_facenet_only import CombinedYOLOFaceOnly as PipelineClass
 
         # Choose which FaceNet module file to load (current vs old) if provided.
         facenet_main_path = config.get("facenet_main") or (REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py")
@@ -426,32 +492,45 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             yolo_path = (REPO_ROOT / yolo_path).resolve()
 
         if not yolo_path.exists():
-            _safe_put(log_queue, {"type": "error", "message": f"YOLO model not found: {yolo_path}"})
+            _safe_put(log_queue, {"type": "error", "message": "❌ System Error: Camera model not found. Please contact administrator."})
             return
 
-        pipeline = CombinedYOLOFaceOnly(
-            yolo_model_path=str(yolo_path),
-            facenet_main_path=str(facenet_main_path),
-            authorization_map=AUTHORIZATION_MAP,
-            conf_threshold=float(config.get("conf_threshold", 0.45)),
-            resize_factor=float(config.get("resize_factor", 1.0)),
-            frame_skip=int(config.get("frame_skip", 1)),
-            # Recognition every N processed frames per track (helps performance + stability)
-            recog_interval=int(config.get("recog_interval", 10)),
-            device=("cpu" if bool(config.get("force_cpu")) else None),
-        )
-        _safe_put(log_queue, {"type": "success", "message": f"Loaded YOLO+ByteTrack pipeline: {yolo_path.name}"})
+        # Build pipeline with behavior parameters if enabled
+        pipeline_kwargs = {
+            "yolo_model_path": str(yolo_path),
+            "facenet_main_path": str(facenet_main_path),
+            "authorization_map": AUTHORIZATION_MAP,
+            "conf_threshold": float(config.get("conf_threshold", 0.45)),
+            "resize_factor": float(config.get("resize_factor", 1.0)),
+            "frame_skip": int(config.get("frame_skip", 1)),
+            "recog_interval": int(config.get("recog_interval", 10)),
+            "device": ("cpu" if bool(config.get("force_cpu")) else None),
+        }
+
+        if enable_behavior:
+            pipeline_kwargs.update({
+                "enable_behavior": True,
+                "coverage_thresh": float(config.get("coverage_thresh", 0.18)),
+                "move_px_thresh": float(config.get("move_px_thresh", 8.0)),
+                "stationary_frames_required": int(config.get("stationary_frames_required", 6)),
+                "status_on_frames_required": int(config.get("status_on_frames_required", 6)),
+                "status_off_frames_required": int(config.get("status_off_frames_required", 12)),
+                "object_hold_frames": int(config.get("object_hold_frames", 8)),
+            })
+
+        pipeline = PipelineClass(**pipeline_kwargs)
 
         source_mode = config.get("source_mode", "webcam")
         cap = open_video_capture(source_mode, video_source)
         if cap is None or not cap.isOpened():
-            _safe_put(log_queue, {"type": "error", "message": "Failed to open video source"})
+            _safe_put(log_queue, {"type": "error", "message": "❌ Failed to connect to camera. Please check camera connection."})
             return
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
         fps = max(int(cap.get(cv2.CAP_PROP_FPS) or 25), 1)
-        _safe_put(log_queue, {"type": "success", "message": f"Video opened: {width}x{height} @ {fps}fps"})
+        
+        # No startup message - system is ready, logs will show when people are detected
 
         # Recording
         if bool(config.get("recording_enabled")):
@@ -463,10 +542,10 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             if writer.isOpened():
                 recorder = writer
                 _safe_put(log_queue, {"type": "recording_path", "path": str(output_path)})
-                _safe_put(log_queue, {"type": "success", "message": f"Recording started: {output_path.name}"})
+                # No logging for recording start - backend operation
             else:
                 writer.release()
-                _safe_put(log_queue, {"type": "warning", "message": "Recording requested but failed to start"})
+                # Silent failure for recording issues
 
         while not stop_flag.is_set():
             ret, frame = cap.read()
@@ -476,6 +555,90 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
 
             annotated, detections = pipeline.process_frame(frame)
             _safe_put(log_queue, {"type": "detections", "data": detections})
+            
+            # Log meaningful events - person detection and activities
+            if enable_logging and detections:
+                for detection in detections:
+                    identity = detection.get("identity", "Unknown")
+                    authorization = detection.get("authorization", "Unauthorized")
+                    behavior = detection.get("behavior_status", "STATUS: NO INTERACTION")
+                    timestamp_display = datetime.now().strftime("%B %d, %Y at %I:%M:%S %p")
+                    
+                    # Track which people we've already logged to avoid spam
+                    track_id = detection.get("track_id", -1)
+                    log_key = f"person_{track_id}_{identity}"
+                    
+                    # First detection of this person
+                    if log_key not in st.session_state.get("logged_people", set()):
+                        if "logged_people" not in st.session_state:
+                            st.session_state.logged_people = set()
+                        st.session_state.logged_people.add(log_key)
+                        
+                        # Entry log
+                        if identity != "Unknown":
+                            auth_emoji = "✅" if authorization == "Authorized" else "⚠️" if authorization == "Partially Authorized" else "🚨"
+                            _safe_put(log_queue, {
+                                "type": "success" if authorization == "Authorized" else "warning" if authorization == "Partially Authorized" else "error",
+                                "message": f"{auth_emoji} {identity} entered the room - {authorization}"
+                            })
+                        else:
+                            _safe_put(log_queue, {
+                                "type": "warning",
+                                "message": f"🚨 Unidentified person detected - Unauthorized"
+                            })
+                    
+                    # Log behavior changes (only significant ones)
+                    if behavior != "STATUS: NO INTERACTION":
+                        behavior_key = f"behavior_{track_id}_{behavior}"
+                        if behavior_key not in st.session_state.get("logged_behaviors", set()):
+                            if "logged_behaviors" not in st.session_state:
+                                st.session_state.logged_behaviors = set()
+                            st.session_state.logged_behaviors.add(behavior_key)
+                            
+                            # Clean behavior text
+                            if "CARRYING" in behavior:
+                                item = behavior.replace("STATUS: CARRYING ", "")
+                                _safe_put(log_queue, {
+                                    "type": "info",
+                                    "message": f"👜 {identity} is carrying {item.lower()}"
+                                })
+                            elif "INTERACTING WITH" in behavior:
+                                item = behavior.replace("STATUS: INTERACTING WITH ", "")
+                                _safe_put(log_queue, {
+                                    "type": "info",
+                                    "message": f"💻 {identity} is using {item.lower()}"
+                                })
+            
+            # Save evidence for interactions (similar to main.py)
+            if config.get("enable_behavior", False):
+                current_time = time.time()
+                for detection in detections:
+                    tid = detection.get("track_id", -1)
+                    behavior = detection.get("behavior_status", "STATUS: NO INTERACTION")
+                    
+                    if tid != -1 and behavior != "STATUS: NO INTERACTION":
+                        last_save_time = last_saved.get(tid, 0)
+                        
+                        if current_time - last_save_time >= SAVE_COOLDOWN:
+                            # Extract object name from behavior status
+                            if "CARRYING" in behavior:
+                                obj_name = behavior.replace("STATUS: CARRYING ", "").lower().replace(" ", "_")
+                            elif "INTERACTING WITH" in behavior:
+                                obj_name = behavior.replace("STATUS: INTERACTING WITH ", "").lower().replace(" ", "_")
+                            else:
+                                obj_name = "unknown"
+                            
+                            timestamp_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+                            identity = detection.get("identity", "unknown")
+                            filename = evidence_dir / f"alert_{timestamp_str}_{obj_name}_{identity}_ID{tid}.jpg"
+                            
+                            try:
+                                cv2.imwrite(str(filename), annotated)
+                                last_saved[tid] = current_time
+                                # No logging for evidence saving - backend operation
+                            except Exception as e:
+                                # Silent failure - no need to spam user with backend errors
+                                pass
 
             if recorder is not None:
                 if annotated.shape[1] != width or annotated.shape[0] != height:
@@ -495,19 +658,19 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
 
             time.sleep(0.001)
 
-        _safe_put(log_queue, {"type": "info", "message": "Processing stopped"})
+        # No stop logging - system operations
 
     except Exception as e:
-        msg = f"Error: {e}\n{traceback.format_exc()}"
-        _safe_put(log_queue, {"type": "error", "message": msg})
+        # Only log critical user-facing errors
+        _safe_put(log_queue, {"type": "error", "message": "⚠️ System encountered an error. Please restart."})
 
     finally:
         if cap is not None:
             cap.release()
-            _safe_put(log_queue, {"type": "info", "message": "Camera released"})
+            # No camera release logging - backend operation
         if recorder is not None:
             recorder.release()
-            _safe_put(log_queue, {"type": "success", "message": "Recording saved"})
+            # No recording save logging - backend operation
 
 
 def main():
@@ -535,7 +698,7 @@ def main():
             st.info("💡 For videos > 200MB, use 'File Path' method")
             
             # Get available videos from Mp4TESTING folder
-            test_videos_dir = REPO_ROOT / "Mp4TESTING"
+            test_videos_dir = REPO_ROOT / "Tapo"
             available_videos = []
             if test_videos_dir.exists():
                 available_videos = sorted([
@@ -616,6 +779,38 @@ def main():
         
         st.divider()
         
+        # Behavior Detection Settings
+        st.subheader("🎯 Behavior Detection")
+        enable_behavior = st.checkbox("Enable HOI Detection", value=False,
+                                     help="Detect human-object interactions (CARRYING/INTERACTING)")
+        
+        if enable_behavior:
+            with st.expander("Behavior Settings"):
+                coverage_thresh = st.slider("Coverage Threshold", 0.05, 0.5, 0.18, 
+                                           help="IoA threshold for object interaction")
+                move_px_thresh = st.slider("Movement Threshold (px)", 1.0, 20.0, 8.0,
+                                          help="Pixels/frame to detect movement")
+                stationary_frames = st.slider("Stationary Frames", 3, 15, 6,
+                                             help="Frames to confirm stationary")
+                status_on_frames = st.slider("Status ON Frames", 3, 15, 6,
+                                            help="Frames to confirm new status")
+                status_off_frames = st.slider("Status OFF Frames", 6, 30, 12,
+                                             help="Frames to clear status")
+                object_hold_frames = st.slider("Object Hold Frames", 3, 20, 8,
+                                              help="Frames to cache objects")
+            
+            # Evidence saving info
+            st.info("💾 Interaction evidence auto-saved to session-specific folders in: `office_evidence/`")
+        else:
+            coverage_thresh = 0.18
+            move_px_thresh = 8.0
+            stationary_frames = 6
+            status_on_frames = 6
+            status_off_frames = 12
+            object_hold_frames = 8
+        
+        st.divider()
+        
         # Performance Settings
         st.subheader("Performance")
         frame_skip = st.slider("Frame Skip", 1, 10, 1)
@@ -636,7 +831,9 @@ def main():
         
         st.divider()
         
-        enable_logging = st.checkbox("Enable Logging", value=False)
+        enable_logging = st.checkbox("Enable Detailed Logging", value=True, 
+                                     help="Generate detailed system logs (initialization, frame processing, file saves, etc.)")
+        st.session_state.enable_logging = enable_logging
         st.session_state.alert_sounds_enabled = st.checkbox("Enable Alert Sounds", value=True)
         
         st.divider()
@@ -668,6 +865,13 @@ def main():
                 'iou_threshold': 0.7,
                 'source_mode': source_mode,
                 'recording_enabled': enable_recording,
+                'enable_behavior': enable_behavior,
+                'coverage_thresh': coverage_thresh,
+                'move_px_thresh': move_px_thresh,
+                'stationary_frames_required': stationary_frames,
+                'status_on_frames_required': status_on_frames,
+                'status_off_frames_required': status_off_frames,
+                'object_hold_frames': object_hold_frames,
             }
             
             # Clear queues
@@ -682,6 +886,10 @@ def main():
                     st.session_state.log_queue.get_nowait()
                 except:
                     break
+            
+            # Clear tracking sets for new session
+            st.session_state.logged_people = set()
+            st.session_state.logged_behaviors = set()
             
             # Start processing thread
             thread = threading.Thread(
@@ -725,8 +933,42 @@ def main():
         with stats_cols[2]:
             unauth_placeholder = st.empty()
 
+    # Always show log section in UI
     st.subheader("📋 System Log")
+    
+    # Add "View All Logs" button
+    col_log1, col_log2 = st.columns([3, 1])
+    with col_log2:
+        if st.button("📜 View All Logs", use_container_width=True):
+            st.session_state.show_all_logs = not st.session_state.get("show_all_logs", False)
+    
     log_placeholder = st.empty()
+    
+    # Expandable section for all logs
+    if st.session_state.get("show_all_logs", False):
+        with st.expander("📋 Complete Log History", expanded=True):
+            if st.session_state.all_logs:
+                # Show all logs with timestamps
+                for log_entry in st.session_state.all_logs[-100:]:  # Show last 100 logs
+                    msg_type = log_entry.get('type', 'info')
+                    message = log_entry.get('message', '')
+                    timestamp = log_entry.get('timestamp', '')
+                    
+                    if msg_type == 'error':
+                        st.error(f"[{timestamp}] ❌ {message}")
+                    elif msg_type == 'warning':
+                        st.warning(f"[{timestamp}] ⚠️ {message}")
+                    elif msg_type == 'success':
+                        st.success(f"[{timestamp}] ✅ {message}")
+                    else:
+                        st.info(f"[{timestamp}] ℹ️ {message}")
+                
+                # Clear logs button
+                if st.button("🗑️ Clear Log History"):
+                    st.session_state.all_logs = []
+                    st.rerun()
+            else:
+                st.info("No logs yet. Start the system to see logs.")
     
     # Display loop
     if st.session_state.running:
@@ -808,25 +1050,33 @@ def main():
                     elif msg.get('type') == 'recording_path':
                         st.session_state.recording_path = msg.get('path')
                     else:
+                        # Add timestamp if not present
+                        if 'timestamp' not in msg:
+                            msg['timestamp'] = datetime.now().strftime("%H:%M:%S")
+                        
+                        # Store in all_logs for history
+                        st.session_state.all_logs.append(msg)
                         log_messages.append(msg)
                 except queue.Empty:
                     break
             
+            # Always display logs in UI (even if logging is disabled in backend)
             if log_messages:
                 try:
                     with log_placeholder.container():
                         for msg in log_messages[-5:]:
                             msg_type = msg.get('type', 'info')
                             message = msg.get('message', '')
+                            timestamp = msg.get('timestamp', '')
                             
                             if msg_type == 'error':
-                                st.error(f"❌ {message}")
+                                st.error(f"[{timestamp}] ❌ {message}")
                             elif msg_type == 'warning':
-                                st.warning(f"⚠️ {message}")
+                                st.warning(f"[{timestamp}] ⚠️ {message}")
                             elif msg_type == 'success':
-                                st.success(f"✅ {message}")
+                                st.success(f"[{timestamp}] ✅ {message}")
                             else:
-                                st.info(f"ℹ️ {message}")
+                                st.info(f"[{timestamp}] ℹ️ {message}")
                 except:
                     pass
             
