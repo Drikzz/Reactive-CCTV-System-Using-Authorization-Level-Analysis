@@ -73,12 +73,35 @@ CLAHE_TILE = 8
 ENABLE_GAMMA_CORRECTION = True
 GAMMA_TARGET_MEAN = 100.0
 
-# -------------------- DEVICE & MODELS --------------------
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INFO] Using device: {device}")
+"""FaceNet pipeline utilities.
 
-# YOLO with ByteTrack
-yolo = YOLO(YOLO_MODEL_PATH)
+Important for Streamlit usage:
+- This module used to initialize heavy models (YOLO/MTCNN/FaceNet) at import time.
+  In Streamlit, any import-time work can block the UI thread, trigger watchdog
+  restarts, and generally make the app feel like it 'starts then stops'.
+
+- We now lazy-load heavy objects on first use via getters.
+"""
+
+# -------------------- DEVICE & MODELS (LAZY) --------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Lazy singletons (initialized on demand)
+_yolo = None
+_mtcnn = None
+_embedder = None
+
+def get_device() -> str:
+    """Return the device string used by this module (cuda/cpu)."""
+    return device
+
+def get_yolo():
+    """Lazy-load YOLO model."""
+    global _yolo
+    if _yolo is None:
+        print(f"[INFO] Using device: {device}")
+        _yolo = YOLO(YOLO_MODEL_PATH)
+    return _yolo
 
 def make_mtcnn(image_size=160, margin=0, keep_all=True, device=None):
     try:
@@ -92,16 +115,24 @@ def make_mtcnn(image_size=160, margin=0, keep_all=True, device=None):
         except Exception as e:
             raise RuntimeError("No usable MTCNN found (install facenet-pytorch or mtcnn). Error: " + str(e))
 
-# MTCNN
-mtcnn = make_mtcnn(
-    image_size=160, 
-    margin=0, 
-    keep_all=True, 
-    device=device
-)
+def get_mtcnn():
+    """Lazy-load MTCNN face detector."""
+    global _mtcnn
+    if _mtcnn is None:
+        _mtcnn = make_mtcnn(
+            image_size=160,
+            margin=0,
+            keep_all=True,
+            device=device,
+        )
+    return _mtcnn
 
-# FaceNet embedder
-embedder = InceptionResnetV1(pretrained="vggface2").to(device).eval()
+def get_embedder():
+    """Lazy-load FaceNet embedder."""
+    global _embedder
+    if _embedder is None:
+        _embedder = InceptionResnetV1(pretrained="vggface2").to(device).eval()
+    return _embedder
 
 # Load classifier
 classifier = None
@@ -353,7 +384,7 @@ def recognize_face_in_crop(person_crop, original_frame, person_bbox):
         
         # Face detection
         person_rgb = cv2.cvtColor(processed_crop, cv2.COLOR_BGR2RGB)
-        face_boxes, face_probs = mtcnn.detect(person_rgb)
+        face_boxes, face_probs = get_mtcnn().detect(person_rgb)
         face_boxes, face_probs = filter_quality_faces(face_boxes, face_probs)
         
         if face_boxes is None or len(face_boxes) == 0:
@@ -393,7 +424,7 @@ def recognize_face_in_crop(person_crop, original_frame, person_bbox):
                 tensor = fixed_image_standardization(tensor)
                 
                 with torch.no_grad():
-                    embedding = embedder(tensor.unsqueeze(0).to(device))
+                    embedding = get_embedder()(tensor.unsqueeze(0).to(device))
                     embedding = embedding.cpu().numpy()[0]
                 
                 # Normalize embedding
@@ -735,7 +766,7 @@ def process_frames_with_bytetrack(frame_q, display_q, stop_event):
             annotated_frame = original_frame.copy()
             
             # Run YOLO with ByteTrack - clean parameters only
-            results = yolo.track(
+            results = get_yolo().track(
                 process_frame,
                 persist=True,
                 tracker="bytetrack.yaml",
