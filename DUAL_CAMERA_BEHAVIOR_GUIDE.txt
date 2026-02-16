@@ -1,0 +1,162 @@
+"""
+DUAL CAMERA BEHAVIOR DETECTION - SETUP GUIDE
+==============================================
+
+## FIXES APPLIED:
+
+✅ 1. Behavior Detection now ENABLED BY DEFAULT
+   - Changed: enable_behavior checkbox now defaults to TRUE
+   - Location: Line ~1180 in streamlit_app.py
+   - What this means: HOI (Human-Object Interaction) detection is automatically active
+
+✅ 2. Recording Folder Structure Changed
+   - OLD: recordings/rtsp/recording_20260213_150302.mp4
+   - NEW: recordings/rtsp_20260213_150302/recording_20260213_150302.mp4
+   - Matches office_evidence structure for consistency
+   - Each session gets its own folder
+
+## HOW TO USE DUAL CAMERA WITH BEHAVIOR DETECTION:
+
+### Step 1: Configure Primary Camera
+1. Select Source: "RTSP Camera"
+2. Choose: "tapo_c200_main" (192.168.0.110)
+
+### Step 2: Enable Dual Camera Mode
+1. ✅ Check "Enable Dual Camera" checkbox
+2. Secondary Source Type: "RTSP Camera"
+3. Select: "tapo_c200_secondary" (192.168.0.104)
+
+### Step 3: Verify Behavior Detection
+- 🎯 "Enable HOI Detection" should be checked (now default)
+- This detects:
+  * 🎒 CARRYING: backpack, handbag, laptop, phone
+  * 💻 INTERACTING WITH: laptop, keyboard, mouse, phone
+
+### Step 4: Enable Recording (Optional)
+- ✅ Check "Enable Recording"
+- Videos saved to: recordings/rtsp_TIMESTAMP/recording_TIMESTAMP.mp4
+
+### Step 5: Start Monitoring
+- Click "▶ Start" button
+- Watch logs for:
+  * "🔗 Connecting to secondary camera (rtsp)..."
+  * "✅ Dual camera mode active! Monitoring both feeds side-by-side."
+
+## WHAT YOU SHOULD SEE:
+
+### Video Display:
+```
+┌─────────────────┬─────────────────┐
+│  Primary Cam    │  Secondary Cam  │
+│ (tapo_c200_main)│(tapo_c200_sec)  │
+│  192.168.0.110  │  192.168.0.104  │
+└─────────────────┴─────────────────┘
+```
+
+### Detection Display:
+```
+┌──────────────────────────────────────┐
+│ [Primary] Aldrikz [ID: 3]           │
+│ Authorized                           │
+│ 💻 INTERACTING WITH LAPTOP           │
+└──────────────────────────────────────┘
+
+┌──────────────────────────────────────┐
+│ [Secondary] Jude [ID: 5]            │
+│ Partially Authorized                 │
+│ 🎒 CARRYING BACKPACK                 │
+└──────────────────────────────────────┘
+```
+
+## TROUBLESHOOTING:
+
+### Issue: No behavior detected
+**Solution:**
+1. Make sure "Enable HOI Detection" is checked ✅
+2. Ensure objects are visible in frame (laptop, backpack, etc.)
+3. Person must be interacting with objects for detection
+
+### Issue: Can't see second camera
+**Solution:**
+1. Verify "Enable Dual Camera" is checked ✅
+2. Run test: python .\scripts\test_rtsp_cameras.py
+3. Check camera IPs are correct in camera_config_streamlit.py
+4. Look for error message in logs
+
+### Issue: Recording not saving
+**Solution:**
+1. Check "Enable Recording" is checked ✅
+2. Look in: recordings/rtsp_TIMESTAMP/ folder
+3. Check disk space
+4. Verify write permissions
+
+## EVIDENCE SAVING:
+
+### Detection Evidence (office_evidence):
+- Location: office_evidence/rtsp_TIMESTAMP/
+- Contains:
+  * alert_TIMESTAMP_object_person_ID.jpg (interaction screenshots)
+  * session_log.txt (full session log)
+
+### Recording Videos (recordings):
+- Location: recordings/rtsp_TIMESTAMP/
+- Contains:
+  * recording_TIMESTAMP.mp4 (full session video)
+  * Shows stitched dual camera view if enabled
+
+## BEHAVIOR TYPES DETECTED:
+
+### Moving + Carrying:
+- 🎒 CARRYING BACKPACK
+- 👜 CARRYING HANDBAG
+- 💻 CARRYING LAPTOP
+- 📱 CARRYING CELL PHONE
+
+### Stationary + Interacting:
+- 💻 INTERACTING WITH LAPTOP
+- ⌨️ INTERACTING WITH KEYBOARD
+- 🖱️ INTERACTING WITH MOUSE
+- 📱 INTERACTING WITH CELL PHONE
+
+### No Interaction:
+- STATUS: NO INTERACTION (default state)
+
+## FILE STRUCTURE AFTER CHANGES:
+
+```
+office_evidence/
+  rtsp_20260213_150302/
+    alert_20260213-150310_laptop_Aldrikz_ID3.jpg
+    alert_20260213-150315_backpack_Jude_ID5.jpg
+    session_log.txt
+
+recordings/
+  rtsp_20260213_150302/
+    recording_20260213_150302.mp4
+```
+
+## VERIFICATION CHECKLIST:
+
+Before starting, verify:
+- [ ] Primary camera selected (tapo_c200_main)
+- [ ] "Enable Dual Camera" checked
+- [ ] Secondary camera selected (tapo_c200_secondary)
+- [ ] "Enable HOI Detection" checked (now default ✅)
+- [ ] "Enable Recording" checked (if you want videos)
+- [ ] Both cameras accessible (run test_rtsp_cameras.py)
+
+After starting, check for:
+- [ ] Log shows "✅ Dual camera mode active!"
+- [ ] Video shows both cameras side-by-side
+- [ ] Detections show [Primary] and [Secondary] labels
+- [ ] Behavior status appears (when interacting with objects)
+- [ ] Evidence saves to office_evidence/rtsp_TIMESTAMP/
+- [ ] Recording saves to recordings/rtsp_TIMESTAMP/
+
+## NOTES:
+
+1. **Recordings are still saved** - Yes! Just in a better folder structure now
+2. **Behavior detection is automatic** - Checkbox is now checked by default
+3. **Works with single or dual camera** - System adapts automatically
+4. **Evidence synced** - Logs and recordings use same timestamp folder structure
+"""

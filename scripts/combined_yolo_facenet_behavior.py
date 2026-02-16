@@ -551,4 +551,9 @@ class CombinedYOLOFaceNetBehavior:
                     }
                 )
 
+        # Feature: If any Authorized person is present, filter out Partially Authorized
+        has_authorized = any(d["authorization"] == "Authorized" for d in detections)
+        if has_authorized:
+            detections = [d for d in detections if d["authorization"] != "Partially Authorized"]
+
         return annotated, detections

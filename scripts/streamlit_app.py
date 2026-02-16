@@ -14,6 +14,10 @@ import cv2
 import numpy as np
 import streamlit as st
 
+# Import AuthorizationManager
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.authorization_manager import AuthorizationManager
+
 
 # Reduce noisy MediaFileHandler tracebacks (they can still appear on stop/refresh
 # if the browser requests an older media id). This matches the old app's behavior.
@@ -142,6 +146,7 @@ _init_state("enable_logging", False)
 _init_state("all_logs", [])  # Store all logs for viewing
 _init_state("logged_people", set())  # Track logged person entries to avoid spam
 _init_state("logged_behaviors", set())  # Track logged behaviors to avoid spam
+_init_state("session_log_file", None)  # Store current session log file path
 
 # Alerts
 _init_state("alert_cooldown", 5)
@@ -151,20 +156,28 @@ _init_state("last_alert", {})
 
 
 # -----------------------------
-# Authorization (Face-only)
+# Authorization (Dynamic from AuthorizationManager)
 # -----------------------------
-AUTHORIZATION_MAP = {
-    "myke": "Partially Authorized",
-    "dean": "Authorized",
-    "art": "Partially Authorized",
-    "aldrikz": "Partially Authorized",
-}
+# Initialize AuthorizationManager
+if "auth_manager" not in st.session_state:
+    st.session_state.auth_manager = AuthorizationManager()
+    # Note: AuthorizationManager automatically syncs on initialization
+
+
+def get_authorization_map():
+    """Get the current authorization map with lowercase keys for case-insensitive lookup"""
+    auth_map = st.session_state.auth_manager.get_all_authorizations()
+    # Convert to lowercase keys for case-insensitive lookup
+    return {k.lower(): v for k, v in auth_map.items()}
 
 
 def get_authorization_level(identity_name: str) -> str:
+    """Get authorization level for a person (case-insensitive)"""
     if not identity_name or identity_name == "Unknown":
         return "Unauthorized"
-    return AUTHORIZATION_MAP.get(str(identity_name).lower(), "Partially Authorized")
+    # Get fresh map each time
+    auth_map = get_authorization_map()
+    return auth_map.get(str(identity_name).lower(), "Partially Authorized")
 
 
 def get_authorization_color(auth_level: str):
@@ -450,6 +463,7 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     """YOLO + ByteTrack tracking + FaceNet recognition + optional behavior detection."""
 
     cap = None
+    cap2 = None  # Initialize secondary camera
     recorder = None
     pipeline = None
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -463,6 +477,31 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     source_label = format_source_label(video_source, source_mode)
     evidence_dir = REPO_ROOT / "office_evidence" / f"{source_label}_{session_timestamp}"
     evidence_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create log file INSIDE the same evidence folder for easy comparison
+    log_file_path = evidence_dir / "session_log.txt"
+    
+    def write_to_log_file(message: str):
+        """Write a log entry to the session log file"""
+        try:
+            timestamp = datetime.now().strftime("%B %d, %Y at %I:%M:%S %p")
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{timestamp}] {message}\n")
+        except Exception:
+            pass
+    
+    # Write session header
+    write_to_log_file("="*60)
+    write_to_log_file(f"CCTV Monitoring Session Started")
+    write_to_log_file(f"Source: {source_label}")
+    write_to_log_file(f"Evidence Folder: {evidence_dir.name}")
+    write_to_log_file("="*60)
+    
+    # Send log file path to UI
+    _safe_put(log_queue, {"type": "log_file_path", "path": str(log_file_path)})
+    
+    # Log evidence folder for easy finding
+    _safe_put(log_queue, {"type": "success", "message": f"📁 Evidence folder: {evidence_dir.name}/"})
     
     # Check if logging is enabled
     enable_logging = config.get("enable_logging", False)
@@ -496,10 +535,13 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             return
 
         # Build pipeline with behavior parameters if enabled
+        # Get authorization map from config (already lowercase keys)
+        auth_map_lowercase = config.get('authorization_map', {})
+        
         pipeline_kwargs = {
             "yolo_model_path": str(yolo_path),
             "facenet_main_path": str(facenet_main_path),
-            "authorization_map": AUTHORIZATION_MAP,
+            "authorization_map": auth_map_lowercase,
             "conf_threshold": float(config.get("conf_threshold", 0.45)),
             "resize_factor": float(config.get("resize_factor", 1.0)),
             "frame_skip": int(config.get("frame_skip", 1)),
@@ -520,41 +562,177 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
 
         pipeline = PipelineClass(**pipeline_kwargs)
 
+        # === DUAL CAMERA SETUP ===
+        enable_dual_cam = config.get("enable_dual_cam", False)
+        secondary_source = config.get("secondary_source")
+        secondary_mode = config.get("secondary_mode")
+        
         source_mode = config.get("source_mode", "webcam")
         cap = open_video_capture(source_mode, video_source)
         if cap is None or not cap.isOpened():
-            _safe_put(log_queue, {"type": "error", "message": "❌ Failed to connect to camera. Please check camera connection."})
+            _safe_put(log_queue, {"type": "error", "message": "❌ Failed to connect to primary camera."})
             return
+
+        cap2 = None
+        if enable_dual_cam and secondary_source is not None:
+            _safe_put(log_queue, {"type": "info", "message": f"🔗 Connecting to secondary camera ({secondary_mode})..."})
+            cap2 = open_video_capture(secondary_mode, secondary_source)
+            if cap2 is None or not cap2.isOpened():
+                _safe_put(log_queue, {"type": "warning", "message": "⚠️ Failed to connect to secondary camera. Running single camera mode."})
+                cap2 = None
+                enable_dual_cam = False
+            else:
+                _safe_put(log_queue, {"type": "success", "message": "✅ Dual camera mode active! Monitoring both feeds side-by-side."})
 
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
         fps = max(int(cap.get(cv2.CAP_PROP_FPS) or 25), 1)
         
+        # Get secondary camera dimensions if dual mode
+        width2, height2 = width, height
+        if cap2 is not None:
+            width2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+            height2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        
         # No startup message - system is ready, logs will show when people are detected
 
-        # Recording
+        # Recording - Separate videos for dual camera mode
+        recorder2 = None
         if bool(config.get("recording_enabled")):
             source_label = format_source_label(video_source, source_mode)
-            rec_dir = REPO_ROOT / "recordings" / source_label
+            # Create session-specific recording folder (matching office_evidence structure)
+            rec_dir = REPO_ROOT / "recordings" / f"{source_label}_{session_timestamp}"
             rec_dir.mkdir(parents=True, exist_ok=True)
-            output_path = rec_dir / f"recording_{session_timestamp}.mp4"
-            writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
-            if writer.isOpened():
-                recorder = writer
-                _safe_put(log_queue, {"type": "recording_path", "path": str(output_path)})
-                # No logging for recording start - backend operation
+            
+            # Dual camera mode: Create TWO separate video files
+            if enable_dual_cam and cap2 is not None:
+                # Primary camera recording
+                output_path = rec_dir / f"recording_primary_{session_timestamp}.mp4"
+                writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+                
+                # Secondary camera recording
+                output_path2 = rec_dir / f"recording_secondary_{session_timestamp}.mp4"
+                writer2 = cv2.VideoWriter(str(output_path2), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width2, height2))
+                
+                if writer.isOpened() and writer2.isOpened():
+                    recorder = writer
+                    recorder2 = writer2
+                    _safe_put(log_queue, {"type": "recording_path", "path": str(output_path)})
+                    _safe_put(log_queue, {"type": "success", "message": f"📹 Recording to: {rec_dir.name}/ (2 cameras)"})
+                else:
+                    if writer.isOpened():
+                        writer.release()
+                    if writer2.isOpened():
+                        writer2.release()
+                    _safe_put(log_queue, {"type": "error", "message": "Failed to initialize dual camera recording"})
             else:
-                writer.release()
-                # Silent failure for recording issues
+                # Single camera recording
+                output_path = rec_dir / f"recording_{session_timestamp}.mp4"
+                writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+                if writer.isOpened():
+                    recorder = writer
+                    _safe_put(log_queue, {"type": "recording_path", "path": str(output_path)})
+                    _safe_put(log_queue, {"type": "success", "message": f"📹 Recording to: {rec_dir.name}/"})
+                else:
+                    writer.release()
 
         while not stop_flag.is_set():
+            # === READ FROM CAMERA(S) ===
             ret, frame = cap.read()
             if not ret or frame is None:
                 time.sleep(0.05)
                 continue
-
-            annotated, detections = pipeline.process_frame(frame)
+            
+            frame2 = None
+            if enable_dual_cam and cap2 is not None:
+                ret2, frame2 = cap2.read()
+                if not ret2 or frame2 is None:
+                    frame2 = None  # Fallback to single camera if secondary fails
+            
+            # === PROCESS FRAME(S) ===
+            if enable_dual_cam and frame2 is not None:
+                # DUAL CAMERA MODE: Stitch frames side-by-side
+                h1, w1 = frame.shape[:2]
+                h2, w2 = frame2.shape[:2]
+                
+                # Normalize heights for side-by-side stitching
+                target_h = min(h1, h2)
+                if h1 != target_h:
+                    new_w1 = int(w1 * target_h / h1)
+                    frame1_resized = cv2.resize(frame, (new_w1, target_h))
+                else:
+                    frame1_resized = frame
+                    new_w1 = w1
+                
+                if h2 != target_h:
+                    new_w2 = int(w2 * target_h / h2)
+                    frame2_resized = cv2.resize(frame2, (new_w2, target_h))
+                else:
+                    frame2_resized = frame2
+                    new_w2 = w2
+                
+                # Stitch horizontally
+                stitched_frame = np.hstack([frame1_resized, frame2_resized])
+                
+                # IMPORTANT: Scale down stitched frame for better object detection
+                # Stitched frames are 2x wider, making objects appear smaller
+                # Apply additional scaling to maintain detection quality
+                stitch_h, stitch_w = stitched_frame.shape[:2]
+                if stitch_w > 800:  # If stitched width is large
+                    scale_factor = 800 / stitch_w
+                    scaled_w = int(stitch_w * scale_factor)
+                    scaled_h = int(stitch_h * scale_factor)
+                    stitched_frame_scaled = cv2.resize(stitched_frame, (scaled_w, scaled_h))
+                    # Store scaling info for bbox adjustment
+                    bbox_scale_x = stitch_w / scaled_w
+                    bbox_scale_y = stitch_h / scaled_h
+                else:
+                    stitched_frame_scaled = stitched_frame
+                    bbox_scale_x = 1.0
+                    bbox_scale_y = 1.0
+                
+                # Process scaled stitched frame
+                annotated, detections = pipeline.process_frame(stitched_frame_scaled)
+                
+                # Resize annotated frame back to original stitched size for display
+                if bbox_scale_x != 1.0 or bbox_scale_y != 1.0:
+                    annotated = cv2.resize(annotated, (stitch_w, stitch_h))
+                
+                # Adjust bboxes back to original stitched frame coordinates and determine camera
+                for detection in detections:
+                    bbox = detection.get("bbox", (0, 0, 0, 0))
+                    x1, y1, x2, y2 = bbox
+                    
+                    # Scale bbox back to original stitched frame size
+                    x1_scaled = int(x1 * bbox_scale_x)
+                    y1_scaled = int(y1 * bbox_scale_y)
+                    x2_scaled = int(x2 * bbox_scale_x)
+                    y2_scaled = int(y2 * bbox_scale_y)
+                    detection["bbox"] = (x1_scaled, y1_scaled, x2_scaled, y2_scaled)
+                    
+                    center_x = (x1_scaled + x2_scaled) / 2
+                    
+                    # If center_x is in the left half, it's Primary camera, otherwise Secondary
+                    if center_x < new_w1:
+                        detection["camera"] = "Primary"
+                    else:
+                        detection["camera"] = "Secondary"
+                        # Adjust bbox coordinates to be relative to frame2
+                        detection["bbox_secondary"] = (
+                            max(0, x1 - new_w1),
+                            y1,
+                            max(0, x2 - new_w1),
+                            y2
+                        )
+            else:
+                # SINGLE CAMERA MODE
+                annotated, detections = pipeline.process_frame(frame)
+                for detection in detections:
+                    detection["camera"] = "Primary"
             _safe_put(log_queue, {"type": "detections", "data": detections})
+            
+            # Track current status for each person
+            current_people = {}  # track_id -> {name, auth, behavior}
             
             # Log meaningful events - person detection and activities
             if enable_logging and detections:
@@ -562,10 +740,16 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                     identity = detection.get("identity", "Unknown")
                     authorization = detection.get("authorization", "Unauthorized")
                     behavior = detection.get("behavior_status", "STATUS: NO INTERACTION")
-                    timestamp_display = datetime.now().strftime("%B %d, %Y at %I:%M:%S %p")
+                    track_id = detection.get("track_id", -1)
+                    
+                    # Store current status
+                    current_people[track_id] = {
+                        'name': identity,
+                        'auth': authorization,
+                        'behavior': behavior
+                    }
                     
                     # Track which people we've already logged to avoid spam
-                    track_id = detection.get("track_id", -1)
                     log_key = f"person_{track_id}_{identity}"
                     
                     # First detection of this person
@@ -577,15 +761,19 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         # Entry log
                         if identity != "Unknown":
                             auth_emoji = "✅" if authorization == "Authorized" else "⚠️" if authorization == "Partially Authorized" else "🚨"
+                            msg = f"{auth_emoji} {identity} entered the room - {authorization}"
                             _safe_put(log_queue, {
                                 "type": "success" if authorization == "Authorized" else "warning" if authorization == "Partially Authorized" else "error",
-                                "message": f"{auth_emoji} {identity} entered the room - {authorization}"
+                                "message": msg
                             })
+                            write_to_log_file(msg)
                         else:
+                            msg = f"🚨 Unidentified person detected - Unauthorized"
                             _safe_put(log_queue, {
                                 "type": "warning",
-                                "message": f"🚨 Unidentified person detected - Unauthorized"
+                                "message": msg
                             })
+                            write_to_log_file(msg)
                     
                     # Log behavior changes (only significant ones)
                     if behavior != "STATUS: NO INTERACTION":
@@ -598,16 +786,50 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                             # Clean behavior text
                             if "CARRYING" in behavior:
                                 item = behavior.replace("STATUS: CARRYING ", "")
+                                msg = f"👜 {identity} is carrying {item.lower()}"
                                 _safe_put(log_queue, {
                                     "type": "info",
-                                    "message": f"👜 {identity} is carrying {item.lower()}"
+                                    "message": msg
                                 })
+                                write_to_log_file(msg)
                             elif "INTERACTING WITH" in behavior:
                                 item = behavior.replace("STATUS: INTERACTING WITH ", "")
+                                msg = f"💻 {identity} is interacting with {item.lower()}"
                                 _safe_put(log_queue, {
                                     "type": "info",
-                                    "message": f"💻 {identity} is using {item.lower()}"
+                                    "message": msg
                                 })
+                                write_to_log_file(msg)
+                
+                # Generate status summary every few seconds
+                if not hasattr(video_processing_thread, 'last_status_log'):
+                    video_processing_thread.last_status_log = time.time()
+                
+                current_time = time.time()
+                if current_time - video_processing_thread.last_status_log >= 10.0:  # Every 10 seconds
+                    video_processing_thread.last_status_log = current_time
+                    
+                    if current_people:
+                        status_lines = ["� Current Status:"]
+                        for tid, info in current_people.items():
+                            name = info['name']
+                            behavior = info['behavior']
+                            
+                            if behavior == "STATUS: NO INTERACTION":
+                                status_lines.append(f"  • {name} is present in the room")
+                            elif "CARRYING" in behavior:
+                                item = behavior.replace("STATUS: CARRYING ", "").lower()
+                                status_lines.append(f"  • {name} is carrying {item}")
+                            elif "INTERACTING WITH" in behavior:
+                                item = behavior.replace("STATUS: INTERACTING WITH ", "").lower()
+                                status_lines.append(f"  • {name} is interacting with {item}")
+                        
+                        status_msg = "\n".join(status_lines)
+                        _safe_put(log_queue, {
+                            "type": "info",
+                            "message": status_msg
+                        })
+                        write_to_log_file(status_msg.replace("\n", " | "))
             
             # Save evidence for interactions (similar to main.py)
             if config.get("enable_behavior", False):
@@ -641,10 +863,25 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                                 pass
 
             if recorder is not None:
-                if annotated.shape[1] != width or annotated.shape[0] != height:
-                    recorder.write(cv2.resize(annotated, (width, height)))
+                # Dual camera mode: Write to BOTH separate recorders (original frames, not stitched)
+                if enable_dual_cam and recorder2 is not None and frame2 is not None:
+                    # Write primary camera frame (original, before stitching)
+                    if frame.shape[1] != width or frame.shape[0] != height:
+                        recorder.write(cv2.resize(frame, (width, height)))
+                    else:
+                        recorder.write(frame)
+                    
+                    # Write secondary camera frame (original)
+                    if frame2.shape[1] != width2 or frame2.shape[0] != height2:
+                        recorder2.write(cv2.resize(frame2, (width2, height2)))
+                    else:
+                        recorder2.write(frame2)
                 else:
-                    recorder.write(annotated)
+                    # Single camera recording
+                    if annotated.shape[1] != width or annotated.shape[0] != height:
+                        recorder.write(cv2.resize(annotated, (width, height)))
+                    else:
+                        recorder.write(annotated)
 
             try:
                 while not frame_queue.empty():
@@ -658,18 +895,26 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
 
             time.sleep(0.001)
 
-        # No stop logging - system operations
+        # Write session end to log file
+        write_to_log_file("="*60)
+        write_to_log_file("CCTV Monitoring Session Ended")
+        write_to_log_file("="*60)
 
     except Exception as e:
         # Only log critical user-facing errors
-        _safe_put(log_queue, {"type": "error", "message": "⚠️ System encountered an error. Please restart."})
+        error_msg = "⚠️ System encountered an error. Please restart."
+        _safe_put(log_queue, {"type": "error", "message": error_msg})
+        write_to_log_file(f"ERROR: {error_msg}")
 
     finally:
         if cap is not None:
             cap.release()
-            # No camera release logging - backend operation
+        if cap2 is not None:
+            cap2.release()
         if recorder is not None:
             recorder.release()
+        if recorder2 is not None:
+            recorder2.release()
             # No recording save logging - backend operation
 
 
@@ -678,6 +923,167 @@ def main():
     st.markdown('<div class="main-header">🎥 CCTV Monitoring System</div>', unsafe_allow_html=True)
 
     with st.sidebar:
+        # ==================== REGISTER PERSONNEL SECTION ====================
+        st.header("👤 Register Personnel")
+        
+        with st.expander("📸 Face Registration", expanded=False):
+            st.markdown("### Capture Face Data")
+            st.info("💡 Capture face images for training the recognition system")
+            
+            # Name input
+            person_name = st.text_input(
+                "Person Name", 
+                placeholder="Enter person's name",
+                help="Enter the name of the person to register"
+            )
+            
+            # Capture settings
+            col_cap1, col_cap2 = st.columns(2)
+            with col_cap1:
+                num_images = st.number_input("Images to Capture", min_value=20, max_value=200, value=100)
+            with col_cap2:
+                capture_webcam_id = st.number_input("Webcam ID", min_value=0, max_value=5, value=0)
+            
+            # Capture button
+            if st.button("🎥 Start Capture", use_container_width=True, type="primary", disabled=not person_name):
+                if person_name and person_name.strip():
+                    st.info(f"🎬 Starting face capture for: **{person_name}**")
+                    st.warning("⚠️ This will open a separate window. Follow on-screen instructions.")
+                    
+                    try:
+                        import subprocess
+                        # Run the facenet_capture.py script
+                        capture_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_capture.py"
+                        
+                        if capture_script.exists():
+                            # Run in background and show status
+                            with st.spinner("Running face capture... Check the popup window!"):
+                                result = subprocess.run(
+                                    [
+                                        str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"),
+                                        str(capture_script)
+                                    ],
+                                    input=person_name.strip(),
+                                    text=True,
+                                    capture_output=True,
+                                    cwd=str(REPO_ROOT)
+                                )
+                                
+                                if result.returncode == 0:
+                                    st.success(f"✅ Successfully captured faces for {person_name}!")
+                                    st.info(f"📁 Images saved to: `datasets/faces/{person_name.strip().replace(' ', '_')}/`")
+                                else:
+                                    st.error(f"❌ Capture failed: {result.stderr}")
+                        else:
+                            st.error(f"❌ Capture script not found: {capture_script}")
+                    except Exception as e:
+                        st.error(f"❌ Error running capture: {str(e)}")
+                else:
+                    st.warning("⚠️ Please enter a person's name first")
+            
+            if not person_name:
+                st.caption("👆 Enter a name to enable capture")
+        
+        # Train button
+        st.markdown("### 🎓 Train Recognition Model")
+        st.info("💡 Train the system after capturing face data")
+        
+        if st.button("🚀 Train Model", use_container_width=True, type="primary"):
+            st.info("🔄 Training FaceNet model... This may take a few minutes.")
+            
+            try:
+                import subprocess
+                train_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_train.py"
+                
+                if train_script.exists():
+                    with st.spinner("Training in progress... Please wait."):
+                        result = subprocess.run(
+                            [
+                                str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"),
+                                str(train_script)
+                            ],
+                            capture_output=True,
+                            text=True,
+                            cwd=str(REPO_ROOT)
+                        )
+                        
+                        if result.returncode == 0:
+                            st.success("✅ Model training completed successfully!")
+                            st.info("📊 Training output:")
+                            st.code(result.stdout, language="text")
+                            st.balloons()
+                        else:
+                            st.error("❌ Training failed!")
+                            st.error(result.stderr)
+                else:
+                    st.error(f"❌ Training script not found: {train_script}")
+            except Exception as e:
+                st.error(f"❌ Error running training: {str(e)}")
+        
+        st.divider()
+        # ==================== END REGISTER PERSONNEL SECTION ====================
+        
+        # ==================== AUTHORIZATION MANAGEMENT SECTION ====================
+        st.header("👥 Authorization Management")
+        
+        # Refresh authorization map from folders
+        if st.button("🔄 Refresh Personnel List", help="Scan for new people in datasets/faces/"):
+            with st.spinner("Scanning for new personnel..."):
+                st.session_state.auth_manager.refresh()
+                st.success("✅ Personnel list refreshed!")
+                st.rerun()  # Rerun to show updated list
+        
+        # Display current authorization map
+        current_map = st.session_state.auth_manager.get_all_authorizations()
+        
+        if not current_map:
+            st.info("ℹ️ No personnel found. Add faces in `datasets/faces/{person_name}/` and click Refresh.")
+        else:
+            st.subheader(f"Personnel Count: {len(current_map)}")
+            
+            # Group by authorization level
+            auth_groups = {"Authorized": [], "Partially Authorized": [], "Unauthorized": []}
+            for name, level in sorted(current_map.items()):
+                auth_groups[level].append(name)
+            
+            # Display statistics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("✅ Authorized", len(auth_groups["Authorized"]))
+            with col2:
+                st.metric("⚠️ Partially Authorized", len(auth_groups["Partially Authorized"]))
+            with col3:
+                st.metric("❌ Unauthorized", len(auth_groups["Unauthorized"]))
+            
+            st.divider()
+            
+            # Authorization editor
+            st.subheader("Edit Authorization Levels")
+            
+            # Create expander for each person
+            for person_name in sorted(current_map.keys()):
+                current_level = current_map[person_name]
+                
+                with st.expander(f"👤 {person_name} - {current_level}"):
+                    new_level = st.selectbox(
+                        "Authorization Level",
+                        ["Authorized", "Partially Authorized", "Unauthorized"],
+                        index=["Authorized", "Partially Authorized", "Unauthorized"].index(current_level),
+                        key=f"auth_{person_name}"
+                    )
+                    
+                    if new_level != current_level:
+                        if st.button(f"💾 Save Changes for {person_name}", key=f"save_{person_name}"):
+                            success = st.session_state.auth_manager.set_authorization(person_name, new_level)
+                            if success:
+                                st.success(f"✅ Updated {person_name}: {current_level} → {new_level}")
+                                st.rerun()  # Refresh to show updated authorization
+                            else:
+                                st.error(f"❌ Failed to update {person_name}")
+        
+        st.divider()
+        # ==================== END AUTHORIZATION MANAGEMENT SECTION ====================
+        
         st.header("⚙️ Configuration")
         
         # Video Source
@@ -698,7 +1104,7 @@ def main():
             st.info("💡 For videos > 200MB, use 'File Path' method")
             
             # Get available videos from Mp4TESTING folder
-            test_videos_dir = REPO_ROOT / "Tapo"
+            test_videos_dir = REPO_ROOT / "vids"
             available_videos = []
             if test_videos_dir.exists():
                 available_videos = sorted([
@@ -769,19 +1175,62 @@ def main():
         
         st.divider()
         
+        # Dual Camera Mode
+        st.subheader("📹 Dual Camera Mode")
+        enable_dual_cam = st.checkbox("Enable Dual Camera", value=False, 
+                                     help="Monitor two camera sources simultaneously")
+        secondary_source = None
+        secondary_mode = None
+        
+        if enable_dual_cam:
+            sec_source_type = st.radio("Secondary Source Type", ["Webcam", "RTSP Camera"], 
+                                      key="sec_source_type")
+            
+            if sec_source_type == "Webcam":
+                sec_webcam_index = st.number_input("Secondary Webcam Index", 
+                                                  min_value=0, max_value=5, 
+                                                  value=cam_config.WEBCAM_ID_SECONDARY)
+                secondary_source = int(sec_webcam_index)
+                secondary_mode = "webcam"
+                st.success(f"✅ Secondary: Webcam {sec_webcam_index}")
+            
+            elif sec_source_type == "RTSP Camera":
+                rtsp_cameras = cam_config.get_all_rtsp_cameras()
+                # Show ALL cameras for secondary
+                sec_camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
+                
+                if sec_camera_options:
+                    sec_selected_camera = st.selectbox(
+                        "Select Secondary RTSP Camera",
+                        options=list(sec_camera_options.keys()),
+                        format_func=lambda x: sec_camera_options[x],
+                        key="sec_rtsp_select"
+                    )
+                    secondary_source = cam_config.get_rtsp_url(sec_selected_camera)
+                    secondary_mode = "rtsp"
+                    
+                    sec_camera_info = cam_config.RTSP_CAMERAS[sec_selected_camera]
+                    st.text(f"IP: {sec_camera_info['ip']}")
+                    st.text(f"Stream: {sec_camera_info['stream']}")
+                    st.success(f"✅ Secondary: {sec_selected_camera}")
+                else:
+                    st.error("No enabled RTSP cameras for secondary source")
+        
+        st.divider()
+        
         # Model Configuration
         st.subheader("Model Settings")
         use_gpu = st.checkbox("Use GPU", value=False)
         device = "cuda" if use_gpu else "cpu"
         
-        yolo_model = st.text_input("YOLO Model", value="models/YOLOv8/yolov8n.pt")
+        yolo_model = st.text_input("YOLO Model", value="models/YOLOv11/yolo11n.pt")
         facenet_main = st.text_input("FaceNet Main", value=str(REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py"))
         
         st.divider()
         
         # Behavior Detection Settings
         st.subheader("🎯 Behavior Detection")
-        enable_behavior = st.checkbox("Enable HOI Detection", value=False,
+        enable_behavior = st.checkbox("Enable HOI Detection", value=True,
                                      help="Detect human-object interactions (CARRYING/INTERACTING)")
         
         if enable_behavior:
@@ -872,6 +1321,12 @@ def main():
                 'status_on_frames_required': status_on_frames,
                 'status_off_frames_required': status_off_frames,
                 'object_hold_frames': object_hold_frames,
+                # Dual camera configuration
+                'enable_dual_cam': enable_dual_cam if 'enable_dual_cam' in locals() else False,
+                'secondary_source': secondary_source if 'secondary_source' in locals() else None,
+                'secondary_mode': secondary_mode if 'secondary_mode' in locals() else None,
+                # Pass authorization map with lowercase keys
+                'authorization_map': {k.lower(): v for k, v in st.session_state.auth_manager.get_all_authorizations().items()},
             }
             
             # Clear queues
@@ -936,11 +1391,34 @@ def main():
     # Always show log section in UI
     st.subheader("📋 System Log")
     
-    # Add "View All Logs" button
-    col_log1, col_log2 = st.columns([3, 1])
+    # Add "View All Logs" and "Open Logs Folder" buttons
+    col_log1, col_log2, col_log3 = st.columns([2, 1, 1])
     with col_log2:
         if st.button("📜 View All Logs", use_container_width=True):
             st.session_state.show_all_logs = not st.session_state.get("show_all_logs", False)
+    with col_log3:
+        if st.button("📂 Open Logs Folder", use_container_width=True):
+            # Open the date-based logs folder
+            current_date = datetime.now().strftime("%m-%d-%Y")
+            logs_date_dir = REPO_ROOT / "logs" / current_date
+            
+            # Create folder if it doesn't exist
+            if not logs_date_dir.exists():
+                logs_date_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Open folder in file explorer
+            import subprocess
+            import platform
+            
+            try:
+                if platform.system() == "Windows":
+                    subprocess.run(['explorer', str(logs_date_dir)])
+                elif platform.system() == "Darwin":  # macOS
+                    subprocess.run(['open', str(logs_date_dir)])
+                else:  # Linux
+                    subprocess.run(['xdg-open', str(logs_date_dir)])
+            except Exception:
+                pass
     
     log_placeholder = st.empty()
     
@@ -948,6 +1426,27 @@ def main():
     if st.session_state.get("show_all_logs", False):
         with st.expander("📋 Complete Log History", expanded=True):
             if st.session_state.all_logs:
+                # Show log file info if available
+                if st.session_state.session_log_file and Path(st.session_state.session_log_file).exists():
+                    log_file = Path(st.session_state.session_log_file)
+                    st.info(f"📄 Session log file: `{log_file.name}`")
+                    
+                    # Download button for log file
+                    try:
+                        with open(log_file, 'r', encoding='utf-8') as f:
+                            log_content = f.read()
+                        st.download_button(
+                            label="💾 Download Log File",
+                            data=log_content,
+                            file_name=log_file.name,
+                            mime="text/plain",
+                            use_container_width=True
+                        )
+                    except Exception:
+                        pass
+                
+                st.divider()
+                
                 # Show all logs with timestamps
                 for log_entry in st.session_state.all_logs[-100:]:  # Show last 100 logs
                     msg_type = log_entry.get('type', 'info')
@@ -1049,6 +1548,8 @@ def main():
                         st.session_state.current_detections = msg.get('data', [])
                     elif msg.get('type') == 'recording_path':
                         st.session_state.recording_path = msg.get('path')
+                    elif msg.get('type') == 'log_file_path':
+                        st.session_state.session_log_file = msg.get('path')
                     else:
                         # Add timestamp if not present
                         if 'timestamp' not in msg:
