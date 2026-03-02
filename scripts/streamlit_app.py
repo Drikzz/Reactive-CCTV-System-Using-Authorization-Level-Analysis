@@ -478,8 +478,11 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     evidence_dir = REPO_ROOT / "office_evidence" / f"{source_label}_{session_timestamp}"
     evidence_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create log file INSIDE the same evidence folder for easy comparison
-    log_file_path = evidence_dir / "session_log.txt"
+    # Create log file in LOGS folder organized by date (separate from evidence)
+    current_date = datetime.now().strftime("%m-%d-%Y")  # Format: 02-19-2026
+    logs_date_dir = REPO_ROOT / "logs" / current_date
+    logs_date_dir.mkdir(parents=True, exist_ok=True)
+    log_file_path = logs_date_dir / f"session_{source_label}_{session_timestamp}.txt"
     
     def write_to_log_file(message: str):
         """Write a log entry to the session log file"""
@@ -495,13 +498,15 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     write_to_log_file(f"CCTV Monitoring Session Started")
     write_to_log_file(f"Source: {source_label}")
     write_to_log_file(f"Evidence Folder: {evidence_dir.name}")
+    write_to_log_file(f"Log File: {current_date}/{log_file_path.name}")
     write_to_log_file("="*60)
     
     # Send log file path to UI
     _safe_put(log_queue, {"type": "log_file_path", "path": str(log_file_path)})
     
-    # Log evidence folder for easy finding
+    # Log evidence and log folder locations for easy finding
     _safe_put(log_queue, {"type": "success", "message": f"📁 Evidence folder: {evidence_dir.name}/"})
+    _safe_put(log_queue, {"type": "success", "message": f"📄 Log file: logs/{current_date}/{log_file_path.name}"})
     
     # Check if logging is enabled
     enable_logging = config.get("enable_logging", False)
@@ -1398,7 +1403,7 @@ def main():
             st.session_state.show_all_logs = not st.session_state.get("show_all_logs", False)
     with col_log3:
         if st.button("📂 Open Logs Folder", use_container_width=True):
-            # Open the date-based logs folder
+            # Open today's date folder in logs
             current_date = datetime.now().strftime("%m-%d-%Y")
             logs_date_dir = REPO_ROOT / "logs" / current_date
             

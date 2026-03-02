@@ -17,16 +17,16 @@ VIDEO_FILE_PATH = r"C:\Users\rikzs\Desktop\Aldrikz\Code\thesis_system\videos\sam
 
 # RTSP Camera Settings (Tapo C200)
 RTSP_CAMERAS = {
-    "tapo_c200_main": {
-        "ip": "192.168.0.110",
+    "Cam1": {
+        "ip": "192.168.254.177",
         "port": "554",
         "username": "reactivecctv101",
         "password": "reactivecctv101",
         "stream": "stream2",  # stream1 = 1080p, stream2 = 640x480
         "enabled": True
     },
-    "tapo_c200_secondary": {
-        "ip": "192.168.0.104",
+    "Cam2": {
+        "ip": "192.168.254.109",
         "port": "554",
         "username": "CakeyFudo",
         "password": "CakeyFudo",
