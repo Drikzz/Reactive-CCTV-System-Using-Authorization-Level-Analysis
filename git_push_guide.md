@@ -8,7 +8,7 @@ git add .
 
 # 3. Commit with a message (keep it short & clear)
 
-git commit -m "fixed login bug + added dark mode"
+git commit -m "commitMessage"
 
 # 4. Push to GitHub (main branch)
 

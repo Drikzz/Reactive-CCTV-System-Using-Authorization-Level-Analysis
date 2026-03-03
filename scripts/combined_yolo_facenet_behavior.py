@@ -76,9 +76,9 @@ class CombinedYOLOFaceNetBehavior:
         enable_behavior: bool = True,
         coverage_thresh: float = 0.18,
         move_px_thresh: float = 8.0,
-        stationary_frames_required: int = 6,
-        status_on_frames_required: int = 6,
-        status_off_frames_required: int = 12,
+        stationary_frames_required: int = 10,  # Require 10 frames of stationary position
+        status_on_frames_required: int = 25,  # Require 25 consecutive frames (~0.83 sec) to confirm interaction
+        status_off_frames_required: int = 30,  # Require 30 frames (~1 sec) to confirm no interaction
         object_hold_frames: int = 8,
     ) -> None:
         self.conf_threshold = float(conf_threshold)
@@ -140,6 +140,15 @@ class CombinedYOLOFaceNetBehavior:
         self.identity_lock_confidence = 0.7  # Confidence threshold to lock identity
         self.identity_lock_duration = 600  # Frames to keep locked identity (20 seconds at 30fps)
         self.identity_decay_rate = 0.998  # Confidence decay when face not detected
+        
+        # NEW: Per-frame unauthorized action counting
+        self.unauthorized_logs: List[Dict[str, Any]] = []  # Store all unauthorized action logs
+        
+        # NEW: Repeated behavior detection with smoothing
+        self.behavior_history: Dict[int, Dict[str, Any]] = {}  # track_id -> behavior tracking data
+        self.behavior_window_size = 50  # Track last 50 frames
+        self.behavior_spam_threshold = 0.8  # 80% repetition = spam/abnormal
+        self.behavior_alert_cooldown = 150  # Frames before re-alerting (5 sec at 30fps)
 
     def get_authorization_level(self, identity_name: str) -> str:
         if not identity_name or identity_name == "Unknown":
@@ -158,11 +167,9 @@ class CombinedYOLOFaceNetBehavior:
     @staticmethod
     def status_color(status_text: str):
         """Color for behavior status."""
-        if "CARRYING" in status_text:
-            return (0, 0, 255)  # Red
         if "INTERACTING" in status_text:
             return (0, 165, 255)  # Orange
-        return (0, 255, 0)  # Green
+        return (0, 255, 0)  # Green (No interaction)
 
     def _should_recognize(self, track_id: int) -> bool:
         last = self._last_recog_frame.get(track_id, -10_000)
@@ -198,26 +205,19 @@ class CombinedYOLOFaceNetBehavior:
 
     def choose_status_for_person(self, moving: bool, stationary: bool, best_cov: Dict):
         """Determine behavior status based on movement and object overlap."""
-        if moving:
-            carry_candidates = [cid for cid in self.CARRY_IDS if cid in best_cov]
-            if carry_candidates:
-                chosen = max(carry_candidates, key=lambda cid: best_cov[cid][0])
-                name = self.CLASS_ID_TO_NAME.get(chosen, str(chosen)).upper()
-                return f"STATUS: CARRYING {name}"
-            return "STATUS: NO INTERACTION"
-
-        if stationary:
-            interact_candidates = [cid for cid in self.INTERACT_IDS if cid in best_cov]
-            if interact_candidates:
-                chosen = None
-                for cid in self.INTERACT_PRIORITY:
-                    if cid in interact_candidates:
-                        chosen = cid
-                        break
-                if chosen is None:
-                    chosen = interact_candidates[0]
-                name = self.CLASS_ID_TO_NAME.get(chosen, str(chosen)).upper()
-                return f"STATUS: INTERACTING WITH {name}"
+        # Check for any object interaction regardless of movement
+        # Treat both moving and stationary as "INTERACTING WITH"
+        interact_candidates = [cid for cid in self.INTERACT_IDS if cid in best_cov]
+        if interact_candidates:
+            chosen = None
+            for cid in self.INTERACT_PRIORITY:
+                if cid in interact_candidates:
+                    chosen = cid
+                    break
+            if chosen is None:
+                chosen = interact_candidates[0]
+            name = self.CLASS_ID_TO_NAME.get(chosen, str(chosen)).upper()
+            return f"STATUS: INTERACTING WITH {name}"
 
         return "STATUS: NO INTERACTION"
 
@@ -237,6 +237,174 @@ class CombinedYOLOFaceNetBehavior:
                 track_state["confirmed_status"] = candidate_status
 
         return track_state["confirmed_status"]
+
+    def count_unauthorized_actions(self, detections: List[Dict[str, Any]], frame_idx: int, timestamp: str) -> Dict[str, Any]:
+        """Count unauthorized actions per frame and log them for analysis.
+        
+        Returns a log entry with:
+        - frame_id: Frame number
+        - timestamp: Current timestamp
+        - unauthorized_count: Total unauthorized interactions in this frame
+        - details: List of each unauthorized action with person info
+        """
+        unauthorized_actions = []
+        
+        print(f"[DEBUG-COUNT] Frame {frame_idx}: Checking {len(detections)} detections")
+        
+        for det in detections:
+            identity = det.get("identity", "Unknown")
+            auth_level = det.get("authorization", "Unauthorized")
+            behavior = det.get("behavior_status", "STATUS: NO INTERACTION")
+            track_id = det.get("track_id", -1)
+            
+            print(f"[DEBUG-COUNT]   - {identity} ({auth_level}): {behavior}")
+            
+            # Check if this is an unauthorized interaction
+            is_interaction = behavior != "STATUS: NO INTERACTION"
+            is_unauthorized_person = auth_level in ["Unauthorized", "Partially Authorized"]
+            
+            # Count as unauthorized if:
+            # 1. Person is unauthorized/partially authorized AND interacting, OR
+            # 2. Specific objects are forbidden (e.g., cell phone = always unauthorized)
+            if is_interaction:
+                # Extract object type from behavior status
+                object_type = None
+                behavior_upper = behavior.upper()  # Case-insensitive matching
+                
+                if "LAPTOP" in behavior_upper:
+                    object_type = "laptop"
+                elif "CELL PHONE" in behavior_upper or "PHONE" in behavior_upper:
+                    object_type = "cell phone"
+                elif "KEYBOARD" in behavior_upper:
+                    object_type = "keyboard"
+                elif "MOUSE" in behavior_upper:
+                    object_type = "mouse"
+                elif "BACKPACK" in behavior_upper:
+                    object_type = "backpack"
+                elif "HANDBAG" in behavior_upper:
+                    object_type = "handbag"
+                
+                # Debug: Print what we're detecting (remove after testing)
+                if object_type is not None:
+                    print(f"[DEBUG] Frame {frame_idx}: {identity} ({auth_level}) - {behavior} -> object: {object_type}")
+                
+                # Define unauthorized interactions
+                # Rules:
+                # - Cell phone use is ALWAYS unauthorized (for everyone)
+                # - ALL other objects (laptop, keyboard, mouse, backpack, handbag) are unauthorized 
+                #   if used by Unauthorized or Partially Authorized persons
+                # - Authorized persons can use any object freely
+                is_unauthorized_action = False
+                
+                if object_type == "cell phone":
+                    # Cell phone use is always unauthorized for everyone
+                    is_unauthorized_action = True
+                    print(f"[DEBUG] UNAUTHORIZED: {identity} using cell phone")
+                elif is_unauthorized_person and object_type is not None:
+                    # Unauthorized/Partially Authorized persons cannot use ANY detected objects
+                    is_unauthorized_action = True
+                    print(f"[DEBUG] UNAUTHORIZED: {identity} ({auth_level}) using {object_type}")
+                
+                if is_unauthorized_action:
+                    action_detail = {
+                        "person_id": int(track_id),  # Convert to Python int for JSON serialization
+                        "identity": identity,
+                        "authorization": auth_level,
+                        "action": behavior,
+                        "object": object_type
+                    }
+                    unauthorized_actions.append(action_detail)
+
+        
+        # Create log entry
+        log_entry = {
+            "frame_id": frame_idx,
+            "timestamp": timestamp,
+            "unauthorized_count": len(unauthorized_actions),
+            "details": unauthorized_actions
+        }
+        
+        # Debug: Print summary for this frame
+        if len(unauthorized_actions) > 0:
+            print(f"[DEBUG] Frame {frame_idx}: {len(unauthorized_actions)} unauthorized action(s) logged")
+        
+        # Store in history
+        if len(unauthorized_actions) > 0:
+            self.unauthorized_logs.append(log_entry)
+        
+        return log_entry
+
+    def detect_repeated_behavior(self, track_id: int, behavior_status: str, identity: str) -> Dict[str, Any]:
+        """Detect if a person is repeating the same behavior abnormally.
+        
+        Uses a sliding window + smoothing to avoid false positives.
+        Returns a dict with:
+        - is_repeated: Whether behavior is being spammed/repeated abnormally
+        - repetition_rate: Percentage of frames showing this behavior (0.0-1.0)
+        - window_size: How many frames were analyzed
+        - flagged: Whether this should trigger an alert
+        """
+        from collections import deque
+        
+        # Initialize tracking for this person if not exists
+        if track_id not in self.behavior_history:
+            self.behavior_history[track_id] = {
+                "behavior_window": deque(maxlen=self.behavior_window_size),  # Last N frames
+                "last_behavior": None,
+                "last_alert_frame": -9999,  # Frame when last alerted
+                "alert_count": 0  # How many times flagged
+            }
+        
+        track_hist = self.behavior_history[track_id]
+        
+        # Add current behavior to window
+        track_hist["behavior_window"].append(behavior_status)
+        track_hist["last_behavior"] = behavior_status
+        
+        # If not enough data yet, return no repetition
+        if len(track_hist["behavior_window"]) < 20:
+            return {
+                "is_repeated": False,
+                "repetition_rate": 0.0,
+                "window_size": len(track_hist["behavior_window"]),
+                "flagged": False
+            }
+        
+        # Count how many times current behavior appears in window
+        behavior_count = sum(1 for b in track_hist["behavior_window"] if b == behavior_status)
+        repetition_rate = behavior_count / len(track_hist["behavior_window"])
+        
+        # Check if this is spam/abnormal repetition
+        # Only flag if:
+        # 1. It's an actual interaction (not "NO INTERACTION")
+        # 2. Repetition rate exceeds threshold
+        # 3. Cooldown period has passed since last alert
+        is_interaction = behavior_status != "STATUS: NO INTERACTION"
+        exceeds_threshold = repetition_rate >= self.behavior_spam_threshold
+        cooldown_passed = (self._frame_idx - track_hist["last_alert_frame"]) >= self.behavior_alert_cooldown
+        
+        is_repeated = is_interaction and exceeds_threshold
+        should_flag = is_repeated and cooldown_passed
+        
+        # Debug: Print when threshold is exceeded
+        if is_repeated:
+            print(f"[DEBUG] {identity} (ID {track_id}): Repeated behavior detected - {behavior_status} appears in {int(repetition_rate*100)}% of last {len(track_hist['behavior_window'])} frames")
+            if should_flag:
+                print(f"[DEBUG] 🔁 FLAGGED as repeated pattern (Alert #{track_hist['alert_count'] + 1})")
+            else:
+                print(f"[DEBUG] Not flagged - cooldown active (frames since last: {self._frame_idx - track_hist['last_alert_frame']})")
+        
+        if should_flag:
+            track_hist["last_alert_frame"] = self._frame_idx
+            track_hist["alert_count"] += 1
+        
+        return {
+            "is_repeated": is_repeated,
+            "repetition_rate": repetition_rate,
+            "window_size": len(track_hist["behavior_window"]),
+            "flagged": should_flag,
+            "alert_count": track_hist["alert_count"]
+        }
 
     def process_frame(self, frame_bgr) -> Tuple[Any, List[Dict[str, Any]]]:
         """Process frame with face recognition and behavior detection.
@@ -540,7 +708,7 @@ class CombinedYOLOFaceNetBehavior:
                 # Add to detections
                 detections.append(
                     {
-                        "track_id": tid,
+                        "track_id": int(tid),  # Convert to Python int for JSON serialization
                         "identity": identity_name,
                         "authorization": auth_level,
                         "identity_conf": identity_conf,
@@ -551,9 +719,158 @@ class CombinedYOLOFaceNetBehavior:
                     }
                 )
 
+        # NEW FEATURE 1: Count unauthorized actions BEFORE filtering
+        # (We need to count all detections, including those that will be filtered)
+        current_timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[DEBUG-MAIN] Frame {self._frame_idx}: About to count {len(detections)} detections")
+        for d in detections:
+            print(f"[DEBUG-MAIN]   {d.get('identity')} ({d.get('authorization')}): {d.get('behavior_status')}")
+        unauthorized_log = self.count_unauthorized_actions(detections, self._frame_idx, current_timestamp)
+        print(f"[DEBUG-MAIN] Result: {unauthorized_log['unauthorized_count']} unauthorized actions")
+
         # Feature: If any Authorized person is present, filter out Partially Authorized
         has_authorized = any(d["authorization"] == "Authorized" for d in detections)
         if has_authorized:
             detections = [d for d in detections if d["authorization"] != "Partially Authorized"]
+        
+        # NEW FEATURE 2: Detect repeated behavior for each person
+        for det in detections:
+            track_id = det.get("track_id", -1)
+            behavior_status = det.get("behavior_status", "STATUS: NO INTERACTION")
+            identity = det.get("identity", "Unknown")
+            
+            if track_id >= 0:
+                repetition_info = self.detect_repeated_behavior(track_id, behavior_status, identity)
+                
+                # Add repetition info to detection
+                det["repetition_detected"] = repetition_info["is_repeated"]
+                det["repetition_rate"] = repetition_info["repetition_rate"]
+                det["behavior_flagged"] = repetition_info["flagged"]
+                det["alert_count"] = repetition_info.get("alert_count", 0)
+                
+                # If flagged, modify behavior status to indicate repeated pattern
+                if repetition_info["flagged"]:
+                    det["behavior_status"] = f"{behavior_status} [REPEATED x{repetition_info['alert_count']}]"
 
         return annotated, detections
+    
+    def get_unauthorized_logs(self) -> List[Dict[str, Any]]:
+        """Get all unauthorized action logs for analysis."""
+        return self.unauthorized_logs
+    
+    def get_unauthorized_summary(self) -> Dict[str, Any]:
+        """Get summary statistics of unauthorized actions.
+        
+        Returns:
+        - total_frames_with_unauthorized: Number of frames that had >=1 unauthorized action
+        - total_unauthorized_actions: Sum of all unauthorized actions across all frames
+        - avg_per_frame: Average unauthorized actions per frame (only frames with actions)
+        - max_in_single_frame: Maximum unauthorized actions in any one frame
+        - by_object_type: Breakdown by object (laptop, phone, etc.)
+        - by_person: Breakdown by person ID
+        """
+        if not self.unauthorized_logs:
+            return {
+                "total_frames_with_unauthorized": 0,
+                "total_unauthorized_actions": 0,
+                "avg_per_frame": 0.0,
+                "max_in_single_frame": 0,
+                "by_object_type": {},
+                "by_person": {}
+            }
+        
+        total_actions = sum(log["unauthorized_count"] for log in self.unauthorized_logs)
+        max_actions = max(log["unauthorized_count"] for log in self.unauthorized_logs)
+        avg_actions = total_actions / len(self.unauthorized_logs)
+        
+        # Breakdown by object type
+        object_counts = {}
+        person_counts = {}
+        
+        for log in self.unauthorized_logs:
+            for detail in log["details"]:
+                obj_type = detail.get("object", "unknown")
+                person_id = detail.get("person_id", -1)
+                
+                object_counts[obj_type] = object_counts.get(obj_type, 0) + 1
+                person_counts[person_id] = person_counts.get(person_id, 0) + 1
+        
+        return {
+            "total_frames_with_unauthorized": len(self.unauthorized_logs),
+            "total_unauthorized_actions": total_actions,
+            "avg_per_frame": round(avg_actions, 2),
+            "max_in_single_frame": max_actions,
+            "by_object_type": object_counts,
+            "by_person": person_counts
+        }
+    
+    def save_unauthorized_logs_to_file(self, filepath: str | Path) -> None:
+        """Save all unauthorized action logs to JSON file for analysis."""
+        import json
+        import os
+        
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Get summary and convert all keys to strings for JSON compatibility
+        summary = self.get_unauthorized_summary()
+        
+        # Ensure by_person has string keys (person_id might be int)
+        if "by_person" in summary:
+            summary["by_person"] = {str(k): v for k, v in summary["by_person"].items()}
+        
+        data = {
+            "summary": summary,
+            "logs": self.unauthorized_logs
+        }
+        
+        print(f"[DEBUG] Preparing to save {len(self.unauthorized_logs)} log entries to JSON...")
+        
+        # Write to temp file first, then rename (atomic operation)
+        temp_filepath = filepath.with_suffix('.tmp')
+        
+        try:
+            # Convert to JSON string first to check for errors
+            json_str = json.dumps(data, indent=2, ensure_ascii=False)
+            print(f"[DEBUG] JSON string created successfully ({len(json_str)} bytes)")
+            
+            # Write to temp file
+            with open(temp_filepath, 'w', encoding='utf-8') as f:
+                f.write(json_str)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+            
+            print(f"[DEBUG] Temp file written successfully")
+            
+            # Rename temp file to final file (atomic on most systems)
+            if filepath.exists():
+                filepath.unlink()  # Delete old file
+            temp_filepath.rename(filepath)
+            
+            print(f"[DEBUG] Successfully saved unauthorized logs to {filepath}")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to save unauthorized logs: {e}")
+            import traceback
+            traceback.print_exc()
+            # Clean up temp file if it exists
+            if temp_filepath.exists():
+                temp_filepath.unlink()
+            raise
+    
+    def get_behavior_spam_summary(self) -> Dict[str, Any]:
+        """Get summary of repeated/spam behavior detections.
+        
+        Returns stats on which persons had abnormal repetitive behavior.
+        """
+        summary = {}
+        
+        for track_id, hist in self.behavior_history.items():
+            if hist["alert_count"] > 0:
+                summary[track_id] = {
+                    "alert_count": hist["alert_count"],
+                    "last_behavior": hist["last_behavior"],
+                    "last_alert_frame": hist["last_alert_frame"]
+                }
+        
+        return summary

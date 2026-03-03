@@ -1,4 +1,5 @@
 import sys
+import json
 import threading
 import queue
 import time
@@ -6,6 +7,7 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List
 import base64
 from io import BytesIO
 from PIL import Image
@@ -13,10 +15,12 @@ from PIL import Image
 import cv2
 import numpy as np
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
-# Import AuthorizationManager
+# Import project utilities
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.authorization_manager import AuthorizationManager
+from utils.room_activity_logger import RoomActivityLogger
 
 
 # Reduce noisy MediaFileHandler tracebacks (they can still appear on stop/refresh
@@ -28,6 +32,7 @@ logging.getLogger("streamlit.web.server.media_file_handler").setLevel(logging.ER
 
 # Repo root + imports
 REPO_ROOT = Path(__file__).resolve().parents[1]
+ACTIVITY_LOG_PATH = REPO_ROOT / "datasets" / "logs.json"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -144,8 +149,6 @@ _init_state("recording_enabled", False)
 _init_state("recording_path", None)
 _init_state("enable_logging", False)
 _init_state("all_logs", [])  # Store all logs for viewing
-_init_state("logged_people", set())  # Track logged person entries to avoid spam
-_init_state("logged_behaviors", set())  # Track logged behaviors to avoid spam
 _init_state("session_log_file", None)  # Store current session log file path
 
 # Alerts
@@ -510,6 +513,9 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     
     # Check if logging is enabled
     enable_logging = config.get("enable_logging", False)
+    
+    # Room activity logger (writes to datasets/logs.json)
+    activity_logger = RoomActivityLogger(ACTIVITY_LOG_PATH)
 
     try:
         # Simplified startup - no technical logs
@@ -739,102 +745,26 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             # Track current status for each person
             current_people = {}  # track_id -> {name, auth, behavior}
             
-            # Log meaningful events - person detection and activities
+            # --- Room activity logging (de-duplicated, writes to datasets/logs.json) ---
             if enable_logging and detections:
                 for detection in detections:
-                    identity = detection.get("identity", "Unknown")
-                    authorization = detection.get("authorization", "Unauthorized")
-                    behavior = detection.get("behavior_status", "STATUS: NO INTERACTION")
                     track_id = detection.get("track_id", -1)
-                    
-                    # Store current status
                     current_people[track_id] = {
-                        'name': identity,
-                        'auth': authorization,
-                        'behavior': behavior
+                        'name': detection.get("identity", "Unknown"),
+                        'auth': detection.get("authorization", "Unauthorized"),
+                        'behavior': detection.get("behavior_status", "STATUS: NO INTERACTION"),
                     }
-                    
-                    # Track which people we've already logged to avoid spam
-                    log_key = f"person_{track_id}_{identity}"
-                    
-                    # First detection of this person
-                    if log_key not in st.session_state.get("logged_people", set()):
-                        if "logged_people" not in st.session_state:
-                            st.session_state.logged_people = set()
-                        st.session_state.logged_people.add(log_key)
-                        
-                        # Entry log
-                        if identity != "Unknown":
-                            auth_emoji = "✅" if authorization == "Authorized" else "⚠️" if authorization == "Partially Authorized" else "🚨"
-                            msg = f"{auth_emoji} {identity} entered the room - {authorization}"
-                            _safe_put(log_queue, {
-                                "type": "success" if authorization == "Authorized" else "warning" if authorization == "Partially Authorized" else "error",
-                                "message": msg
-                            })
-                            write_to_log_file(msg)
-                        else:
-                            msg = f"🚨 Unidentified person detected - Unauthorized"
-                            _safe_put(log_queue, {
-                                "type": "warning",
-                                "message": msg
-                            })
-                            write_to_log_file(msg)
-                    
-                    # Log behavior changes (only significant ones)
-                    if behavior != "STATUS: NO INTERACTION":
-                        behavior_key = f"behavior_{track_id}_{behavior}"
-                        if behavior_key not in st.session_state.get("logged_behaviors", set()):
-                            if "logged_behaviors" not in st.session_state:
-                                st.session_state.logged_behaviors = set()
-                            st.session_state.logged_behaviors.add(behavior_key)
-                            
-                            # Clean behavior text
-                            if "CARRYING" in behavior:
-                                item = behavior.replace("STATUS: CARRYING ", "")
-                                msg = f"👜 {identity} is carrying {item.lower()}"
-                                _safe_put(log_queue, {
-                                    "type": "info",
-                                    "message": msg
-                                })
-                                write_to_log_file(msg)
-                            elif "INTERACTING WITH" in behavior:
-                                item = behavior.replace("STATUS: INTERACTING WITH ", "")
-                                msg = f"💻 {identity} is interacting with {item.lower()}"
-                                _safe_put(log_queue, {
-                                    "type": "info",
-                                    "message": msg
-                                })
-                                write_to_log_file(msg)
-                
-                # Generate status summary every few seconds
-                if not hasattr(video_processing_thread, 'last_status_log'):
-                    video_processing_thread.last_status_log = time.time()
-                
-                current_time = time.time()
-                if current_time - video_processing_thread.last_status_log >= 10.0:  # Every 10 seconds
-                    video_processing_thread.last_status_log = current_time
-                    
-                    if current_people:
-                        status_lines = ["� Current Status:"]
-                        for tid, info in current_people.items():
-                            name = info['name']
-                            behavior = info['behavior']
-                            
-                            if behavior == "STATUS: NO INTERACTION":
-                                status_lines.append(f"  • {name} is present in the room")
-                            elif "CARRYING" in behavior:
-                                item = behavior.replace("STATUS: CARRYING ", "").lower()
-                                status_lines.append(f"  • {name} is carrying {item}")
-                            elif "INTERACTING WITH" in behavior:
-                                item = behavior.replace("STATUS: INTERACTING WITH ", "").lower()
-                                status_lines.append(f"  • {name} is interacting with {item}")
-                        
-                        status_msg = "\n".join(status_lines)
-                        _safe_put(log_queue, {
-                            "type": "info",
-                            "message": status_msg
-                        })
-                        write_to_log_file(status_msg.replace("\n", " | "))
+
+                new_entries = activity_logger.update(detections)
+                for entry in new_entries:
+                    _safe_put(log_queue, {"type": "info", "message": entry})
+                    write_to_log_file(entry)
+            elif enable_logging:
+                # No detections this frame — still let the logger track absences
+                new_entries = activity_logger.update([])
+                for entry in new_entries:
+                    _safe_put(log_queue, {"type": "info", "message": entry})
+                    write_to_log_file(entry)
             
             # Save evidence for interactions (similar to main.py)
             if config.get("enable_behavior", False):
@@ -904,6 +834,63 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         write_to_log_file("="*60)
         write_to_log_file("CCTV Monitoring Session Ended")
         write_to_log_file("="*60)
+        
+        # Flush room activity logger (marks remaining people as left)
+        activity_logger.close()
+        
+        # NEW: Save unauthorized action analysis
+        if pipeline is not None and enable_behavior:
+            try:
+                # Get summary statistics
+                summary = pipeline.get_unauthorized_summary()
+                spam_summary = pipeline.get_behavior_spam_summary()
+                
+                # Log summary to session log
+                write_to_log_file("")
+                write_to_log_file("="*60)
+                write_to_log_file("UNAUTHORIZED ACTIONS SUMMARY")
+                write_to_log_file("="*60)
+                write_to_log_file(f"Total frames with unauthorized actions: {summary['total_frames_with_unauthorized']}")
+                write_to_log_file(f"Total unauthorized actions: {summary['total_unauthorized_actions']}")
+                write_to_log_file(f"Average per frame: {summary['avg_per_frame']}")
+                write_to_log_file(f"Max in single frame: {summary['max_in_single_frame']}")
+                
+                if summary['by_object_type']:
+                    write_to_log_file("")
+                    write_to_log_file("Breakdown by object type:")
+                    for obj_type, count in summary['by_object_type'].items():
+                        write_to_log_file(f"  {obj_type}: {count} violations")
+                
+                if summary['by_person']:
+                    write_to_log_file("")
+                    write_to_log_file("Breakdown by person ID:")
+                    for person_id, count in summary['by_person'].items():
+                        write_to_log_file(f"  Person {person_id}: {count} violations")
+                
+                if spam_summary:
+                    write_to_log_file("")
+                    write_to_log_file("="*60)
+                    write_to_log_file("REPEATED BEHAVIOR ALERTS (SPAM/ABNORMAL)")
+                    write_to_log_file("="*60)
+                    for track_id, info in spam_summary.items():
+                        write_to_log_file(f"Person {track_id}: {info['last_behavior']}")
+                        write_to_log_file(f"  Alert count: {info['alert_count']} times")
+                        write_to_log_file(f"  Last flagged at frame: {info['last_alert_frame']}")
+                
+                # Save detailed JSON logs for analysis
+                json_log_path = logs_date_dir / f"unauthorized_actions_{source_label}_{session_timestamp}.json"
+                pipeline.save_unauthorized_logs_to_file(json_log_path)
+                write_to_log_file("")
+                write_to_log_file(f"Detailed analysis saved to: {json_log_path.name}")
+                write_to_log_file("="*60)
+                
+                # Send summary to UI
+                _safe_put(log_queue, {"type": "success", "message": f"📊 Analysis: {summary['total_unauthorized_actions']} unauthorized actions detected"})
+                if spam_summary:
+                    _safe_put(log_queue, {"type": "info", "message": f"🔁 {len(spam_summary)} person(s) with repeated behavior patterns"})
+                
+            except Exception as e:
+                write_to_log_file(f"Failed to save analysis: {str(e)}")
 
     except Exception as e:
         # Only log critical user-facing errors
@@ -912,6 +899,7 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         write_to_log_file(f"ERROR: {error_msg}")
 
     finally:
+        activity_logger.close()
         if cap is not None:
             cap.release()
         if cap2 is not None:
@@ -920,7 +908,118 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
             recorder.release()
         if recorder2 is not None:
             recorder2.release()
-            # No recording save logging - backend operation
+
+
+# ------------------------------------------------------------------
+# Activity Log Viewer (reads from datasets/logs.json)
+# ------------------------------------------------------------------
+
+def _load_activity_logs() -> Dict:
+    """Read the activity log JSON file. Returns {"logs": {date: [entries]}}."""
+    if ACTIVITY_LOG_PATH.exists() and ACTIVITY_LOG_PATH.stat().st_size > 0:
+        try:
+            with open(ACTIVITY_LOG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "logs" in data:
+                return data["logs"]
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _fmt_date(iso_date: str) -> str:
+    """Convert 'YYYY-MM-DD' to 'Month DD, YYYY' for display."""
+    try:
+        return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%B %d, %Y")
+    except ValueError:
+        return iso_date
+
+
+def _render_activity_log_viewer() -> None:
+    """Streamlit component: date selector (with 'All Dates') + search box + filtered log entries."""
+    logs = _load_activity_logs()
+    available_dates = sorted(logs.keys(), reverse=True)
+
+    if not available_dates:
+        st.info("No activity logs yet. Start the system to begin logging.")
+        return
+
+    # --- Controls row: date picker + search ---
+    ALL_DATES_LABEL = "All Dates"
+    date_options = [ALL_DATES_LABEL] + available_dates
+
+    ctrl_col1, ctrl_col2 = st.columns([1, 2])
+
+    with ctrl_col1:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        # Default to today if it exists, otherwise "All Dates"
+        if today_str in available_dates:
+            default_idx = date_options.index(today_str)
+        else:
+            default_idx = 0  # "All Dates"
+        selected = st.selectbox(
+            "📅 Select Date",
+            options=date_options,
+            index=default_idx,
+            format_func=lambda d: d if d == ALL_DATES_LABEL else _fmt_date(d),
+            key="activity_log_date",
+        )
+
+    with ctrl_col2:
+        search_query = st.text_input(
+            "🔍 Search logs",
+            placeholder="e.g. Art, laptop, interacting, 10:12",
+            key="activity_log_search",
+        )
+
+    query_lower = search_query.lower().strip() if search_query else ""
+    show_all = selected == ALL_DATES_LABEL
+
+    # --- Build list of (date, entries) to display ---
+    dates_to_show = available_dates if show_all else [selected]
+    total_entries = 0
+    results: List[tuple] = []  # (date_str, filtered_entries)
+
+    for date_key in dates_to_show:
+        entries = logs.get(date_key, [])
+        if query_lower:
+            entries = [e for e in entries if query_lower in e.lower()]
+        if entries:
+            results.append((date_key, entries))
+            total_entries += len(entries)
+
+    # --- Summary ---
+    scope = "all dates" if show_all else f"**{_fmt_date(selected)}**"
+    st.caption(f"Showing **{total_entries}** entries for {scope}")
+
+    if not results:
+        if query_lower:
+            st.warning(f'No entries matching "{search_query}" on {scope}.')
+        else:
+            st.info(f"No activity recorded on {scope}.")
+        return
+
+    # --- Render grouped by date ---
+    for date_key, entries in results:
+        st.markdown(f"**📆 {_fmt_date(date_key)}**")
+        st.code("\n".join(entries), language=None)
+
+    # --- Download ---
+    download_lines: List[str] = []
+    for date_key, entries in results:
+        download_lines.append(f"=== {_fmt_date(date_key)} ===")
+        download_lines.extend(entries)
+        download_lines.append("")
+    download_text = "\n".join(download_lines)
+
+    file_label = "all_dates" if show_all else selected
+    st.download_button(
+        label="💾 Download Logs",
+        data=download_text,
+        file_name=f"activity_log_{file_label}.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
 
 
 def main():
@@ -1348,15 +1447,16 @@ def main():
                     break
             
             # Clear tracking sets for new session
-            st.session_state.logged_people = set()
-            st.session_state.logged_behaviors = set()
+            st.session_state.all_logs = []
             
-            # Start processing thread
+            # Start processing thread with Streamlit context
             thread = threading.Thread(
                 target=video_processing_thread,
                 args=(video_source, config, st.session_state.frame_queue, st.session_state.log_queue, st.session_state.stop_flag),
                 daemon=True
             )
+            # Add Streamlit context to the thread to prevent warnings
+            add_script_run_ctx(thread)
             thread.start()
             st.session_state.processing_thread = thread
             
@@ -1396,83 +1496,29 @@ def main():
     # Always show log section in UI
     st.subheader("📋 System Log")
     
-    # Add "View All Logs" and "Open Logs Folder" buttons
+    # "View All Logs" toggle + "Open Logs Folder" buttons
     col_log1, col_log2, col_log3 = st.columns([2, 1, 1])
     with col_log2:
         if st.button("📜 View All Logs", use_container_width=True):
             st.session_state.show_all_logs = not st.session_state.get("show_all_logs", False)
     with col_log3:
         if st.button("📂 Open Logs Folder", use_container_width=True):
-            # Open today's date folder in logs
-            current_date = datetime.now().strftime("%m-%d-%Y")
-            logs_date_dir = REPO_ROOT / "logs" / current_date
-            
-            # Create folder if it doesn't exist
-            if not logs_date_dir.exists():
-                logs_date_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Open folder in file explorer
-            import subprocess
-            import platform
-            
+            import subprocess, platform
+            logs_dir = REPO_ROOT / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
             try:
-                if platform.system() == "Windows":
-                    subprocess.run(['explorer', str(logs_date_dir)])
-                elif platform.system() == "Darwin":  # macOS
-                    subprocess.run(['open', str(logs_date_dir)])
-                else:  # Linux
-                    subprocess.run(['xdg-open', str(logs_date_dir)])
+                {"Windows": lambda p: subprocess.run(["explorer", str(p)]),
+                 "Darwin": lambda p: subprocess.run(["open", str(p)])
+                }.get(platform.system(), lambda p: subprocess.run(["xdg-open", str(p)]))(logs_dir)
             except Exception:
                 pass
     
     log_placeholder = st.empty()
     
-    # Expandable section for all logs
+    # ---------- Searchable, date-filtered log viewer ----------
     if st.session_state.get("show_all_logs", False):
-        with st.expander("📋 Complete Log History", expanded=True):
-            if st.session_state.all_logs:
-                # Show log file info if available
-                if st.session_state.session_log_file and Path(st.session_state.session_log_file).exists():
-                    log_file = Path(st.session_state.session_log_file)
-                    st.info(f"📄 Session log file: `{log_file.name}`")
-                    
-                    # Download button for log file
-                    try:
-                        with open(log_file, 'r', encoding='utf-8') as f:
-                            log_content = f.read()
-                        st.download_button(
-                            label="💾 Download Log File",
-                            data=log_content,
-                            file_name=log_file.name,
-                            mime="text/plain",
-                            use_container_width=True
-                        )
-                    except Exception:
-                        pass
-                
-                st.divider()
-                
-                # Show all logs with timestamps
-                for log_entry in st.session_state.all_logs[-100:]:  # Show last 100 logs
-                    msg_type = log_entry.get('type', 'info')
-                    message = log_entry.get('message', '')
-                    timestamp = log_entry.get('timestamp', '')
-                    
-                    if msg_type == 'error':
-                        st.error(f"[{timestamp}] ❌ {message}")
-                    elif msg_type == 'warning':
-                        st.warning(f"[{timestamp}] ⚠️ {message}")
-                    elif msg_type == 'success':
-                        st.success(f"[{timestamp}] ✅ {message}")
-                    else:
-                        st.info(f"[{timestamp}] ℹ️ {message}")
-                
-                # Clear logs button
-                if st.button("🗑️ Clear Log History"):
-                    st.session_state.all_logs = []
-                    st.rerun()
-            else:
-                st.info("No logs yet. Start the system to see logs.")
+        with st.expander("📋 Activity Log Viewer", expanded=True):
+            _render_activity_log_viewer()
     
     # Display loop
     if st.session_state.running:
