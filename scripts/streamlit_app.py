@@ -21,6 +21,7 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.authorization_manager import AuthorizationManager
 from utils.room_activity_logger import RoomActivityLogger
+from utils.confirmation_manager import ConfirmationManager
 
 
 # Reduce noisy MediaFileHandler tracebacks (they can still appear on stop/refresh
@@ -633,6 +634,16 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
     # Room activity logger (writes to datasets/logs.json)
     activity_logger = RoomActivityLogger(ACTIVITY_LOG_PATH)
 
+    # Confirmation manager — temporal smoothing to prevent spammy logs.
+    # Detections must be stable for CONFIRM_FRAMES consecutive frames
+    # before the logger ever sees them.
+    confirmer = ConfirmationManager(
+        confirm_frames=15,       # ~0.5s at 30fps before confirming identity
+        gone_grace_frames=45,    # ~1.5s occlusion tolerance before "left"
+        name_lock_hits=3,        # FaceNet must agree 3 times on a name
+        ema_alpha=0.3,           # Confidence smoothing factor
+    )
+
     try:
         # Simplified startup - no technical logs
         # Only log critical errors or user-facing events
@@ -858,12 +869,33 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                     detection["camera"] = "Primary"
             _safe_put(log_queue, {"type": "detections", "data": detections})
             
+            # --- Confirmation manager: temporal smoothing ---
+            # Run every detection through the confirmer so identity/auth
+            # are only accepted after consistent multi-frame observation.
+            seen_track_ids = set()
+            for det in detections:
+                tid = det.get("track_id", -1)
+                if tid >= 0:
+                    seen_track_ids.add(tid)
+                result = confirmer.update(det)
+                # Patch detection with confirmed (smoothed) values
+                if result["confirmed"]:
+                    det["identity"] = result["identity"]
+                    det["authorization"] = result["authorization"]
+                    det["identity_conf"] = result["confidence"]
+
+            # Get only confirmed detections for logging (filters out flickers)
+            confirmed_detections = confirmer.get_confirmed_detections(detections)
+
+            # Check for tracks that left (grace period expired)
+            left_events = confirmer.finish_frame(seen_track_ids)
+
             # Track current status for each person
             current_people = {}  # track_id -> {name, auth, behavior}
             
             # --- Room activity logging (de-duplicated, writes to datasets/logs.json) ---
-            if enable_logging and detections:
-                for detection in detections:
+            if enable_logging and confirmed_detections:
+                for detection in confirmed_detections:
                     track_id = detection.get("track_id", -1)
                     current_people[track_id] = {
                         'name': detection.get("identity", "Unknown"),
@@ -871,12 +903,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                         'behavior': detection.get("behavior_status", "STATUS: NO INTERACTION"),
                     }
 
-                new_entries = activity_logger.update(detections)
+                new_entries = activity_logger.update(confirmed_detections)
                 for entry in new_entries:
                     _safe_put(log_queue, {"type": "info", "message": entry})
                     write_to_log_file(entry)
             elif enable_logging:
-                # No detections this frame — still let the logger track absences
+                # No confirmed detections this frame — still let the logger track absences
                 new_entries = activity_logger.update([])
                 for entry in new_entries:
                     _safe_put(log_queue, {"type": "info", "message": entry})
