@@ -5,3 +5,4 @@ vids/*
 Tapo/*
 office_evidence/*
 logs/*
+config/rtsp_cameras.json

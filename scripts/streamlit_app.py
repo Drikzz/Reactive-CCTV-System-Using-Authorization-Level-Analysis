@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from utils.authorization_manager import AuthorizationManager
 from utils.room_activity_logger import RoomActivityLogger
 from utils.confirmation_manager import ConfirmationManager
+from utils.rtsp_config_manager import get_manager as get_rtsp_manager
 
 
 # Reduce noisy MediaFileHandler tracebacks (they can still appear on stop/refresh
@@ -1083,6 +1084,91 @@ def _fmt_date(iso_date: str) -> str:
         return iso_date
 
 
+@st.dialog("📹 Configure RTSP Cameras", width="large")
+def _rtsp_camera_dialog() -> None:
+    """Centered modal dialog for configuring the two fixed RTSP cameras (Cam1 & Cam2)."""
+    mgr = get_rtsp_manager()
+
+    FIXED_CAMS = ["Cam1", "Cam2"]
+    # Ensure both entries exist in the manager (empty defaults)
+    for cam_name in FIXED_CAMS:
+        if mgr.get_camera(cam_name) is None:
+            mgr.add_camera(cam_name, ip="", username="", password="", remember=True)
+
+    st.caption("Configure the RTSP connection for each camera slot. Both are saved automatically.")
+
+    col1, col2 = st.columns(2, gap="large")
+
+    for idx, (cam_name, col) in enumerate(zip(FIXED_CAMS, [col1, col2])):
+        cam_data = mgr.get_camera(cam_name)
+
+        with col:
+            is_enabled = cam_data.get("enabled", True) if cam_data else True
+            status = "🟢" if (is_enabled and cam_data and cam_data.get("ip")) else "⚫"
+            st.markdown(f"#### {status} {cam_name}")
+
+            ip = st.text_input("IP Address", value=cam_data.get("ip", "") if cam_data else "",
+                               placeholder="192.168.1.10", key=f"dlg_{cam_name}_ip")
+            c1, c2 = st.columns([2, 1])
+            port = c1.text_input("Port", value=cam_data.get("port", "554") if cam_data else "554",
+                                 key=f"dlg_{cam_name}_port")
+            stream = c2.text_input("Stream", value=cam_data.get("stream", "stream2") if cam_data else "stream2",
+                                   key=f"dlg_{cam_name}_stream",
+                                   help="stream1 = 1080p, stream2 = 480p")
+            user = st.text_input("Username", value=cam_data.get("username", "") if cam_data else "",
+                                 key=f"dlg_{cam_name}_user")
+            pwd = st.text_input("Password", type="password",
+                                value=cam_data.get("password", "") if cam_data else "",
+                                key=f"dlg_{cam_name}_pass")
+            enabled = st.checkbox("✅ Enabled", value=is_enabled, key=f"dlg_{cam_name}_en")
+
+            # URL preview
+            if ip and ip.strip():
+                proto = cam_data.get("protocol", "rtsp") if cam_data else "rtsp"
+                u = user.strip() if user else ""
+                h = f"{ip.strip()}:{port.strip()}" if port else f"{ip.strip()}:554"
+                s = stream.strip() if stream else "stream2"
+                preview = f"`{proto}://{u}:••••@{h}/{s}`" if u else f"`{proto}://{h}/{s}`"
+                st.caption(f"**URL:** {preview}")
+            else:
+                st.caption("⚠️ No IP set — camera inactive")
+
+            if idx < len(FIXED_CAMS) - 1:
+                pass  # visual separator handled by columns
+
+    # ---------- Save button ----------
+    if mgr.has_keyring:
+        st.caption("🔒 Passwords stored in OS keyring")
+    else:
+        st.caption("🔑 Passwords stored locally (base64-encoded)")
+
+    st.divider()
+    if st.button("💾 Save Both Cameras", type="primary", use_container_width=True, key="dlg_btn_save_all"):
+        for cam_name in FIXED_CAMS:
+            ip_val = st.session_state.get(f"dlg_{cam_name}_ip", "").strip()
+            port_val = st.session_state.get(f"dlg_{cam_name}_port", "554").strip()
+            stream_val = st.session_state.get(f"dlg_{cam_name}_stream", "stream2").strip()
+            user_val = st.session_state.get(f"dlg_{cam_name}_user", "").strip()
+            pass_val = st.session_state.get(f"dlg_{cam_name}_pass", "")
+            en_val = st.session_state.get(f"dlg_{cam_name}_en", True)
+
+            mgr.add_camera(
+                cam_name, ip=ip_val, port=port_val,
+                username=user_val, password=pass_val,
+                stream=stream_val or "stream2",
+                enabled=en_val, remember=True,
+            )
+        st.success("✅ Saved **Cam1** & **Cam2**")
+        time.sleep(0.6)
+        st.rerun()
+
+
+def _render_rtsp_camera_manager() -> None:
+    """Sidebar button that opens the RTSP camera management dialog."""
+    if st.button("⚙ Manage Cameras", use_container_width=True, key="btn_open_cam_mgr"):
+        _rtsp_camera_dialog()
+
+
 def _extract_person_name(entry: str) -> str:
     """Extract the person name from a log entry like 'HH:MM:SS - Name has entered'."""
     # Strip timestamp prefix "HH:MM:SS - "
@@ -1281,13 +1367,14 @@ def main():
                     selected_camera = st.selectbox("Camera", options=list(camera_options.keys()), format_func=lambda x: camera_options[x])
                     video_source = cam_config.get_rtsp_url(selected_camera)
                 else:
-                    st.error("No RTSP cameras configured")
+                    st.error("No RTSP cameras configured — add one below ↓")
                 source_mode = "rtsp"
 
             # Dual camera (nested inside source)
             enable_dual_cam = st.checkbox("Dual Camera", value=False)
             secondary_source = None
             secondary_mode = None
+            _sec_chose_rtsp = False
             if enable_dual_cam:
                 sec_source_type = st.radio("Secondary", ["Webcam", "RTSP"], key="sec_source_type", horizontal=True)
                 if sec_source_type == "Webcam":
@@ -1295,12 +1382,21 @@ def main():
                     secondary_source = int(sec_webcam_index)
                     secondary_mode = "webcam"
                 else:
+                    _sec_chose_rtsp = True
                     rtsp_cameras = cam_config.get_all_rtsp_cameras()
                     sec_camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
                     if sec_camera_options:
                         sec_selected_camera = st.selectbox("Sec. RTSP", options=list(sec_camera_options.keys()), format_func=lambda x: sec_camera_options[x], key="sec_rtsp_select")
                         secondary_source = cam_config.get_rtsp_url(sec_selected_camera)
                         secondary_mode = "rtsp"
+                    else:
+                        st.error("No RTSP cameras configured — add one below ↓")
+
+            # Always show manage button when RTSP is relevant (primary or secondary)
+            _show_manage = (source_type == "RTSP Camera") or _sec_chose_rtsp
+            if _show_manage:
+                st.divider()
+                _render_rtsp_camera_manager()
 
         # ===== 2. DETECTION SETTINGS =====
         with st.expander("🎯 Detection & Behavior", expanded=False):

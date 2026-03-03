@@ -1,7 +1,18 @@
 """
 Camera Configuration for Streamlit CCTV System
 Supports webcam, video files, and RTSP IP cameras (Tapo C200)
+
+RTSP cameras are now managed dynamically via utils/rtsp_config_manager.py.
+On first run the legacy defaults below are migrated into config/rtsp_cameras.json
+so credentials are never hard-coded again.
 """
+
+import sys
+from pathlib import Path
+
+# Ensure utils is importable
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from utils.rtsp_config_manager import get_manager as _get_rtsp_manager
 
 # ==================== CAMERA SOURCE SETTINGS ====================
 
@@ -15,28 +26,36 @@ WEBCAM_ID_SECONDARY = 1  # Secondary webcam ID
 # Video File Settings
 VIDEO_FILE_PATH = r"C:\Users\rikzs\Desktop\Aldrikz\Code\thesis_system\videos\sample.mp4"
 
-# RTSP Camera Settings (Tapo C200)
-RTSP_CAMERAS = {
+# ---------------------------------------------------------------------------
+# RTSP cameras – loaded dynamically from config/rtsp_cameras.json
+# Legacy hardcoded defaults are auto-migrated on first run.
+# ---------------------------------------------------------------------------
+_LEGACY_RTSP_CAMERAS = {
     "Cam1": {
         "ip": "192.168.254.177",
         "port": "554",
         "username": "reactivecctv101",
         "password": "reactivecctv101",
-        "stream": "stream2",  # stream1 = 1080p, stream2 = 640x480
-        "enabled": True
+        "stream": "stream2",
+        "enabled": True,
     },
     "Cam2": {
         "ip": "192.168.254.109",
         "port": "554",
         "username": "CakeyFudo",
         "password": "CakeyFudo",
-        "stream": "stream2",  # Lower resolution for better performance
-        "enabled": True
-    }
+        "stream": "stream2",
+        "enabled": True,
+    },
 }
 
+# Auto-migrate legacy cameras on first import
+_rtsp_mgr = _get_rtsp_manager()
+if _rtsp_mgr.camera_count == 0:
+    _rtsp_mgr.migrate_from_dict(_LEGACY_RTSP_CAMERAS)
+
 # Select which RTSP camera to use (key from RTSP_CAMERAS)
-ACTIVE_RTSP_CAMERA = "tapo_c200_main"
+ACTIVE_RTSP_CAMERA = "Cam1"
 
 # ==================== RTSP CONNECTION SETTINGS ====================
 
@@ -71,37 +90,17 @@ SHOW_STREAM_INFO = True
 
 def get_rtsp_url(camera_key=None):
     """
-    Generate RTSP URL from camera configuration
+    Generate RTSP URL from the dynamic config manager.
     
     Args:
-        camera_key: Key from RTSP_CAMERAS dict. If None, uses ACTIVE_RTSP_CAMERA
+        camera_key: Camera name. If None, uses ACTIVE_RTSP_CAMERA.
     
     Returns:
-        RTSP URL string or None if camera not found/disabled
+        RTSP URL string or None if camera not found/disabled.
     """
     if camera_key is None:
         camera_key = ACTIVE_RTSP_CAMERA
-    
-    camera = RTSP_CAMERAS.get(camera_key)
-    
-    if camera is None:
-        print(f"[ERROR] Camera '{camera_key}' not found in configuration")
-        return None
-    
-    if not camera.get("enabled", False):
-        print(f"[WARN] Camera '{camera_key}' is disabled")
-        return None
-    
-    ip = camera["ip"]
-    port = camera["port"]
-    username = camera["username"]
-    password = camera["password"]
-    stream = camera["stream"]
-    
-    # Construct RTSP URL
-    url = f"{RTSP_PROTOCOL}://{username}:{password}@{ip}:{port}/{stream}"
-    
-    return url
+    return _rtsp_mgr.build_url(camera_key)
 
 
 def get_camera_source(mode=None):
@@ -132,17 +131,12 @@ def get_camera_source(mode=None):
 
 def get_all_rtsp_cameras():
     """
-    Get list of all available RTSP cameras
+    Get list of all available RTSP cameras from the config manager.
     
     Returns:
         List of tuples (camera_key, camera_name, is_enabled)
     """
-    cameras = []
-    for key, config in RTSP_CAMERAS.items():
-        name = f"{config['ip']} ({config['stream']})"
-        enabled = config.get("enabled", False)
-        cameras.append((key, name, enabled))
-    return cameras
+    return _rtsp_mgr.list_cameras()
 
 
 def print_camera_info():
@@ -159,7 +153,7 @@ def print_camera_info():
         print(f"Video File: {VIDEO_FILE_PATH}")
     
     elif CAMERA_MODE == "rtsp":
-        camera = RTSP_CAMERAS.get(ACTIVE_RTSP_CAMERA)
+        camera = _rtsp_mgr.get_camera(ACTIVE_RTSP_CAMERA)
         if camera:
             print(f"Camera: {ACTIVE_RTSP_CAMERA}")
             print(f"IP: {camera['ip']}")
