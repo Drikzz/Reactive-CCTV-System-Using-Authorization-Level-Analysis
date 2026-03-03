@@ -40,7 +40,7 @@ import camera_config_streamlit as cam_config
 
 
 # -----------------------------
-# UI styling (kept old look)
+# UI styling — modern redesign
 # -----------------------------
 st.set_page_config(
     page_title="CCTV Security System",
@@ -52,79 +52,207 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+    /* ===== Global Reset & Typography ===== */
     .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
+        font-size: 1.8rem;
+        font-weight: 700;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
         text-align: center;
-        margin-bottom: 1rem;
+        margin-bottom: 0.5rem;
+        letter-spacing: -0.02em;
     }
-    .status-box {
-        padding: 0.8rem;
-        border-radius: 0.5rem;
-        margin: 0.3rem 0;
-        font-size: 0.9rem;
-        font-weight: 500;
-    }
-    .status-box strong {
-        font-size: 1.1rem;
-    }
-    .authorized {
-        background-color: #d4edda;
-        border: 2px solid #28a745;
-        color: #155724 !important;
-    }
-    .authorized strong { color: #0d4017 !important; }
-    .partial {
-        background-color: #fff3cd;
-        border: 2px solid #ffc107;
-        color: #856404 !important;
-    }
-    .partial strong { color: #533f03 !important; }
-    .unauthorized {
-        background-color: #f8d7da;
-        border: 2px solid #dc3545;
-        color: #721c24 !important;
-    }
-    .unauthorized strong { color: #491217 !important; }
 
-    /* Alert/Notification styles */
+    /* ===== Sidebar cleanup ===== */
+    [data-testid="stSidebar"] {
+        background-color: #0e1117;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+        width: 100%;
+    }
+    .sidebar-section-label {
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #8b8fa3;
+        margin: 0.8rem 0 0.3rem 0;
+    }
+
+    /* ===== Detection cards ===== */
+    .det-card {
+        padding: 0.65rem 0.85rem;
+        border-radius: 8px;
+        margin: 0.35rem 0;
+        font-size: 0.85rem;
+        font-weight: 500;
+        line-height: 1.4;
+        border-left: 4px solid;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .det-card:hover { transform: translateX(2px); }
+    .det-card .det-name {
+        font-size: 0.95rem;
+        font-weight: 700;
+        margin-bottom: 2px;
+    }
+    .det-card .det-meta {
+        font-size: 0.75rem;
+        opacity: 0.85;
+    }
+    .det-card .det-behavior {
+        font-size: 0.78rem;
+        font-weight: 600;
+        margin-top: 3px;
+        padding: 2px 8px;
+        border-radius: 4px;
+        display: inline-block;
+    }
+
+    /* Authorization color variants */
+    .det-authorized {
+        background-color: rgba(40, 167, 69, 0.12);
+        border-left-color: #28a745;
+        color: #b7dfbf;
+    }
+    .det-authorized .det-behavior { background: rgba(40,167,69,0.2); color: #6fcf7f; }
+
+    .det-partial {
+        background-color: rgba(255, 193, 7, 0.10);
+        border-left-color: #ffc107;
+        color: #f5e6b8;
+    }
+    .det-partial .det-behavior { background: rgba(255,193,7,0.2); color: #ffd95c; }
+
+    .det-unauthorized {
+        background-color: rgba(220, 53, 69, 0.12);
+        border-left-color: #dc3545;
+        color: #f0b3b8;
+    }
+    .det-unauthorized .det-behavior { background: rgba(220,53,69,0.2); color: #ff7a85; }
+
+    /* ===== Stat badges ===== */
+    .stat-row {
+        display: flex;
+        gap: 8px;
+        margin: 0.5rem 0;
+    }
+    .stat-badge {
+        flex: 1;
+        text-align: center;
+        padding: 0.6rem 0.4rem;
+        border-radius: 8px;
+        font-weight: 700;
+        font-size: 1.3rem;
+        line-height: 1;
+    }
+    .stat-badge .stat-label {
+        font-size: 0.65rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        opacity: 0.75;
+        margin-bottom: 2px;
+    }
+    .stat-total  { background: rgba(102,126,234,0.15); color: #a0b4ff; }
+    .stat-auth   { background: rgba(40,167,69,0.15);   color: #6fcf7f; }
+    .stat-unauth { background: rgba(220,53,69,0.15);   color: #ff7a85; }
+
+    /* ===== Alert/Notification styles ===== */
     .alert-container {
         position: fixed;
-        top: 80px;
+        top: 70px;
         right: 20px;
         z-index: 9999;
         display: flex;
         flex-direction: column;
-        gap: 10px;
-        max-width: 400px;
+        gap: 8px;
+        max-width: 360px;
         pointer-events: none;
     }
     .alert-notification {
-        position: relative;
-        padding: 1rem 1.5rem;
-        border-radius: 0.5rem;
+        padding: 0.8rem 1.2rem;
+        border-radius: 8px;
         font-weight: 600;
-        font-size: 0.95rem;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        animation: slideIn 0.3s ease-out;
-        width: 100%;
+        font-size: 0.88rem;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+        animation: alertSlide 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
         pointer-events: auto;
+        backdrop-filter: blur(8px);
     }
     .alert-unauthorized {
-        background-color: #dc3545;
-        color: white;
-        border: 2px solid #a71d2a;
+        background: rgba(220,53,69,0.92);
+        color: #fff;
+        border: 1px solid rgba(255,255,255,0.15);
     }
     .alert-partial {
-        background-color: #ffc107;
-        color: #000;
-        border: 2px solid #d39e00;
+        background: rgba(255,193,7,0.92);
+        color: #1a1a1a;
+        border: 1px solid rgba(0,0,0,0.1);
     }
-    @keyframes slideIn {
-        from { transform: translateX(400px); opacity: 0; }
-        to { transform: translateX(0); opacity: 1; }
+    @keyframes alertSlide {
+        from { transform: translateX(120%); opacity: 0; }
+        to   { transform: translateX(0);    opacity: 1; }
     }
+
+    /* ===== Status indicator ===== */
+    .status-indicator {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        padding: 4px 12px;
+        border-radius: 20px;
+    }
+    .status-live {
+        background: rgba(40,167,69,0.15);
+        color: #6fcf7f;
+    }
+    .status-live::before {
+        content: '';
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        background: #28a745;
+        animation: pulse 1.5s infinite;
+    }
+    .status-stopped {
+        background: rgba(220,53,69,0.15);
+        color: #ff7a85;
+    }
+    .status-recording {
+        background: rgba(220,53,69,0.2);
+        color: #ff7a85;
+        margin-left: 6px;
+    }
+    .status-recording::before {
+        content: '';
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        background: #dc3545;
+        animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+
+    /* ===== Log viewer ===== */
+    .log-date-header {
+        font-size: 0.8rem;
+        font-weight: 700;
+        color: #8b8fa3;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding: 0.4rem 0;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        margin: 0.8rem 0 0.3rem 0;
+    }
+
+    /* ===== Misc polish ===== */
+    .block-container { padding-top: 1.5rem; }
+    [data-testid="stMetric"] { display: none; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -219,8 +347,6 @@ def display_loop(
     video_placeholder,
     detections_placeholder,
     total_placeholder,
-    auth_placeholder,
-    unauth_placeholder,
     log_placeholder,
     status_placeholder,
     alert_placeholder,
@@ -287,49 +413,33 @@ def display_loop(
             with detections_placeholder.container():
                 if st.session_state.current_detections:
                     for detection in st.session_state.current_detections:
-                        auth_class = "authorized" if detection["authorization"] == "Authorized" else (
-                            "partial" if detection["authorization"] == "Partially Authorized" else "unauthorized"
+                        auth_cls = "det-authorized" if detection["authorization"] == "Authorized" else (
+                            "det-partial" if detection["authorization"] == "Partially Authorized" else "det-unauthorized"
                         )
-                        
-                        # Build detection HTML with enhanced interaction display
-                        behavior_info = ""
-                        behavior_emoji = ""
+
+                        # Build behavior badge
+                        behavior_html = ""
                         if "behavior_status" in detection and detection["behavior_status"] != "STATUS: NO INTERACTION":
                             behavior_status = detection["behavior_status"].replace("STATUS: ", "")
-                            
-                            # Add emoji based on interaction type
-                            if "CARRYING" in behavior_status:
-                                behavior_emoji = "🎒"  # Backpack emoji
-                                if "LAPTOP" in behavior_status:
-                                    behavior_emoji = "💻"
-                                elif "HANDBAG" in behavior_status:
-                                    behavior_emoji = "👜"
-                                elif "CELL PHONE" in behavior_status:
-                                    behavior_emoji = "📱"
-                            elif "INTERACTING WITH" in behavior_status:
-                                behavior_emoji = "🖐️"  # Hand emoji
-                                if "LAPTOP" in behavior_status:
-                                    behavior_emoji = "💻"
-                                elif "KEYBOARD" in behavior_status:
-                                    behavior_emoji = "⌨️"
-                                elif "MOUSE" in behavior_status:
-                                    behavior_emoji = "🖱️"
-                            
-                            behavior_info = f"<br><span style='font-size: 0.95em; font-weight: 600; color: #ff6b35;'>{behavior_emoji} {behavior_status}</span>"
-                        
-                        # Track ID info
+                            behavior_emoji = "🖐️"
+                            for kw, em in [("CARRYING", "🎒"), ("LAPTOP", "💻"), ("HANDBAG", "👜"),
+                                           ("CELL PHONE", "📱"), ("KEYBOARD", "⌨️"), ("MOUSE", "�️")]:
+                                if kw in behavior_status:
+                                    behavior_emoji = em
+                            behavior_html = f'<div class="det-behavior">{behavior_emoji} {behavior_status}</div>'
+
                         tid = detection.get("track_id", -1)
                         tid_info = f" [ID: {tid}]" if tid != -1 else ""
-                        
-                        st.markdown(
-                            f"""
-                        <div class=\"status-box {auth_class}\">
-                            <strong>[{detection.get('camera', 'Primary')}] {detection['identity']}{tid_info}</strong><br>
-                            {detection['authorization']}{behavior_info}
+                        camera_tag = detection.get("camera", "Primary")
+
+                        st.markdown(f"""
+                        <div class="det-card {auth_cls}">
+                            <div class="det-name">{detection['identity']}{tid_info}</div>
+                            <div class="det-meta">📷 {camera_tag} · {detection['authorization']}</div>
+                            {behavior_html}
                         </div>
-                        """,
-                            unsafe_allow_html=True,
-                        )
+                        """, unsafe_allow_html=True)
+
                         if detection["authorization"] in ["Unauthorized", "Partially Authorized"]:
                             show_alert(detection["authorization"], detection["identity"])
                 else:
@@ -343,23 +453,29 @@ def display_loop(
         except Exception:
             pass
 
-        # --- Stats
+        # --- Stats (custom HTML badges)
         try:
             total = len(st.session_state.current_detections)
             auth_count = sum(1 for d in st.session_state.current_detections if d["authorization"] == "Authorized")
             unauth_count = sum(1 for d in st.session_state.current_detections if d["authorization"] == "Unauthorized")
-            
-            # Count active interactions
-            interact_count = sum(1 for d in st.session_state.current_detections 
-                                if d.get("behavior_status", "STATUS: NO INTERACTION") != "STATUS: NO INTERACTION")
-            
-            total_placeholder.metric("Total Persons", total)
-            auth_placeholder.metric("Authorized", auth_count)
-            unauth_placeholder.metric("Unauthorized", unauth_count)
-            
-            # Show interaction count if behavior detection enabled
+            interact_count = sum(1 for d in st.session_state.current_detections
+                                 if d.get("behavior_status", "STATUS: NO INTERACTION") != "STATUS: NO INTERACTION")
+
+            interact_badge = ""
             if interact_count > 0:
-                status_placeholder.metric("🎯 Active Interactions", interact_count)
+                interact_badge = (
+                    f'<div class="stat-badge" style="background:rgba(255,107,53,0.15);color:#ff8c57;">'
+                    f'<div class="stat-label">Interact</div>{interact_count}</div>'
+                )
+
+            total_placeholder.markdown(f"""
+            <div class="stat-row">
+                <div class="stat-badge stat-total"><div class="stat-label">Total</div>{total}</div>
+                <div class="stat-badge stat-auth"><div class="stat-label">Auth</div>{auth_count}</div>
+                <div class="stat-badge stat-unauth"><div class="stat-label">Unauth</div>{unauth_count}</div>
+                {interact_badge}
+            </div>
+            """, unsafe_allow_html=True)
         except Exception:
             pass
 
@@ -935,8 +1051,20 @@ def _fmt_date(iso_date: str) -> str:
         return iso_date
 
 
+def _extract_person_name(entry: str) -> str:
+    """Extract the person name from a log entry like 'HH:MM:SS - Name has entered'."""
+    # Strip timestamp prefix "HH:MM:SS - "
+    after_ts = entry.split(" - ", 1)[-1] if " - " in entry else entry
+    # The name is everything before the first known verb phrase
+    for verb in (" has entered", " is present", " is interacting", " has left"):
+        idx = after_ts.find(verb)
+        if idx != -1:
+            return after_ts[:idx].strip()
+    return ""
+
+
 def _render_activity_log_viewer() -> None:
-    """Streamlit component: date selector (with 'All Dates') + search box + filtered log entries."""
+    """Streamlit component: date + person selectors, search box, filtered log entries."""
     logs = _load_activity_logs()
     available_dates = sorted(logs.keys(), reverse=True)
 
@@ -944,21 +1072,30 @@ def _render_activity_log_viewer() -> None:
         st.info("No activity logs yet. Start the system to begin logging.")
         return
 
-    # --- Controls row: date picker + search ---
+    # --- Collect all unique person names across every date ---
+    ALL_LABEL = "All"
+    all_names: set = set()
+    for entries in logs.values():
+        for e in entries:
+            name = _extract_person_name(e)
+            if name and name != "Unknown person":
+                all_names.add(name)
+    person_options = [ALL_LABEL] + sorted(all_names, key=str.lower)
+
+    # --- Controls row: date | person | search ---
     ALL_DATES_LABEL = "All Dates"
     date_options = [ALL_DATES_LABEL] + available_dates
 
-    ctrl_col1, ctrl_col2 = st.columns([1, 2])
+    ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1, 2])
 
     with ctrl_col1:
         today_str = datetime.now().strftime("%Y-%m-%d")
-        # Default to today if it exists, otherwise "All Dates"
         if today_str in available_dates:
             default_idx = date_options.index(today_str)
         else:
-            default_idx = 0  # "All Dates"
+            default_idx = 0
         selected = st.selectbox(
-            "📅 Select Date",
+            "📅 Date",
             options=date_options,
             index=default_idx,
             format_func=lambda d: d if d == ALL_DATES_LABEL else _fmt_date(d),
@@ -966,22 +1103,35 @@ def _render_activity_log_viewer() -> None:
         )
 
     with ctrl_col2:
+        selected_person = st.selectbox(
+            "👤 Person",
+            options=person_options,
+            index=0,
+            key="activity_log_person",
+        )
+
+    with ctrl_col3:
         search_query = st.text_input(
-            "🔍 Search logs",
-            placeholder="e.g. Art, laptop, interacting, 10:12",
+            "🔍 Search",
+            placeholder="e.g. laptop, interacting, 10:12",
             key="activity_log_search",
         )
 
     query_lower = search_query.lower().strip() if search_query else ""
-    show_all = selected == ALL_DATES_LABEL
+    show_all_dates = selected == ALL_DATES_LABEL
+    filter_person = selected_person != ALL_LABEL
 
     # --- Build list of (date, entries) to display ---
-    dates_to_show = available_dates if show_all else [selected]
+    dates_to_show = available_dates if show_all_dates else [selected]
     total_entries = 0
-    results: List[tuple] = []  # (date_str, filtered_entries)
+    results: List[tuple] = []
 
     for date_key in dates_to_show:
         entries = logs.get(date_key, [])
+        # Person filter (exact match on extracted name)
+        if filter_person:
+            entries = [e for e in entries if _extract_person_name(e) == selected_person]
+        # Free-text search
         if query_lower:
             entries = [e for e in entries if query_lower in e.lower()]
         if entries:
@@ -989,12 +1139,13 @@ def _render_activity_log_viewer() -> None:
             total_entries += len(entries)
 
     # --- Summary ---
-    scope = "all dates" if show_all else f"**{_fmt_date(selected)}**"
-    st.caption(f"Showing **{total_entries}** entries for {scope}")
+    scope = "all dates" if show_all_dates else f"**{_fmt_date(selected)}**"
+    person_scope = f" for **{selected_person}**" if filter_person else ""
+    st.caption(f"Showing **{total_entries}** entries on {scope}{person_scope}")
 
     if not results:
-        if query_lower:
-            st.warning(f'No entries matching "{search_query}" on {scope}.')
+        if query_lower or filter_person:
+            st.warning(f'No matching entries found.')
         else:
             st.info(f"No activity recorded on {scope}.")
         return
@@ -1012,391 +1163,213 @@ def _render_activity_log_viewer() -> None:
         download_lines.append("")
     download_text = "\n".join(download_lines)
 
-    file_label = "all_dates" if show_all else selected
+    file_label = "all_dates" if show_all_dates else selected
+    person_label = f"_{selected_person}" if filter_person else ""
     st.download_button(
         label="💾 Download Logs",
         data=download_text,
-        file_name=f"activity_log_{file_label}.txt",
+        file_name=f"activity_log_{file_label}{person_label}.txt",
         mime="text/plain",
         use_container_width=True,
     )
 
 
 def main():
-    st.set_page_config(page_title="CCTV Security System", page_icon="🎥", layout="wide", initial_sidebar_state="expanded")
     st.markdown('<div class="main-header">🎥 CCTV Monitoring System</div>', unsafe_allow_html=True)
 
     with st.sidebar:
-        # ==================== REGISTER PERSONNEL SECTION ====================
-        st.header("👤 Register Personnel")
-        
-        with st.expander("📸 Face Registration", expanded=False):
-            st.markdown("### Capture Face Data")
-            st.info("💡 Capture face images for training the recognition system")
-            
-            # Name input
-            person_name = st.text_input(
-                "Person Name", 
-                placeholder="Enter person's name",
-                help="Enter the name of the person to register"
-            )
-            
-            # Capture settings
-            col_cap1, col_cap2 = st.columns(2)
-            with col_cap1:
-                num_images = st.number_input("Images to Capture", min_value=20, max_value=200, value=100)
-            with col_cap2:
-                capture_webcam_id = st.number_input("Webcam ID", min_value=0, max_value=5, value=0)
-            
-            # Capture button
-            if st.button("🎥 Start Capture", use_container_width=True, type="primary", disabled=not person_name):
-                if person_name and person_name.strip():
-                    st.info(f"🎬 Starting face capture for: **{person_name}**")
-                    st.warning("⚠️ This will open a separate window. Follow on-screen instructions.")
-                    
-                    try:
-                        import subprocess
-                        # Run the facenet_capture.py script
-                        capture_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_capture.py"
-                        
-                        if capture_script.exists():
-                            # Run in background and show status
-                            with st.spinner("Running face capture... Check the popup window!"):
-                                result = subprocess.run(
-                                    [
-                                        str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"),
-                                        str(capture_script)
-                                    ],
-                                    input=person_name.strip(),
-                                    text=True,
-                                    capture_output=True,
-                                    cwd=str(REPO_ROOT)
-                                )
-                                
-                                if result.returncode == 0:
-                                    st.success(f"✅ Successfully captured faces for {person_name}!")
-                                    st.info(f"📁 Images saved to: `datasets/faces/{person_name.strip().replace(' ', '_')}/`")
-                                else:
-                                    st.error(f"❌ Capture failed: {result.stderr}")
-                        else:
-                            st.error(f"❌ Capture script not found: {capture_script}")
-                    except Exception as e:
-                        st.error(f"❌ Error running capture: {str(e)}")
-                else:
-                    st.warning("⚠️ Please enter a person's name first")
-            
-            if not person_name:
-                st.caption("👆 Enter a name to enable capture")
-        
-        # Train button
-        st.markdown("### 🎓 Train Recognition Model")
-        st.info("💡 Train the system after capturing face data")
-        
-        if st.button("🚀 Train Model", use_container_width=True, type="primary"):
-            st.info("🔄 Training FaceNet model... This may take a few minutes.")
-            
-            try:
-                import subprocess
-                train_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_train.py"
-                
-                if train_script.exists():
-                    with st.spinner("Training in progress... Please wait."):
-                        result = subprocess.run(
-                            [
-                                str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"),
-                                str(train_script)
-                            ],
-                            capture_output=True,
-                            text=True,
-                            cwd=str(REPO_ROOT)
-                        )
-                        
-                        if result.returncode == 0:
-                            st.success("✅ Model training completed successfully!")
-                            st.info("📊 Training output:")
-                            st.code(result.stdout, language="text")
-                            st.balloons()
-                        else:
-                            st.error("❌ Training failed!")
-                            st.error(result.stderr)
-                else:
-                    st.error(f"❌ Training script not found: {train_script}")
-            except Exception as e:
-                st.error(f"❌ Error running training: {str(e)}")
-        
-        st.divider()
-        # ==================== END REGISTER PERSONNEL SECTION ====================
-        
-        # ==================== AUTHORIZATION MANAGEMENT SECTION ====================
-        st.header("👥 Authorization Management")
-        
-        # Refresh authorization map from folders
-        if st.button("🔄 Refresh Personnel List", help="Scan for new people in datasets/faces/"):
-            with st.spinner("Scanning for new personnel..."):
-                st.session_state.auth_manager.refresh()
-                st.success("✅ Personnel list refreshed!")
-                st.rerun()  # Rerun to show updated list
-        
-        # Display current authorization map
-        current_map = st.session_state.auth_manager.get_all_authorizations()
-        
-        if not current_map:
-            st.info("ℹ️ No personnel found. Add faces in `datasets/faces/{person_name}/` and click Refresh.")
-        else:
-            st.subheader(f"Personnel Count: {len(current_map)}")
-            
-            # Group by authorization level
-            auth_groups = {"Authorized": [], "Partially Authorized": [], "Unauthorized": []}
-            for name, level in sorted(current_map.items()):
-                auth_groups[level].append(name)
-            
-            # Display statistics
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("✅ Authorized", len(auth_groups["Authorized"]))
-            with col2:
-                st.metric("⚠️ Partially Authorized", len(auth_groups["Partially Authorized"]))
-            with col3:
-                st.metric("❌ Unauthorized", len(auth_groups["Unauthorized"]))
-            
-            st.divider()
-            
-            # Authorization editor
-            st.subheader("Edit Authorization Levels")
-            
-            # Create expander for each person
-            for person_name in sorted(current_map.keys()):
-                current_level = current_map[person_name]
-                
-                with st.expander(f"👤 {person_name} - {current_level}"):
-                    new_level = st.selectbox(
-                        "Authorization Level",
-                        ["Authorized", "Partially Authorized", "Unauthorized"],
-                        index=["Authorized", "Partially Authorized", "Unauthorized"].index(current_level),
-                        key=f"auth_{person_name}"
-                    )
-                    
-                    if new_level != current_level:
-                        if st.button(f"💾 Save Changes for {person_name}", key=f"save_{person_name}"):
-                            success = st.session_state.auth_manager.set_authorization(person_name, new_level)
-                            if success:
-                                st.success(f"✅ Updated {person_name}: {current_level} → {new_level}")
-                                st.rerun()  # Refresh to show updated authorization
-                            else:
-                                st.error(f"❌ Failed to update {person_name}")
-        
-        st.divider()
-        # ==================== END AUTHORIZATION MANAGEMENT SECTION ====================
-        
-        st.header("⚙️ Configuration")
-        
-        # Video Source
-        st.subheader("Video Source")
-        source_type = st.radio("Select Source", ["Webcam", "Video File", "RTSP Camera"], key="source_type")
-        
-        # Initialize variables
-        video_source = None
-        source_mode = "webcam"
-        webcam_index = 0  # Default value
-        
-        if source_type == "Webcam":
-            webcam_index = st.number_input("Webcam Index", min_value=0, max_value=5, value=cam_config.WEBCAM_ID)
-            video_source = int(webcam_index)  # Ensure it's an integer
-            source_mode = "webcam"
-        
-        elif source_type == "Video File":
-            st.info("💡 For videos > 200MB, use 'File Path' method")
-            
-            # Get available videos from Mp4TESTING folder
-            test_videos_dir = REPO_ROOT / "vids"
-            available_videos = []
-            if test_videos_dir.exists():
-                available_videos = sorted([
-                    f for f in test_videos_dir.glob("*") 
-                    if f.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']
-                ])
-            
-            # Method selection
-            upload_method = st.radio(
-                "Select Method", 
-                ["Browse Test Videos", "Upload File", "Custom Path"], 
-                horizontal=True
-            )
-            if upload_method == "Browse Test Videos":
-                if available_videos:
-                    video_options = {str(v): v.name for v in available_videos}
-                    selected_video = st.selectbox("Select Test Video", options=list(video_options.keys()), format_func=lambda x: video_options[x])
-                    if selected_video:
-                        video_source = selected_video
-                        file_size_mb = Path(selected_video).stat().st_size / (1024 * 1024)
-                        st.success(f"✅ {Path(selected_video).name} ({file_size_mb:.1f} MB)")
-                else:
-                    st.warning(f"No videos found in {test_videos_dir.relative_to(REPO_ROOT)}")
-            
-            elif upload_method == "Upload File":
-                video_file = st.file_uploader("Upload Video (Max 200MB)", type=['mp4', 'avi', 'mov'])
-                if video_file:
-                    temp_path = REPO_ROOT / "temp" / video_file.name
-                    temp_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(temp_path, 'wb') as f:
-                        f.write(video_file.read())
-                    video_source = str(temp_path)
-                    file_size_mb = temp_path.stat().st_size / (1024 * 1024)
-                    st.success(f"✅ Uploaded: {video_file.name} ({file_size_mb:.1f} MB)")
-            
-            else:  # Custom Path
-                default_path = cam_config.VIDEO_FILE_PATH if Path(cam_config.VIDEO_FILE_PATH).exists() else ""
-                file_path_input = st.text_input("Video File Path", value=default_path, placeholder="C:/Videos/my.mp4")
-                if file_path_input:
-                    file_path = Path(file_path_input)
-                    if not file_path.is_absolute():
-                        file_path = REPO_ROOT / file_path_input
-                    if file_path.exists():
-                        video_source = str(file_path)
-                        file_size_mb = file_path.stat().st_size / (1024 * 1024)
-                        st.success(f"✅ {file_path.name} ({file_size_mb:.1f} MB)")
-                    else:
-                        st.error(f"❌ File not found: {file_path}")
-            
-            source_mode = "video"
-        
-        else:  # RTSP Camera
-            # Get available cameras
-            rtsp_cameras = cam_config.get_all_rtsp_cameras()
-            camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
-            if camera_options:
-                selected_camera = st.selectbox("Select RTSP Camera", options=list(camera_options.keys()), format_func=lambda x: camera_options[x])
-                video_source = cam_config.get_rtsp_url(selected_camera)
-                camera_info = cam_config.RTSP_CAMERAS[selected_camera]
-                st.text(f"IP: {camera_info['ip']}")
-                st.text(f"Stream: {camera_info['stream']}")
-                source_mode = "rtsp"
-            else:
-                st.error("No RTSP cameras configured or enabled")
-                video_source = None
-            
-            source_mode = "rtsp"
-        
-        st.divider()
-        
-        # Dual Camera Mode
-        st.subheader("📹 Dual Camera Mode")
-        enable_dual_cam = st.checkbox("Enable Dual Camera", value=False, 
-                                     help="Monitor two camera sources simultaneously")
-        secondary_source = None
-        secondary_mode = None
-        
-        if enable_dual_cam:
-            sec_source_type = st.radio("Secondary Source Type", ["Webcam", "RTSP Camera"], 
-                                      key="sec_source_type")
-            
-            if sec_source_type == "Webcam":
-                sec_webcam_index = st.number_input("Secondary Webcam Index", 
-                                                  min_value=0, max_value=5, 
-                                                  value=cam_config.WEBCAM_ID_SECONDARY)
-                secondary_source = int(sec_webcam_index)
-                secondary_mode = "webcam"
-                st.success(f"✅ Secondary: Webcam {sec_webcam_index}")
-            
-            elif sec_source_type == "RTSP Camera":
-                rtsp_cameras = cam_config.get_all_rtsp_cameras()
-                # Show ALL cameras for secondary
-                sec_camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
-                
-                if sec_camera_options:
-                    sec_selected_camera = st.selectbox(
-                        "Select Secondary RTSP Camera",
-                        options=list(sec_camera_options.keys()),
-                        format_func=lambda x: sec_camera_options[x],
-                        key="sec_rtsp_select"
-                    )
-                    secondary_source = cam_config.get_rtsp_url(sec_selected_camera)
-                    secondary_mode = "rtsp"
-                    
-                    sec_camera_info = cam_config.RTSP_CAMERAS[sec_selected_camera]
-                    st.text(f"IP: {sec_camera_info['ip']}")
-                    st.text(f"Stream: {sec_camera_info['stream']}")
-                    st.success(f"✅ Secondary: {sec_selected_camera}")
-                else:
-                    st.error("No enabled RTSP cameras for secondary source")
-        
-        st.divider()
-        
-        # Model Configuration
-        st.subheader("Model Settings")
-        use_gpu = st.checkbox("Use GPU", value=False)
-        device = "cuda" if use_gpu else "cpu"
-        
-        yolo_model = st.text_input("YOLO Model", value="models/YOLOv11/yolo11n.pt")
-        facenet_main = st.text_input("FaceNet Main", value=str(REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py"))
-        
-        st.divider()
-        
-        # Behavior Detection Settings
-        st.subheader("🎯 Behavior Detection")
-        enable_behavior = st.checkbox("Enable HOI Detection", value=True,
-                                     help="Detect human-object interactions (CARRYING/INTERACTING)")
-        
-        if enable_behavior:
-            with st.expander("Behavior Settings"):
-                coverage_thresh = st.slider("Coverage Threshold", 0.05, 0.5, 0.18, 
-                                           help="IoA threshold for object interaction")
-                move_px_thresh = st.slider("Movement Threshold (px)", 1.0, 20.0, 8.0,
-                                          help="Pixels/frame to detect movement")
-                stationary_frames = st.slider("Stationary Frames", 3, 15, 6,
-                                             help="Frames to confirm stationary")
-                status_on_frames = st.slider("Status ON Frames", 3, 15, 6,
-                                            help="Frames to confirm new status")
-                status_off_frames = st.slider("Status OFF Frames", 6, 30, 12,
-                                             help="Frames to clear status")
-                object_hold_frames = st.slider("Object Hold Frames", 3, 20, 8,
-                                              help="Frames to cache objects")
-            
-            # Evidence saving info
-            st.info("💾 Interaction evidence auto-saved to session-specific folders in: `office_evidence/`")
-        else:
-            coverage_thresh = 0.18
-            move_px_thresh = 8.0
-            stationary_frames = 6
-            status_on_frames = 6
-            status_off_frames = 12
-            object_hold_frames = 8
-        
-        st.divider()
-        
-        # Performance Settings
-        st.subheader("Performance")
-        frame_skip = st.slider("Frame Skip", 1, 10, 1)
-        resize_factor = st.slider("Resize", 0.1, 1.0, 1.0)
-        recog_interval = st.slider("Recognition Interval", 10, 60, 30)
-        
-        st.divider()
-        
-        # Recording Settings
-        st.subheader("📹 Recording")
-        enable_recording = st.checkbox("Enable Recording", value=True, 
-                                       help="Save annotated video with all detections")
-        
-        if enable_recording:
-            st.info("📁 Recordings saved to: `recordings/`")
-            if st.session_state.recording_path:
-                st.info(f"Last: {Path(st.session_state.recording_path).name}")
-        
-        st.divider()
-        
-        enable_logging = st.checkbox("Enable Detailed Logging", value=True, 
-                                     help="Generate detailed system logs (initialization, frame processing, file saves, etc.)")
-        st.session_state.enable_logging = enable_logging
-        st.session_state.alert_sounds_enabled = st.checkbox("Enable Alert Sounds", value=True)
-        
-        st.divider()
-        
-        # Control Buttons
+        # ===== CONTROL BUTTONS — always visible at top =====
         col1, col2 = st.columns(2)
         with col1:
             start_button = st.button("▶️ Start", use_container_width=True, type="primary", disabled=st.session_state.running)
         with col2:
             stop_button = st.button("⏹️ Stop", use_container_width=True, disabled=not st.session_state.running)
+
+        # Quick toggles (always visible)
+        enable_recording = st.checkbox("🔴 Record", value=True, help="Save annotated video")
+        enable_logging = st.checkbox("� Logging", value=True, help="Enable activity logging to logs.json")
+        st.session_state.enable_logging = enable_logging
+
+        st.divider()
+
+        # ===== 1. VIDEO SOURCE (most common config) =====
+        with st.expander("� Video Source", expanded=True):
+            source_type = st.radio("Source", ["Webcam", "Video File", "RTSP Camera"], key="source_type", horizontal=True)
+
+            video_source = None
+            source_mode = "webcam"
+            webcam_index = 0
+
+            if source_type == "Webcam":
+                webcam_index = st.number_input("Webcam Index", min_value=0, max_value=5, value=cam_config.WEBCAM_ID)
+                video_source = int(webcam_index)
+                source_mode = "webcam"
+
+            elif source_type == "Video File":
+                test_videos_dir = REPO_ROOT / "vids"
+                available_videos = sorted([
+                    f for f in test_videos_dir.glob("*")
+                    if f.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']
+                ]) if test_videos_dir.exists() else []
+
+                upload_method = st.radio("Method", ["Browse", "Upload", "Path"], horizontal=True)
+                if upload_method == "Browse":
+                    if available_videos:
+                        video_options = {str(v): v.name for v in available_videos}
+                        selected_video = st.selectbox("Video", options=list(video_options.keys()), format_func=lambda x: video_options[x])
+                        if selected_video:
+                            video_source = selected_video
+                    else:
+                        st.caption("No videos in vids/")
+                elif upload_method == "Upload":
+                    video_file = st.file_uploader("Upload (max 200MB)", type=['mp4', 'avi', 'mov'])
+                    if video_file:
+                        temp_path = REPO_ROOT / "temp" / video_file.name
+                        temp_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(temp_path, 'wb') as f:
+                            f.write(video_file.read())
+                        video_source = str(temp_path)
+                else:
+                    default_path = cam_config.VIDEO_FILE_PATH if Path(cam_config.VIDEO_FILE_PATH).exists() else ""
+                    file_path_input = st.text_input("File Path", value=default_path, placeholder="C:/Videos/my.mp4")
+                    if file_path_input:
+                        file_path = Path(file_path_input)
+                        if not file_path.is_absolute():
+                            file_path = REPO_ROOT / file_path_input
+                        if file_path.exists():
+                            video_source = str(file_path)
+                        else:
+                            st.error(f"Not found: {file_path}")
+                source_mode = "video"
+
+            else:  # RTSP
+                rtsp_cameras = cam_config.get_all_rtsp_cameras()
+                camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
+                if camera_options:
+                    selected_camera = st.selectbox("Camera", options=list(camera_options.keys()), format_func=lambda x: camera_options[x])
+                    video_source = cam_config.get_rtsp_url(selected_camera)
+                else:
+                    st.error("No RTSP cameras configured")
+                source_mode = "rtsp"
+
+            # Dual camera (nested inside source)
+            enable_dual_cam = st.checkbox("Dual Camera", value=False)
+            secondary_source = None
+            secondary_mode = None
+            if enable_dual_cam:
+                sec_source_type = st.radio("Secondary", ["Webcam", "RTSP"], key="sec_source_type", horizontal=True)
+                if sec_source_type == "Webcam":
+                    sec_webcam_index = st.number_input("Sec. Webcam", min_value=0, max_value=5, value=cam_config.WEBCAM_ID_SECONDARY)
+                    secondary_source = int(sec_webcam_index)
+                    secondary_mode = "webcam"
+                else:
+                    rtsp_cameras = cam_config.get_all_rtsp_cameras()
+                    sec_camera_options = {key: f"{key} - {name}" for key, name, enabled in rtsp_cameras if enabled}
+                    if sec_camera_options:
+                        sec_selected_camera = st.selectbox("Sec. RTSP", options=list(sec_camera_options.keys()), format_func=lambda x: sec_camera_options[x], key="sec_rtsp_select")
+                        secondary_source = cam_config.get_rtsp_url(sec_selected_camera)
+                        secondary_mode = "rtsp"
+
+        # ===== 2. DETECTION SETTINGS =====
+        with st.expander("🎯 Detection & Behavior", expanded=False):
+            enable_behavior = st.checkbox("Enable HOI Detection", value=True, help="Detect human-object interactions")
+            use_gpu = st.checkbox("Use GPU", value=False)
+            device = "cuda" if use_gpu else "cpu"
+
+            if enable_behavior:
+                coverage_thresh = st.slider("Coverage Threshold", 0.05, 0.5, 0.18)
+                move_px_thresh = st.slider("Movement Threshold (px)", 1.0, 20.0, 8.0)
+                stationary_frames = st.slider("Stationary Frames", 3, 15, 6)
+                status_on_frames = st.slider("Status ON Frames", 3, 15, 6)
+                status_off_frames = st.slider("Status OFF Frames", 6, 30, 12)
+                object_hold_frames = st.slider("Object Hold Frames", 3, 20, 8)
+            else:
+                coverage_thresh, move_px_thresh = 0.18, 8.0
+                stationary_frames, status_on_frames = 6, 6
+                status_off_frames, object_hold_frames = 12, 8
+
+            st.divider()
+            frame_skip = st.slider("Frame Skip", 1, 10, 1)
+            resize_factor = st.slider("Resize Factor", 0.1, 1.0, 1.0)
+            recog_interval = st.slider("Recognition Interval", 10, 60, 30)
+
+        # ===== 3. PERSONNEL MANAGEMENT =====
+        with st.expander("👥 Personnel & Authorization", expanded=False):
+            # Registration
+            st.markdown('<p class="sidebar-section-label">Face Registration</p>', unsafe_allow_html=True)
+            person_name = st.text_input("Person Name", placeholder="Enter name", key="reg_person_name")
+            col_cap1, col_cap2 = st.columns(2)
+            with col_cap1:
+                num_images = st.number_input("Images", min_value=20, max_value=200, value=100)
+            with col_cap2:
+                capture_webcam_id = st.number_input("Cam ID", min_value=0, max_value=5, value=0)
+
+            if st.button("📸 Capture Faces", use_container_width=True, disabled=not person_name):
+                if person_name and person_name.strip():
+                    try:
+                        import subprocess
+                        capture_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_capture.py"
+                        if capture_script.exists():
+                            with st.spinner("Capturing..."):
+                                result = subprocess.run(
+                                    [str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"), str(capture_script)],
+                                    input=person_name.strip(), text=True, capture_output=True, cwd=str(REPO_ROOT)
+                                )
+                                if result.returncode == 0:
+                                    st.success(f"✅ Captured for {person_name}")
+                                else:
+                                    st.error(f"Failed: {result.stderr}")
+                    except Exception as e:
+                        st.error(str(e))
+
+            if st.button("🚀 Train Model", use_container_width=True, type="primary"):
+                try:
+                    import subprocess
+                    train_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_train.py"
+                    if train_script.exists():
+                        with st.spinner("Training..."):
+                            result = subprocess.run(
+                                [str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"), str(train_script)],
+                                capture_output=True, text=True, cwd=str(REPO_ROOT)
+                            )
+                            if result.returncode == 0:
+                                st.success("✅ Training complete!")
+                                st.balloons()
+                            else:
+                                st.error(result.stderr)
+                except Exception as e:
+                    st.error(str(e))
+
+            st.divider()
+
+            # Authorization management
+            st.markdown('<p class="sidebar-section-label">Authorization Levels</p>', unsafe_allow_html=True)
+            if st.button("� Refresh List", use_container_width=True):
+                st.session_state.auth_manager.refresh()
+                st.rerun()
+
+            current_map = st.session_state.auth_manager.get_all_authorizations()
+            if current_map:
+                for pname in sorted(current_map.keys()):
+                    current_level = current_map[pname]
+                    new_level = st.selectbox(
+                        f"👤 {pname}",
+                        ["Authorized", "Partially Authorized", "Unauthorized"],
+                        index=["Authorized", "Partially Authorized", "Unauthorized"].index(current_level),
+                        key=f"auth_{pname}"
+                    )
+                    if new_level != current_level:
+                        if st.button(f"Save {pname}", key=f"save_{pname}", use_container_width=True):
+                            st.session_state.auth_manager.set_authorization(pname, new_level)
+                            st.rerun()
+            else:
+                st.caption("No personnel registered yet.")
+
+        # ===== 4. ADVANCED (rarely changed) =====
+        with st.expander("⚙️ Advanced", expanded=False):
+            yolo_model = st.text_input("YOLO Model", value="models/YOLOv11/yolo11n.pt")
+            facenet_main = st.text_input("FaceNet Main", value=str(REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py"))
+            st.session_state.alert_sounds_enabled = st.checkbox("Alert Sounds", value=True)
     
     # Handle start/stop
     if start_button and not st.session_state.running:
@@ -1473,25 +1446,18 @@ def main():
 
     # Main content area
     col1, col2 = st.columns([2, 1])
-    
+
     with col1:
         st.subheader("📹 Live Feed")
-        video_placeholder = st.empty()
         status_placeholder = st.empty()
+        video_placeholder = st.empty()
         alert_placeholder = st.empty()
-    
+
     with col2:
-        st.subheader("👥 Detections")
+        st.subheader("� Overview")
+        stats_placeholder = st.empty()
+        st.subheader("� Detections")
         detections_placeholder = st.empty()
-        
-        st.subheader("📊 Stats")
-        stats_cols = st.columns(3)
-        with stats_cols[0]:
-            total_placeholder = st.empty()
-        with stats_cols[1]:
-            auth_placeholder = st.empty()
-        with stats_cols[2]:
-            unauth_placeholder = st.empty()
 
     # Always show log section in UI
     st.subheader("📋 System Log")
@@ -1522,11 +1488,13 @@ def main():
     
     # Display loop
     if st.session_state.running:
-        status_placeholder.success("🟢 Running")
-        
-        # Show recording status
-        if st.session_state.recording_enabled:
-            status_placeholder.success("🟢 Running | 🔴 Recording")
+        rec_label = " · 🔴 REC" if st.session_state.recording_enabled else ""
+        status_placeholder.markdown(
+            f'<div style="padding:0.4rem 0.8rem;border-radius:6px;background:rgba(40,167,69,0.15);'
+            f'color:#6fcf7f;font-weight:600;font-size:0.85rem;display:inline-block;">'
+            f'🟢 Running{rec_label}</div>',
+            unsafe_allow_html=True,
+        )
         
         while st.session_state.running:
             # Get frame
@@ -1547,46 +1515,59 @@ def main():
                 time.sleep(0.01)
                 continue
             
-            # Update detections
+            # Update detections + stats
             try:
+                total = len(st.session_state.current_detections)
+                auth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Authorized")
+                unauth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Unauthorized")
+
+                # Stat badges (custom HTML instead of st.metric)
+                stats_placeholder.markdown(f"""
+                <div class="stat-row">
+                    <div class="stat-badge stat-total">
+                        <div class="stat-label">Total</div>{total}
+                    </div>
+                    <div class="stat-badge stat-auth">
+                        <div class="stat-label">Auth</div>{auth}
+                    </div>
+                    <div class="stat-badge stat-unauth">
+                        <div class="stat-label">Unauth</div>{unauth}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Detection cards
                 with detections_placeholder.container():
                     if st.session_state.current_detections:
                         for detection in st.session_state.current_detections:
-                            auth_class = "authorized" if detection['authorization'] == "Authorized" else \
-                                        "partial" if detection['authorization'] == "Partially Authorized" else "unauthorized"
-                            
+                            auth_cls = "det-authorized" if detection['authorization'] == "Authorized" else \
+                                       "det-partial" if detection['authorization'] == "Partially Authorized" else "det-unauthorized"
+
+                            behavior_text = detection.get('behavior_status', '')
+                            behavior_html = f'<div class="det-behavior">{behavior_text}</div>' if behavior_text else ''
+                            camera_tag = detection.get('camera', 'Primary')
+
                             st.markdown(f"""
-                            <div class="status-box {auth_class}">
-                                <strong>[{detection.get('camera', 'Primary')}] {detection['identity']}</strong><br>
-                                {detection['authorization']}
+                            <div class="det-card {auth_cls}">
+                                <div class="det-name">{detection['identity']}</div>
+                                <div class="det-meta">📷 {camera_tag} · {detection['authorization']}</div>
+                                {behavior_html}
                             </div>
                             """, unsafe_allow_html=True)
-                            
+
                             # Generate alerts for unauthorized/partial
                             if detection['authorization'] in ["Unauthorized", "Partially Authorized"]:
                                 show_alert(detection['authorization'], detection['identity'])
                     else:
                         st.info("No detections")
-                
+
                 # Display all active alerts (with expiration)
                 active_alerts_html = get_active_alerts()
                 if active_alerts_html:
                     alert_placeholder.markdown(active_alerts_html, unsafe_allow_html=True)
                 else:
                     alert_placeholder.empty()
-                    
-            except:
-                pass
-            
-            # Update stats
-            try:
-                total = len(st.session_state.current_detections)
-                auth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Authorized")
-                unauth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Unauthorized")
-                
-                total_placeholder.metric("Total", total)
-                auth_placeholder.metric("Auth", auth)
-                unauth_placeholder.metric("Unauth", unauth)
+
             except:
                 pass
             
@@ -1637,7 +1618,12 @@ def main():
             if not st.session_state.running:
                 break
     else:
-        status_placeholder.warning("🔴 Stopped")
+        status_placeholder.markdown(
+            '<div style="padding:0.4rem 0.8rem;border-radius:6px;background:rgba(220,53,69,0.15);'
+            'color:#ff7a85;font-weight:600;font-size:0.85rem;display:inline-block;">'
+            '🔴 Stopped</div>',
+            unsafe_allow_html=True,
+        )
         video_placeholder.empty()
         
         # Show download button for last recording
