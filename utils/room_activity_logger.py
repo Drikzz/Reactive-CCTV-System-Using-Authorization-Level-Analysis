@@ -256,8 +256,11 @@ class RoomActivityLogger:
         last = self._last_log_time.get(key, 0.0)
         if (now - last) < self.DEBOUNCE_SECONDS:
             return None  # suppressed
+        entry = self._add_entry(message)
+        if not entry:
+            return None  # suppressed by _add_entry (same-second dup)
         self._last_log_time[key] = now
-        return self._add_entry(message)
+        return entry
 
     def _today(self) -> str:
         return datetime.now().strftime("%Y-%m-%d")
@@ -266,12 +269,30 @@ class RoomActivityLogger:
         return datetime.now().strftime("%H:%M:%S")
 
     def _add_entry(self, message: str) -> str:
-        """Append a timestamped entry for today and return the full string."""
-        entry = f"{self._timestamp()} - {message}"
+        """Append a timestamped entry for today and return the full string.
+
+        Safety-net rules applied here (last line of defence):
+        1. Strip any ``[repeated xN]`` suffix that leaked through.
+        2. Reject exact duplicate of the most recent entry for today
+           (same timestamp + same message → skip).
+        """
+        # Safety-net: strip [repeated xN] from the final message
+        message = self._REPEATED_RE.sub("", message).strip()
+
+        ts = self._timestamp()
+        entry = f"{ts} - {message}"
         date_key = self._today()
+
         with self._lock:
-            self._data.setdefault(date_key, [])
-            self._data[date_key].append(entry)
+            today_entries = self._data.setdefault(date_key, [])
+            # Reject same-second exact duplicate (scan last few entries)
+            for prev in reversed(today_entries[-10:]):
+                if prev == entry:
+                    return ""  # suppressed — identical entry already exists
+                # Stop scanning once we pass a different timestamp
+                if not prev.startswith(ts):
+                    break
+            today_entries.append(entry)
             self._dirty = True
         return entry
 

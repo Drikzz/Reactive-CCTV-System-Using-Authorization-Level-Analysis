@@ -748,9 +748,10 @@ class CombinedYOLOFaceNetBehavior:
                 det["behavior_flagged"] = repetition_info["flagged"]
                 det["alert_count"] = repetition_info.get("alert_count", 0)
                 
-                # If flagged, modify behavior status to indicate repeated pattern
-                if repetition_info["flagged"]:
-                    det["behavior_status"] = f"{behavior_status} [REPEATED x{repetition_info['alert_count']}]"
+                # NOTE: Do NOT modify behavior_status with [REPEATED xN] suffix.
+                # Repetition metadata is stored in the fields above and the UI
+                # can read them directly.  Appending to behavior_status caused
+                # duplicate / polluted log entries downstream.
 
         return annotated, detections
     
