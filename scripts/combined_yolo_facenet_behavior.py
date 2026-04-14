@@ -406,19 +406,30 @@ class CombinedYOLOFaceNetBehavior:
             "alert_count": track_hist["alert_count"]
         }
 
+    # -----------------------------
+    # Core AI pipeline per frame
+    # -----------------------------
+    # process_frame() is the main algorithm used by the thesis system.
+    # For each incoming frame, it performs:
+    # 1) Detection + tracking (YOLO + ByteTrack)
+    # 2) Face recognition (FaceNet on person crops)
+    # 3) Authorization lookup (Authorized / Partially Authorized / Unauthorized)
+    # 4) Behavior recognition (human-object interaction rules)
+    # 5) Annotation + structured detection output for UI/logging
     def process_frame(self, frame_bgr) -> Tuple[Any, List[Dict[str, Any]]]:
-        """Process frame with face recognition and behavior detection.
-
-        Returns:
-            annotated_frame_bgr, detections (list[dict])
-        """
+        
+        # //
+        # Face detection + tracking pipeline
+        # Main per-frame algorithm entry.
+        # Handles frame skipping to reduce computation.
         self._frame_idx += 1
         if self._frame_idx % self.frame_skip != 0:
             return frame_bgr, []
 
         orig = frame_bgr
 
-        # Resize for YOLO if requested
+        # Optional resize for faster inference; scale factors are used
+        # to map detections back to original frame coordinates.
         if self.resize_factor < 1.0:
             proc_w = max(1, int(orig.shape[1] * self.resize_factor))
             proc_h = max(1, int(orig.shape[0] * self.resize_factor))
@@ -429,13 +440,13 @@ class CombinedYOLOFaceNetBehavior:
             proc = orig
             scale_x = scale_y = 1.0
 
-        # Determine which classes to detect
+        # Determine which classes to detect based on whether behavior detection is enabled.
         if self.enable_behavior:
             detect_classes = list(self.CLASS_ID_TO_NAME.keys())
         else:
             detect_classes = [0]  # Person only
 
-        # YOLOv8 tracking with ByteTrack
+        # YOLO + ByteTrack: gives bounding boxes plus persistent track IDs.
         results = self.yolo.track(
             proc,
             persist=True,
@@ -447,6 +458,8 @@ class CombinedYOLOFaceNetBehavior:
             verbose=False,
             device=self.device,
         )
+
+        # Rest of the code...
 
         annotated = orig.copy()
         detections: List[Dict[str, Any]] = []
@@ -509,10 +522,17 @@ class CombinedYOLOFaceNetBehavior:
                 if crop.size == 0:
                     continue
 
-                # === Face Recognition ===
+                # Face recognition logic
+                # - Runs at intervals per track ID to reduce compute
+                # - Uses identity cache to avoid flickering names
+                # - Uses lock-and-decay strategy:
+                #   high confidence locks identity; low/no-face frames decay confidence gradually
+                
+                # === Face Recognition Logic ===
                 identity_name = "Unknown"
                 identity_conf = 0.0
 
+                # Create cache for each track ID so identity does not flicker.
                 # Initialize identity cache for new tracks
                 if tid != -1 and tid not in self._identity_cache:
                     self._identity_cache[tid] = {
@@ -524,7 +544,8 @@ class CombinedYOLOFaceNetBehavior:
                         "frames_without_face": 0,
                     }
 
-                # Try face recognition (throttled per track)
+            
+                # Run FaceNet only at controlled intervals per track.
                 if tid != -1 and self._should_recognize(tid):
                     try:
                         res = self.recognize_face_fn(crop, orig, (x1, y1, x2, y2))
@@ -532,8 +553,11 @@ class CombinedYOLOFaceNetBehavior:
                             detected_name = res.get("name", "Unknown") or "Unknown"
                             detected_conf = float(res.get("confidence", 0.0) or 0.0)
                             
-                            # Update identity cache with locking logic
+                            # Identity lock: if confidence is high, keep identity stable
+                            # even if later frames are noisy.
                             cache = self._identity_cache[tid]
+                            
+                            # Rest of the code...
                             
                             if detected_name != "Unknown":
                                 # Valid face detected
@@ -606,15 +630,23 @@ class CombinedYOLOFaceNetBehavior:
                             else:
                                 cache["confidence"] *= 0.95
 
-                # Get identity from cache
+                # Use cached identity for output annotation and authorization mapping.
                 if tid != -1 and tid in self._identity_cache:
                     cache = self._identity_cache[tid]
                     identity_name = cache["name"]
                     identity_conf = cache["confidence"]
+                # //
 
                 auth_level = self.get_authorization_level(str(identity_name))
                 auth_color = self.get_authorization_color(auth_level)
 
+                # Behavior recognition logic:
+                # - Applied only when behavior mode is enabled
+                # - Computes person movement and overlap with office objects
+                # - Converts overlap signals to semantic status labels
+                #   (e.g., STATUS: INTERACTING WITH LAPTOP)
+                # - Uses hysteresis smoothing to prevent rapid ON/OFF status flicker
+                
                 # === Behavior Detection ===
                 # Only apply behavior detection for "Partially Authorized" persons
                 behavior_status = "STATUS: NO INTERACTION"
@@ -639,7 +671,7 @@ class CombinedYOLOFaceNetBehavior:
                     moving = st["speed"] >= self.move_px_thresh
                     st["still_frames"] = 0 if moving else (st["still_frames"] + 1)
                     stationary = st["still_frames"] >= self.stationary_frames_required
-
+                    
                     # Vectorized IoA calculation
                     best_cov = {}
                     if len(item_xyxy) > 0:
@@ -658,9 +690,13 @@ class CombinedYOLOFaceNetBehavior:
                             if o_cls not in best_cov or ioas[idx] > best_cov[o_cls][0]:
                                 best_cov[o_cls] = (ioas[idx], item_xyxy[idx])
 
-                    # Update status
+                    # Compute overlap (IoA) between person and detected objects.
+                    # If overlap is significant, candidate behavior becomes interaction.
                     candidate = self.choose_status_for_person(moving, stationary, best_cov)
+                    # Hysteresis smoothing prevents rapid ON/OFF behavior flicker.
                     behavior_status = self.update_confirmed_status(st, candidate)
+
+                # Rest of the code...
 
                 # === Draw Annotations ===
                 # Draw bounding box (color based on authorization)

@@ -1654,7 +1654,19 @@ def main():
             facenet_main = st.text_input("FaceNet Main", value=str(REPO_ROOT / "face_recognition" / "Facenet" / "facenet_main.py"))
             st.session_state.alert_sounds_enabled = st.checkbox("Alert Sounds", value=True)
     
-    # Handle start/stop
+    # -----------------------------
+    # Session control (Start / Stop)
+    # -----------------------------
+    # This block is the runtime entry trigger of the monitoring system.
+    # When Start is pressed:
+    # 1) Build a config dictionary from UI settings (models, thresholds, behavior options)
+    # 2) Reset old queues/state from previous sessions
+    # 3) Launch video_processing_thread(...) in a background thread
+    # 4) Rerun Streamlit so the live dashboard switches to running mode
+    #
+    # When Stop is pressed:
+    # - Set the stop flag so the worker loop exits safely
+    # - Rerun Streamlit to refresh the UI into stopped state
     if start_button and not st.session_state.running:
         if video_source is not None:
             st.session_state.running = True
@@ -1688,6 +1700,8 @@ def main():
                 # Pass authorization map with lowercase keys
                 'authorization_map': {k.lower(): v for k, v in st.session_state.auth_manager.get_all_authorizations().items()},
             }
+
+            # Rest of the code...
             
             # Clear queues
             while not st.session_state.frame_queue.empty():
