@@ -1,7 +1,8 @@
 {
-    "Aldrikz": "Partially Authorized",
-    "Art": "Partially Authorized",
-    "Tanora": "Authorized",
+    "Aldrikz": "Authorized",
+    "Art": "Unauthorized",
+    "Salimar": "Authorized",
+    "Tanora": "Partially Authorized",
     "farah": "Unauthorized",
     "myke": "Partially Authorized"
 }

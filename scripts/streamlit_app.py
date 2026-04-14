@@ -7,7 +7,7 @@ import logging
 import traceback
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Any, Dict, List
 import base64
 from io import BytesIO
 from PIL import Image
@@ -23,6 +23,7 @@ from utils.authorization_manager import AuthorizationManager
 from utils.room_activity_logger import RoomActivityLogger
 from utils.confirmation_manager import ConfirmationManager
 from utils.rtsp_config_manager import get_manager as get_rtsp_manager
+from utils.session_metrics import SessionMetrics
 
 
 # Reduce noisy MediaFileHandler tracebacks (they can still appear on stop/refresh
@@ -56,6 +57,7 @@ st.markdown(
 <style>
     /* ===== Global Reset & Typography ===== */
     .main-header {
+        margin-top: 0.5rem;
         font-size: 1.8rem;
         font-weight: 700;
         background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -164,11 +166,11 @@ st.markdown(
     /* ===== Alert/Notification styles ===== */
     .alert-container {
         position: fixed;
-        top: 70px;
+        bottom: 20px;
         right: 20px;
         z-index: 9999;
         display: flex;
-        flex-direction: column;
+        flex-direction: column-reverse;
         gap: 8px;
         max-width: 360px;
         pointer-events: none;
@@ -194,8 +196,8 @@ st.markdown(
         border: 1px solid rgba(0,0,0,0.1);
     }
     @keyframes alertSlide {
-        from { transform: translateX(120%); opacity: 0; }
-        to   { transform: translateX(0);    opacity: 1; }
+        from { transform: translateY(120%); opacity: 0; }
+        to   { transform: translateY(0);    opacity: 1; }
     }
 
     /* ===== Status indicator ===== */
@@ -254,7 +256,34 @@ st.markdown(
 
     /* ===== Misc polish ===== */
     .block-container { padding-top: 1.5rem; }
-    [data-testid="stMetric"] { display: none; }
+
+    /* ===== Live evaluation metrics bar ===== */
+    .eval-bar {
+        display: flex;
+        gap: 6px;
+        margin: 0.4rem 0 0.6rem 0;
+    }
+    .eval-chip {
+        flex: 1;
+        text-align: center;
+        padding: 0.45rem 0.3rem;
+        border-radius: 6px;
+        font-weight: 700;
+        font-size: 1.05rem;
+        line-height: 1;
+    }
+    .eval-chip .eval-label {
+        font-size: 0.55rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        opacity: 0.7;
+        margin-bottom: 2px;
+    }
+    .eval-fps   { background: rgba(102,126,234,0.18); color: #a0b4ff; }
+    .eval-det   { background: rgba(40,167,69,0.18);   color: #6fcf7f; }
+    .eval-pred  { background: rgba(255,193,7,0.18);   color: #ffd95c; }
+    .eval-ppl   { background: rgba(220,53,69,0.18);   color: #ff7a85; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -280,6 +309,8 @@ _init_state("recording_path", None)
 _init_state("enable_logging", False)
 _init_state("all_logs", [])  # Store all logs for viewing
 _init_state("session_log_file", None)  # Store current session log file path
+_init_state("session_metrics", None)  # SessionMetrics instance (live during run)
+_init_state("last_eval_report", None)  # Final evaluation report dict (after stop)
 
 # Alerts
 _init_state("alert_cooldown", 5)
@@ -327,10 +358,29 @@ def get_authorization_color(auth_level: str):
 # -----------------------------
 def _safe_put(q: queue.Queue, payload):
     try:
-        # Add timestamp if it's a log message
+        # Add timestamp if it's a log message       
         if isinstance(payload, dict) and 'message' in payload and 'timestamp' not in payload:
             payload['timestamp'] = datetime.now().strftime("%H:%M:%S")
         q.put(payload)
+    except Exception:
+        pass
+
+
+def _drain_remaining_queue():
+    """Drain leftover messages from log_queue (e.g. eval_report sent during cleanup)."""
+    try:
+        while not st.session_state.log_queue.empty():
+            msg = st.session_state.log_queue.get_nowait()
+            if msg.get('type') == 'eval_report':
+                st.session_state.last_eval_report = msg.get('data')
+            elif msg.get('type') == 'log_file_path':
+                st.session_state.session_log_file = msg.get('path')
+            elif msg.get('type') == 'recording_path':
+                st.session_state.recording_path = msg.get('path')
+            elif msg.get('type') != 'detections':
+                if 'timestamp' not in msg:
+                    msg['timestamp'] = datetime.now().strftime("%H:%M:%S")
+                st.session_state.all_logs.append(msg)
     except Exception:
         pass
 
@@ -645,6 +695,12 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         ema_alpha=0.3,           # Confidence smoothing factor
     )
 
+    # Session-level evaluation metrics
+    metrics = SessionMetrics()
+    # Share with UI thread via session state (thread-safe reads)
+    import streamlit as _st
+    _st.session_state.session_metrics = metrics
+
     try:
         # Simplified startup - no technical logs
         # Only log critical errors or user-facing events
@@ -869,7 +925,10 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
                 for detection in detections:
                     detection["camera"] = "Primary"
             _safe_put(log_queue, {"type": "detections", "data": detections})
-            
+
+            # --- Session metrics: record this frame's detections ---
+            metrics.tick_frame(detections)
+
             # --- Confirmation manager: temporal smoothing ---
             # Run every detection through the confirmer so identity/auth
             # are only accepted after consistent multi-frame observation.
@@ -983,7 +1042,25 @@ def video_processing_thread(video_source, config, frame_queue, log_queue, stop_f
         write_to_log_file("="*60)
         write_to_log_file("CCTV Monitoring Session Ended")
         write_to_log_file("="*60)
-        
+
+        # --- System Evaluation Report ---
+        eval_report = metrics.report()
+        eval_text = metrics.report_text()
+        write_to_log_file("")
+        write_to_log_file(eval_text)
+        # Save report as JSON alongside session log
+        try:
+            import json as _json
+            eval_json_path = logs_date_dir / f"evaluation_{source_label}_{session_timestamp}.json"
+            with open(eval_json_path, "w", encoding="utf-8") as _ef:
+                _json.dump(eval_report, _ef, indent=2)
+            write_to_log_file(f"Evaluation report saved to: {eval_json_path.name}")
+        except Exception:
+            pass
+        # Share with UI so it can render the report after session stops
+        _safe_put(log_queue, {"type": "eval_report", "data": eval_report})
+        _safe_put(log_queue, {"type": "success", "message": f"📊 Evaluation: Detection {eval_report['detection_rate_pct']}% · Prediction {eval_report['prediction_rate_pct']}% · {eval_report['avg_fps']} FPS"})
+
         # Flush room activity logger (marks remaining people as left)
         activity_logger.close()
         
@@ -1167,6 +1244,84 @@ def _render_rtsp_camera_manager() -> None:
     """Sidebar button that opens the RTSP camera management dialog."""
     if st.button("⚙ Manage Cameras", use_container_width=True, key="btn_open_cam_mgr"):
         _rtsp_camera_dialog()
+
+
+def _render_eval_report(report: Dict[str, Any]) -> None:
+    """Render the system evaluation report as styled Streamlit UI."""
+    if not report:
+        return
+
+    # --- KPI row (styled HTML to match dashboard theme) ---
+    duration = report.get("session_duration", "—")
+    det_pct = report.get("detection_rate_pct", 0)
+    pred_pct = report.get("prediction_rate_pct", 0)
+    avg_fps = report.get("avg_fps", 0)
+    total_frames = report.get("total_frames_processed", 0)
+
+    st.markdown(f"""
+    <div class="eval-bar" style="margin-bottom:1rem;">
+        <div class="eval-chip eval-fps" style="padding:0.7rem 0.4rem;font-size:1.25rem;">
+            <div class="eval-label">⏱ Duration</div>{duration}
+        </div>
+        <div class="eval-chip eval-det" style="padding:0.7rem 0.4rem;font-size:1.25rem;">
+            <div class="eval-label">🎯 Detection Rate</div>{det_pct}%
+        </div>
+        <div class="eval-chip eval-pred" style="padding:0.7rem 0.4rem;font-size:1.25rem;">
+            <div class="eval-label">🧠 Prediction Rate</div>{pred_pct}%
+        </div>
+        <div class="eval-chip eval-fps" style="padding:0.7rem 0.4rem;font-size:1.25rem;">
+            <div class="eval-label">⚡ Avg FPS</div>{avg_fps}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.caption(f"📐 Total frames processed: **{total_frames}**")
+
+    st.divider()
+
+    col_det, col_pred = st.columns(2, gap="large")
+
+    with col_det:
+        st.markdown("##### 🎯 Detection Rate")
+        st.caption("How often YOLO detected at least one person in a frame.")
+        total_f = report.get("total_frames_processed", 0)
+        with_p = report.get("frames_with_people", 0)
+        pct_det = report.get("detection_rate_pct", 0)
+        st.progress(min(pct_det / 100.0, 1.0))
+        st.markdown(f"**{with_p}** / {total_f} frames → **{pct_det}%**")
+
+    with col_pred:
+        st.markdown("##### 🧠 Prediction Rate")
+        st.caption("How often FaceNet successfully identified a detected person (not 'Unknown').")
+        total_pd = report.get("total_person_detections", 0)
+        ident = report.get("identified_detections", 0)
+        pct_pred = report.get("prediction_rate_pct", 0)
+        st.progress(min(pct_pred / 100.0, 1.0))
+        st.markdown(f"**{ident}** / {total_pd} detections → **{pct_pred}%**")
+
+    st.divider()
+
+    col_auth, col_behav, col_ppl = st.columns(3, gap="medium")
+
+    with col_auth:
+        st.markdown("##### 🔐 Authorization")
+        st.markdown(f"- 🟢 Authorized: **{report.get('auth_authorized', 0)}**")
+        st.markdown(f"- 🟡 Partial: **{report.get('auth_partial', 0)}**")
+        st.markdown(f"- 🔴 Unauthorized: **{report.get('auth_unauthorized', 0)}**")
+
+    with col_behav:
+        st.markdown("##### 🖐️ Interactions")
+        st.markdown(f"- Total: **{report.get('total_interactions', 0)}**")
+        st.markdown(f"- Unauthorized: **{report.get('unauthorized_interactions', 0)}**")
+
+    with col_ppl:
+        st.markdown("##### 👥 People Identified")
+        people_list = report.get("unique_people_list", [])
+        if people_list:
+            for name in people_list:
+                st.markdown(f"- {name.title()}")
+        else:
+            st.caption("No one identified this session.")
 
 
 def _extract_person_name(entry: str) -> str:
@@ -1549,6 +1704,8 @@ def main():
             
             # Clear tracking sets for new session
             st.session_state.all_logs = []
+            st.session_state.last_eval_report = None
+            st.session_state.session_metrics = None
             
             # Start processing thread with Streamlit context
             thread = threading.Thread(
@@ -1582,9 +1739,10 @@ def main():
         alert_placeholder = st.empty()
 
     with col2:
-        st.subheader("� Overview")
+        st.subheader("📊 Overview")
         stats_placeholder = st.empty()
-        st.subheader("� Detections")
+        metrics_placeholder = st.empty()   # Live FPS / Detection / Prediction rates
+        st.subheader("🔍 Detections")
         detections_placeholder = st.empty()
 
     # Always show log section in UI
@@ -1613,7 +1771,10 @@ def main():
     if st.session_state.get("show_all_logs", False):
         with st.expander("📋 Activity Log Viewer", expanded=True):
             _render_activity_log_viewer()
-    
+
+    # Placeholder for eval report — filled after queue drain in the stopped branch
+    eval_report_slot = st.empty()
+
     # Display loop
     if st.session_state.running:
         rec_label = " · 🔴 REC" if st.session_state.recording_enabled else ""
@@ -1647,6 +1808,7 @@ def main():
             try:
                 total = len(st.session_state.current_detections)
                 auth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Authorized")
+                partial = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Partially Authorized")
                 unauth = sum(1 for d in st.session_state.current_detections if d['authorization'] == "Unauthorized")
 
                 # Stat badges (custom HTML instead of st.metric)
@@ -1658,11 +1820,38 @@ def main():
                     <div class="stat-badge stat-auth">
                         <div class="stat-label">Auth</div>{auth}
                     </div>
+                    <div class="stat-badge" style="background:rgba(255,193,7,0.15);color:#ffd95c;">
+                        <div class="stat-label">Partial</div>{partial}
+                    </div>
                     <div class="stat-badge stat-unauth">
                         <div class="stat-label">Unauth</div>{unauth}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+                # --- Live evaluation metrics ---
+                _m = st.session_state.get("session_metrics")
+                if _m is not None:
+                    try:
+                        _snap = _m.snapshot()
+                        metrics_placeholder.markdown(f"""
+                        <div class="eval-bar">
+                            <div class="eval-chip eval-fps">
+                                <div class="eval-label">FPS</div>{_snap['fps']}
+                            </div>
+                            <div class="eval-chip eval-det">
+                                <div class="eval-label">Detection</div>{_snap['detection_rate']}%
+                            </div>
+                            <div class="eval-chip eval-pred">
+                                <div class="eval-label">Prediction</div>{_snap['prediction_rate']}%
+                            </div>
+                            <div class="eval-chip eval-ppl">
+                                <div class="eval-label">People</div>{_snap['unique_people']}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    except Exception:
+                        pass
 
                 # Detection cards
                 with detections_placeholder.container():
@@ -1710,6 +1899,8 @@ def main():
                         st.session_state.recording_path = msg.get('path')
                     elif msg.get('type') == 'log_file_path':
                         st.session_state.session_log_file = msg.get('path')
+                    elif msg.get('type') == 'eval_report':
+                        st.session_state.last_eval_report = msg.get('data')
                     else:
                         # Add timestamp if not present
                         if 'timestamp' not in msg:
@@ -1745,7 +1936,24 @@ def main():
             
             if not st.session_state.running:
                 break
+
+        # --- Drain any remaining queue messages (catches eval_report sent during cleanup) ---
+        _drain_remaining_queue()
+
     else:
+        # --- Wait briefly for processing thread to finish cleanup & post eval_report ---
+        _thread = st.session_state.get("processing_thread")
+        if _thread and _thread.is_alive():
+            _thread.join(timeout=3.0)  # wait up to 3s for cleanup
+
+        # --- Drain queue on stopped screen (catches eval_report sent during cleanup) ---
+        _drain_remaining_queue()
+
+        # --- Render evaluation report now that queue is drained ---
+        if st.session_state.last_eval_report:
+            with eval_report_slot.expander("📊 System Evaluation Report", expanded=True):
+                _render_eval_report(st.session_state.last_eval_report)
+
         status_placeholder.markdown(
             '<div style="padding:0.4rem 0.8rem;border-radius:6px;background:rgba(220,53,69,0.15);'
             'color:#ff7a85;font-weight:600;font-size:0.85rem;display:inline-block;">'
