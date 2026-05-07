@@ -246,6 +246,14 @@ def main():
     clf = SVC(kernel="linear", probability=True)
     clf.fit(X_train_emb, y_train_enc)
 
+    if len(set(y_train_enc)) < 2:
+        print("[ERROR] Need at least 2 different people to train the model!")
+        print("[ERROR] Please capture faces for at least 2 people first.")
+        exit(1)
+    
+    clf = SVC(kernel="linear", probability=True)
+    clf.fit(X_train_emb, y_train_enc)
+
     # --- Evaluate ---
     if X_test_emb is not None and len(X_test_emb) > 0:
         y_pred = clf.predict(X_test_emb)

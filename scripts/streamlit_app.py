@@ -11,7 +11,7 @@ from typing import Any, Dict, List
 import base64
 from io import BytesIO
 from PIL import Image
-import subprocess
+
 import cv2
 import numpy as np
 import streamlit as st
@@ -1595,8 +1595,8 @@ def main():
                         if capture_script.exists():
                             with st.spinner("Capturing..."):
                                 result = subprocess.run(
-                                    [sys.executable, str(train_script)],
-                                    capture_output=True, text=True, cwd=str(REPO_ROOT)
+                                    [str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"), str(capture_script)],
+                                    input=person_name.strip(), text=True, capture_output=True, cwd=str(REPO_ROOT)
                                 )
                                 if result.returncode == 0:
                                     st.success(f"✅ Captured for {person_name}")
@@ -1608,18 +1608,26 @@ def main():
             if st.button("🚀 Train Model", use_container_width=True, type="primary"):
                 try:
                     import subprocess
+                    import sys
                     train_script = REPO_ROOT / "face_recognition" / "Facenet" / "facenet_train.py"
                     if train_script.exists():
-                        with st.spinner("Training..."):
+                        with st.spinner("Training model, please wait..."):
                             result = subprocess.run(
-                                [sys.executable, str(train_script)],
+                                [str(REPO_ROOT / ".venv" / "Scripts" / "python.exe"), str(train_script)],
                                 capture_output=True, text=True, cwd=str(REPO_ROOT)
                             )
                             if result.returncode == 0:
                                 st.success("✅ Training complete!")
                                 st.balloons()
                             else:
-                                st.error(result.stderr)
+                                # Check for specific errors
+                                if "got 1 class" in result.stderr or "Need at least 2" in result.stdout:
+                                    st.error("❌ Not enough people captured!")
+                                    st.warning("⚠️ You need to capture faces for at least 2 different people before training.")
+                                    st.info("💡 Go to the **Face Capture** section and add more people first.")
+                                else:
+                                    st.error("❌ Training failed!")
+                                    st.code(result.stderr, language="bash")
                 except Exception as e:
                     st.error(str(e))
 

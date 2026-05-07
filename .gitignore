@@ -6,3 +6,23 @@ Tapo/*
 office_evidence/*
 logs/*
 config/rtsp_cameras.json
+experimental-logo.png
+*.log
+.vscode/
+
+temp/
+*.tmp
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PyInstaller
+dist/
+build/*
+*.spec
+
+# Inno Setup output
+installer_output/
+installer_output/ReactiveCCTV_Installer.exe
